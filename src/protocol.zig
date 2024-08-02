@@ -23,7 +23,10 @@ const Message = union(MessageTag) {
     },
     rdy: u32,
     fin: [16]u8,
-    req: [16]u8,
+    req: struct {
+        msg_id: [16]u8,
+        timeout: u32,
+    },
     touch: [16]u8,
     cls: void,
     nop: void,
@@ -65,9 +68,10 @@ const Parser = struct {
     // pos  - Tail position after successful message parsing.
     //        First byte of the next message in buf or buf.len.
     fn parse(p: *Parser) !Message {
+        if (p.buf[p.pos..].len < 4) return error.BufferOverflow;
+
         const start_pos = p.pos;
         errdefer p.pos = start_pos;
-
         switch (p.buf[p.pos]) {
             'I' => {
                 // IDENTIFY\n[ 4-byte size in bytes ][ N-byte JSON data ]
@@ -107,6 +111,59 @@ const Parser = struct {
 
                 return .{ .mpub = .{ .topic = topic, .msgs = msgs, .data = data } };
             },
+            'D' => {
+                // DPUB <topic_name> <defer_time>\n[ 4-byte size in bytes ][ N-byte binary data ]
+                try p.matchString("DPUB ");
+                const topic = try p.readString(' ');
+                const time = try p.readStringInt('\n');
+                const size = try p.readInt();
+                const data = try p.readBytes(size);
+                return .{ .dpub = .{ .topic = topic, .defer_time = time, .data = data } };
+            },
+            'R' => {
+                switch (p.buf[p.pos + 1]) {
+                    'D' => {
+                        // RDY <count>\n
+                        try p.matchString("RDY ");
+                        const count = try p.readStringInt('\n');
+                        return .{ .rdy = count };
+                    },
+                    'E' => {
+                        // REQ <message_id> <timeout>\n
+                        try p.matchString("REQ ");
+                        const msg_id = try p.readMessageId(' ');
+                        const timeout = try p.readStringInt('\n');
+                        return .{ .req = .{ .msg_id = msg_id, .timeout = timeout } };
+                    },
+                    else => return error.Invalid,
+                }
+            },
+            'F' => {
+                // FIN <message_id>\n
+                try p.matchString("FIN ");
+                const msg_id = try p.readMessageId('\n');
+                return .{ .fin = msg_id };
+            },
+            'T' => {
+                // TOUCH <message_id>\n
+                try p.matchString("TOUCH ");
+                const msg_id = try p.readMessageId('\n');
+                return .{ .touch = msg_id };
+            },
+            'C' => { // CLS\n
+                try p.matchString("CLS\n");
+                return .{ .cls = {} };
+            },
+            'N' => { // NOP\n
+                try p.matchString("NOP\n");
+                return .{ .nop = {} };
+            },
+            'A' => { // AUTH\n[ 4-byte size in bytes ][ N-byte Auth Secret ]
+                try p.matchString("AUTH\n");
+                const size = try p.readInt();
+                const data = try p.readBytes(size);
+                return .{ .auth = data };
+            },
             else => return error.Invalid,
         }
     }
@@ -116,6 +173,17 @@ const Parser = struct {
         if (buf.len < str.len) return error.BufferOverflow;
         if (!mem.eql(u8, buf[0..str.len], str)) return error.Invalid;
         p.pos += str.len;
+    }
+
+    fn readMessageId(p: *Parser, delim: u8) ![16]u8 {
+        const buf = p.buf[p.pos..];
+        if (buf.len < 17 or buf[16] != delim) return error.Invalid;
+        p.pos += 17;
+        return buf[0..16].*;
+    }
+
+    fn readStringInt(p: *Parser, delim: u8) !u32 {
+        return std.fmt.parseInt(u32, try p.readString(delim), 10) catch return error.Invalid;
     }
 
     fn readInt(p: *Parser) !u32 {
@@ -260,4 +328,35 @@ test "mpub" {
         buf2[21] = 4; // change number of bytes in message 1
         try testing.expectError(error.Invalid, p.parse());
     }
+}
+
+test "dpub" {
+    const buf = "DPUB pero 1234\n" ++
+        "\x00\x00\x00\x03bar"; // [size][body]
+    {
+        var p = Parser{ .buf = buf };
+        const m = try p.parse();
+        try testing.expectEqualStrings("pero", m.dpub.topic);
+        try testing.expectEqual(1234, m.dpub.defer_time);
+        try testing.expectEqual(3, m.dpub.data.len);
+        try testing.expectEqual(buf.len, p.pos);
+    }
+}
+
+test "rdy,fin" {
+    const buf = "RDY 123\nFIN 0123456789abcdef\nTOUCH 0123401234012345\nCLS\nNOP\nREQ 5678956789567890 4567\n";
+    var p = Parser{ .buf = buf };
+    var m = try p.parse();
+    try testing.expectEqual(123, m.rdy);
+    m = try p.parse();
+    try testing.expectEqualStrings("0123456789abcdef", &m.fin);
+    m = try p.parse();
+    try testing.expectEqualStrings("0123401234012345", &m.touch);
+    m = try p.parse();
+    try testing.expect(m == .cls);
+    m = try p.parse();
+    try testing.expect(m == .nop);
+    m = try p.parse();
+    try testing.expectEqualStrings("5678956789567890", &m.req.msg_id);
+    try testing.expectEqual(4567, m.req.timeout);
 }
