@@ -56,17 +56,16 @@ const Parser = struct {
     buf: []const u8,
     pos: usize = 0,
 
-    pub fn next(p: *Parser) !?Message {
-        const msg = p.parse() catch |err| switch (err) {
-            error.BufferOverflow => return null,
-            else => return err,
-        };
-        return msg;
-    }
-
     // null - Not enough data in the buf.
     // pos  - Tail position after successful message parsing.
     //        First byte of the next message in buf or buf.len.
+    pub fn next(p: *Parser) Error!?Message {
+        return p.parse() catch |err| switch (err) {
+            error.BufferOverflow => return null,
+            else => return err,
+        };
+    }
+
     fn parse(p: *Parser) !Message {
         if (p.buf[p.pos..].len < 4) return error.BufferOverflow;
 
@@ -343,7 +342,7 @@ test "dpub" {
     }
 }
 
-test "rdy,fin" {
+test "rdy,fin.." {
     const buf = "RDY 123\nFIN 0123456789abcdef\nTOUCH 0123401234012345\nCLS\nNOP\nREQ 5678956789567890 4567\n";
     var p = Parser{ .buf = buf };
     var m = try p.parse();
