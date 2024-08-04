@@ -14,7 +14,7 @@ pub const Error = error{
 
 pub const Completion = struct {
     context: u64 = 0,
-    callback: *const fn (*Completion, linux.io_uring_cqe) Error!void,
+    callback: *const fn (*Completion, linux.io_uring_cqe) Error!void = undefined,
     buf_grp: ?*IoUring.BufferGroup = null,
     state: State = .submitted,
 

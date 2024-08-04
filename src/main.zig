@@ -180,11 +180,13 @@ const response_ok = "\x00\x00\x00\x06" ++ // size
 const Conn = struct {
     allocator: mem.Allocator,
     recv_completion: Completion = undefined,
-    send_completion: Completion = undefined,
+    send_completion: Completion = .{ .state = .completed },
     socket: socket_t = 0,
     listener: *Listener,
-    send_buf: []const u8 = &.{},
     recv_buf: ?[]u8 = null,
+
+    msg_header_buf: [34]u8 = undefined,
+    send_vec: [2]posix.iovec_const = undefined,
 
     fn recv(conn: *Conn) !void {
         conn.recv_completion = Completion.recv(conn, Conn.onRecv, Conn.onRecvSignal, &conn.listener.recv_buf_grp);
@@ -192,13 +194,7 @@ const Conn = struct {
     }
 
     fn onRecv(conn: *Conn, bytes: []const u8) Error!void {
-        if (conn.recv_buf) |old_buf| {
-            const new_buf = try conn.allocator.realloc(old_buf, old_buf.len + bytes.len);
-            @memcpy(new_buf[old_buf.len..], bytes);
-            conn.recv_buf = new_buf;
-        }
-
-        var parser = protocol.Parser{ .buf = if (conn.recv_buf) |recv_buf| recv_buf else bytes };
+        var parser = protocol.Parser{ .buf = try conn.appendRecvBuf(bytes) };
         while (parser.next() catch |err| brk: {
             log.err("protocol parser failed {}", .{err});
             try conn.recvClose();
@@ -207,10 +203,11 @@ const Conn = struct {
             switch (msg) {
                 .identify => |data| {
                     log.debug("identify: {s}", .{data});
-                    try conn.send(response_ok);
+                    try conn.sendOk();
                 },
                 .sub => |sub| {
                     log.debug("subscribe: {s} {s}", .{ sub.topic, sub.channel });
+                    try conn.sendOk();
                 },
                 .rdy => |count| {
                     log.debug("ready: {}", .{count});
@@ -223,14 +220,26 @@ const Conn = struct {
         }
 
         const unparsed = parser.unparsed();
-        if (unparsed.len > 0) {
-            const new_buf = try conn.allocator.alloc(u8, unparsed.len);
-            @memcpy(new_buf, unparsed);
+        if (unparsed.len > 0)
+            try conn.setRecvBuf(unparsed)
+        else
             conn.deinitRecvBuf();
+    }
+
+    fn appendRecvBuf(conn: *Conn, bytes: []const u8) ![]const u8 {
+        if (conn.recv_buf) |old_buf| {
+            const new_buf = try conn.allocator.realloc(old_buf, old_buf.len + bytes.len);
+            @memcpy(new_buf[old_buf.len..], bytes);
             conn.recv_buf = new_buf;
-        } else {
-            conn.deinitRecvBuf();
+            return new_buf;
         }
+        return bytes;
+    }
+
+    fn setRecvBuf(conn: *Conn, bytes: []const u8) !void {
+        const new_buf = try conn.allocator.dupe(u8, bytes);
+        conn.deinitRecvBuf();
+        conn.recv_buf = new_buf;
     }
 
     fn deinitRecvBuf(conn: *Conn) void {
@@ -255,24 +264,46 @@ const Conn = struct {
         try conn.recvClose();
     }
 
-    fn send(conn: *Conn, bytes: []const u8) !void {
-        conn.send_buf = bytes;
+    fn sendOk(conn: *Conn) !void {
+        if (conn.sending()) return;
+        conn.send_vec[0] = .{ .base = response_ok.ptr, .len = response_ok.len };
+        conn.send_vec[1] = .{ .base = response_ok.ptr, .len = 0 };
+        try conn.send();
+    }
+
+    fn sending(conn: *Conn) bool {
+        return conn.send_completion.state == .submitted;
+    }
+
+    fn send(conn: *Conn) !void {
         conn.send_completion = Completion.send(conn, Conn.onSend, Conn.onSendErr);
-        _ = try conn.listener.ring.send(@intFromPtr(&conn.send_completion), conn.socket, conn.send_buf, 0);
+        _ = try conn.listener.ring.writev(@intFromPtr(&conn.send_completion), conn.socket, conn.send_vec[0..2], 0);
     }
 
     fn onSend(self: *Conn, n: usize) Error!void {
-        if (n < self.send_buf.len) {
-            try self.send(self.send_buf[n..]);
+        const send_len = self.send_vec[0].len + self.send_vec[1].len;
+        if (n < send_len) {
+            log.debug("onSend short send {} {}", .{ n, send_len });
+            if (send_len > self.send_vec[0].len) {
+                const n1 = n - self.send_vec[0].len;
+                self.send_vec[1].base += n1;
+                self.send_vec[1].len -= n1;
+                self.send_vec[0].len = 0;
+            } else {
+                self.send_vec[0].base += n;
+                self.send_vec[0].len -= n;
+            }
+            try self.send();
         } else {
-            self.send_buf = &.{};
+            self.send_vec[0].len = 0;
+            self.send_vec[1].len = 0;
         }
     }
 
     fn onSendErr(conn: *Conn, err: anyerror) Error!void {
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
-            error.InterruptedSystemCall => return try conn.send(conn.send_buf),
+            error.InterruptedSystemCall => return try conn.send(),
             else => log.err("{} send {}", .{ conn.socket, err }),
         }
         try conn.sendClose();
