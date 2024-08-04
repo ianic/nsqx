@@ -1,7 +1,9 @@
 const std = @import("std");
 const mem = std.mem;
+const fmt = std.fmt;
 
-const Message = union(MessageTag) {
+pub const Message = union(MessageTag) {
+    version: void,
     identify: []const u8,
     sub: struct {
         topic: []const u8,
@@ -34,6 +36,7 @@ const Message = union(MessageTag) {
 };
 
 const MessageTag = enum {
+    version,
     identify,
     sub,
     spub, // pub is keyword, so calling it single publish
@@ -52,7 +55,7 @@ const Error = error{
     Invalid,
 };
 
-const Parser = struct {
+pub const Parser = struct {
     buf: []const u8,
     pos: usize = 0,
 
@@ -60,10 +63,17 @@ const Parser = struct {
     // pos  - Tail position after successful message parsing.
     //        First byte of the next message in buf or buf.len.
     pub fn next(p: *Parser) Error!?Message {
-        return p.parse() catch |err| switch (err) {
-            error.BufferOverflow => return null,
-            else => return err,
-        };
+        while (true) {
+            const msg = p.parse() catch |err| switch (err) {
+                error.BufferOverflow => return null,
+                error.Invalid => |e| return e,
+            };
+            if (msg != .version) return msg;
+        }
+    }
+
+    pub fn unparsed(p: *Parser) []const u8 {
+        return p.buf[p.pos..];
     }
 
     fn parse(p: *Parser) !Message {
@@ -72,6 +82,10 @@ const Parser = struct {
         const start_pos = p.pos;
         errdefer p.pos = start_pos;
         switch (p.buf[p.pos]) {
+            ' ' => {
+                try p.matchString("  V2");
+                return .{ .version = {} };
+            },
             'I' => {
                 // IDENTIFY\n[ 4-byte size in bytes ][ N-byte JSON data ]
                 try p.matchString("IDENTIFY\n");
@@ -182,7 +196,7 @@ const Parser = struct {
     }
 
     fn readStringInt(p: *Parser, delim: u8) !u32 {
-        return std.fmt.parseInt(u32, try p.readString(delim), 10) catch return error.Invalid;
+        return fmt.parseInt(u32, try p.readString(delim), 10) catch return error.Invalid;
     }
 
     fn readInt(p: *Parser) !u32 {
