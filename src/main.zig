@@ -187,6 +187,7 @@ const Conn = struct {
 
     msg_header_buf: [34]u8 = undefined,
     send_vec: [2]posix.iovec_const = undefined,
+    ready_count: u32 = 0,
 
     fn recv(conn: *Conn) !void {
         conn.recv_completion = Completion.recv(conn, Conn.onRecv, Conn.onRecvSignal, &conn.listener.recv_buf_grp);
@@ -211,6 +212,13 @@ const Conn = struct {
                 },
                 .rdy => |count| {
                     log.debug("ready: {}", .{count});
+                    conn.ready_count = count;
+                },
+                .fin => |msg_id| {
+                    log.debug("fin: {x}", .{msg_id});
+                },
+                .cls => {
+                    try conn.sendResponse("CLOSE_WAIT");
                 },
                 else => {
                     std.debug.print("{}\n", .{msg});
@@ -264,26 +272,48 @@ const Conn = struct {
         try conn.recvClose();
     }
 
-    fn sendOk(conn: *Conn) !void {
-        if (conn.sending()) return;
-        conn.send_vec[0] = .{ .base = response_ok.ptr, .len = response_ok.len };
-        conn.send_vec[1] = .{ .base = response_ok.ptr, .len = 0 };
-        try conn.send();
+    fn sendOk(self: *Conn) !void {
+        try self.sendResponse("OK");
     }
 
-    fn sending(conn: *Conn) bool {
-        return conn.send_completion.state == .submitted;
+    fn sendHeartbeat(self: *Conn) !void {
+        try self.sendResponse("_heartbeat_");
+    }
+
+    fn sendResponse(self: *Conn, data: []const u8) !void {
+        var hdr = &self.msg_header_buf;
+        assert(data.len <= hdr.len - 8);
+        mem.writeInt(u32, hdr[0..4], @intCast(4 + data.len), .big);
+        mem.writeInt(u32, hdr[4..8], @intFromEnum(FrameType.response), .big);
+        @memcpy(hdr[8..][0..data.len], data);
+        self.send_vec[0] = .{ .base = &self.msg_header_buf, .len = data.len + 8 };
+        self.send_vec[1].len = 0;
+        try self.send();
+    }
+
+    fn sendMsg(self: *Conn, msg: Message) !void {
+        var hdr = &self.msg_header_buf;
+        mem.writeInt(u32, hdr[0..4], @intCast(msg.body.len + 30), .big);
+        mem.writeInt(u32, hdr[4..8], @intFromEnum(FrameType.message), .big);
+        mem.writeInt(u64, hdr[8..16], msg.timestamp, .big);
+        mem.writeInt(u16, hdr[16..18], msg.attempts, .big);
+        hdr[18..34].* = msg.id;
+        self.send_vec[0] = .{ .base = &self.msg_header_buf, .len = hdr.len };
+        self.send_vec[1] = .{ .base = msg.body.ptr, .len = msg.body.len };
+        try self.send();
     }
 
     fn send(conn: *Conn) !void {
+        assert(conn.send_completion.state != .submitted);
         conn.send_completion = Completion.send(conn, Conn.onSend, Conn.onSendErr);
         _ = try conn.listener.ring.writev(@intFromPtr(&conn.send_completion), conn.socket, conn.send_vec[0..2], 0);
     }
 
     fn onSend(self: *Conn, n: usize) Error!void {
         const send_len = self.send_vec[0].len + self.send_vec[1].len;
+        log.debug("onSend {} {}", .{ send_len, n });
         if (n < send_len) {
-            log.debug("onSend short send {} {}", .{ n, send_len });
+            log.debug("onSend short send n: {} len: {} vec0: {} vec1: {}", .{ n, send_len, self.send_vec[0].len, self.send_vec[1].len });
             if (send_len > self.send_vec[0].len) {
                 const n1 = n - self.send_vec[0].len;
                 self.send_vec[1].base += n1;
@@ -297,6 +327,11 @@ const Conn = struct {
         } else {
             self.send_vec[0].len = 0;
             self.send_vec[1].len = 0;
+
+            if (send_len == 10 and self.ready_count > 0) {
+                const m = Message{ .body = "Hello world!" };
+                try self.sendMsg(m);
+            }
         }
     }
 
@@ -325,4 +360,17 @@ const Conn = struct {
         conn.deinitRecvBuf();
         conn.listener.remove(conn);
     }
+};
+
+const FrameType = enum(u32) {
+    response = 0,
+    err = 1,
+    message = 2,
+};
+
+const Message = struct {
+    id: [16]u8 = .{0} ** 16,
+    timestamp: u64 = 0,
+    attempts: u16 = 0,
+    body: []const u8,
 };

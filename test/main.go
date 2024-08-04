@@ -1,8 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"github.com/nsqio/go-nsq"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
@@ -19,12 +23,19 @@ func main() {
 		log.Fatal(err)
 	}
 
-	print("subscribed")
+	print("subscribed\n")
 
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	consumer.Stop()
+	<-consumer.StopChan
 }
 
 type TailHandler struct{}
 
 func (th *TailHandler) HandleMessage(m *nsq.Message) error {
+	fmt.Printf("%s", m.Body)
 	return nil
 }
