@@ -54,8 +54,11 @@ pub const Completion = struct {
                     .CONNABORTED, .INTR => {}, // continue
                     else => |errno| return try signal(ctx, errFromErrno(errno)), // close
                 }
-                if (cqe.flags & linux.IORING_CQE_F_MORE == 0)
+                if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
                     try signal(ctx, error.MultishotFinished);
+                } else {
+                    completion.state = .submitted;
+                }
             }
         };
         return .{
@@ -92,14 +95,43 @@ pub const Completion = struct {
                     },
                     else => |errno| return try signal(ctx, errFromErrno(errno)), // signal other errors
                 }
-                if (cqe.flags & linux.IORING_CQE_F_MORE == 0)
+                if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
                     try signal(ctx, error.MultishotFinished);
+                } else {
+                    completion.state = .submitted;
+                }
             }
         };
         return .{
             .context = @intFromPtr(context),
             .callback = wrapper.complete,
             .buf_grp = buf_grp,
+        };
+    }
+
+    pub fn timeout(
+        context: anytype,
+        comptime success: fn (@TypeOf(context)) Error!void,
+        comptime signal: fn (@TypeOf(context), anyerror) Error!void,
+    ) Completion {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(completion: *Completion, cqe: linux.io_uring_cqe) Error!void {
+                const ctx: Context = @ptrFromInt(completion.context);
+                switch (cqe.err()) {
+                    .SUCCESS, .TIME => try success(ctx),
+                    else => |errno| return try signal(ctx, errFromErrno(errno)),
+                }
+                if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+                    try signal(ctx, error.MultishotFinished);
+                } else {
+                    completion.state = .submitted;
+                }
+            }
+        };
+        return .{
+            .context = @intFromPtr(context),
+            .callback = wrapper.complete,
         };
     }
 

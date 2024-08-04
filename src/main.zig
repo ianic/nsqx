@@ -68,6 +68,7 @@ fn readCompletions(ring: *IoUring, cqes: []linux.io_uring_cqe) !usize {
 
 fn flushCompletions(ring: *IoUring, cqes: []linux.io_uring_cqe) !void {
     for (cqes) |cqe| {
+        if (cqe.user_data == 0) continue;
         const c: *Completion = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
         c.state = .completed;
         while (true) {
@@ -181,44 +182,64 @@ const Conn = struct {
     allocator: mem.Allocator,
     recv_completion: Completion = undefined,
     send_completion: Completion = .{ .state = .completed },
+    heartbeat_completion: Completion = undefined,
     socket: socket_t = 0,
     listener: *Listener,
     recv_buf: ?[]u8 = null,
-
     msg_header_buf: [34]u8 = undefined,
     send_vec: [2]posix.iovec_const = undefined,
     ready_count: u32 = 0,
+    unanswered_heartbeats: u8 = 0,
+    heartbeat_ts: linux.kernel_timespec = .{ .sec = 5, .nsec = 0 },
 
-    fn recv(conn: *Conn) !void {
-        conn.recv_completion = Completion.recv(conn, Conn.onRecv, Conn.onRecvSignal, &conn.listener.recv_buf_grp);
-        _ = try conn.listener.recv_buf_grp.recv_multishot(@intFromPtr(&conn.recv_completion), conn.socket, 0);
+    fn recv(self: *Conn) !void {
+        self.recv_completion = Completion.recv(self, Conn.onRecv, Conn.onRecvSignal, &self.listener.recv_buf_grp);
+        _ = try self.listener.recv_buf_grp.recv_multishot(@intFromPtr(&self.recv_completion), self.socket, 0);
+
+        try self.heartbeatTimeout();
     }
 
-    fn onRecv(conn: *Conn, bytes: []const u8) Error!void {
-        var parser = protocol.Parser{ .buf = try conn.appendRecvBuf(bytes) };
+    fn heartbeatTimeout(self: *Conn) !void {
+        self.heartbeat_completion = Completion.timeout(self, Conn.onHeartbeatTimeout, Conn.onHeartbeatTimeoutErr);
+        const IORING_TIMEOUT_MULTISHOT = 1 << 6;
+        _ = try self.listener.ring.timeout(
+            @intFromPtr(&self.heartbeat_completion),
+            &self.heartbeat_ts,
+            0,
+            IORING_TIMEOUT_MULTISHOT,
+        );
+    }
+
+    fn onRecv(self: *Conn, bytes: []const u8) Error!void {
+        var parser = protocol.Parser{ .buf = try self.appendRecvBuf(bytes) };
         while (parser.next() catch |err| brk: {
             log.err("protocol parser failed {}", .{err});
-            try conn.recvClose();
+            // cancel multishot recv
+            _ = try self.listener.ring.cancel(0, @intFromPtr(&self.recv_completion), 0);
             break :brk null;
         }) |msg| {
+            self.unanswered_heartbeats = 0;
             switch (msg) {
                 .identify => |data| {
                     log.debug("identify: {s}", .{data});
-                    try conn.sendOk();
+                    try self.sendOk();
                 },
                 .sub => |sub| {
                     log.debug("subscribe: {s} {s}", .{ sub.topic, sub.channel });
-                    try conn.sendOk();
+                    try self.sendOk();
                 },
                 .rdy => |count| {
                     log.debug("ready: {}", .{count});
-                    conn.ready_count = count;
+                    self.ready_count = count;
                 },
                 .fin => |msg_id| {
                     log.debug("fin: {x}", .{msg_id});
                 },
                 .cls => {
-                    try conn.sendResponse("CLOSE_WAIT");
+                    try self.sendResponse("CLOSE_WAIT");
+                },
+                .nop => {
+                    log.debug("nop", .{});
                 },
                 else => {
                     std.debug.print("{}\n", .{msg});
@@ -229,47 +250,75 @@ const Conn = struct {
 
         const unparsed = parser.unparsed();
         if (unparsed.len > 0)
-            try conn.setRecvBuf(unparsed)
+            try self.setRecvBuf(unparsed)
         else
-            conn.deinitRecvBuf();
+            self.deinitRecvBuf();
     }
 
-    fn appendRecvBuf(conn: *Conn, bytes: []const u8) ![]const u8 {
-        if (conn.recv_buf) |old_buf| {
-            const new_buf = try conn.allocator.realloc(old_buf, old_buf.len + bytes.len);
+    fn appendRecvBuf(self: *Conn, bytes: []const u8) ![]const u8 {
+        if (self.recv_buf) |old_buf| {
+            const new_buf = try self.allocator.realloc(old_buf, old_buf.len + bytes.len);
             @memcpy(new_buf[old_buf.len..], bytes);
-            conn.recv_buf = new_buf;
+            self.recv_buf = new_buf;
             return new_buf;
         }
         return bytes;
     }
 
-    fn setRecvBuf(conn: *Conn, bytes: []const u8) !void {
-        const new_buf = try conn.allocator.dupe(u8, bytes);
-        conn.deinitRecvBuf();
-        conn.recv_buf = new_buf;
+    fn setRecvBuf(self: *Conn, bytes: []const u8) !void {
+        const new_buf = try self.allocator.dupe(u8, bytes);
+        self.deinitRecvBuf();
+        self.recv_buf = new_buf;
     }
 
-    fn deinitRecvBuf(conn: *Conn) void {
-        if (conn.recv_buf) |recv_buf| {
-            conn.allocator.free(recv_buf);
-            conn.recv_buf = null;
+    fn deinitRecvBuf(self: *Conn) void {
+        if (self.recv_buf) |recv_buf| {
+            self.allocator.free(recv_buf);
+            self.recv_buf = null;
         }
     }
 
-    fn onRecvSignal(conn: *Conn, err: anyerror) Error!void {
+    fn onRecvSignal(self: *Conn, err: anyerror) Error!void {
         switch (err) {
             error.NoBufferSpaceAvailable,
             error.InterruptedSystemCall,
             error.MultishotFinished,
             => {
                 log.warn("recv failed {}, restarting", .{err});
-                return try conn.recv();
+                return try self.recv();
             },
-            error.EndOfFile, error.ConnectionResetByPeer => {}, // don't log and close
-            else => log.err("{} recv {}", .{ conn.socket, err }), // log and close
+            error.OperationCanceled, error.EndOfFile, error.ConnectionResetByPeer => {}, // don't log and close
+            else => log.err("{} recv {}", .{ self.socket, err }), // log and close
         }
-        try conn.recvClose();
+        try self.close(&self.recv_completion);
+    }
+
+    fn onHeartbeatTimeout(self: *Conn) Error!void {
+        if (self.unanswered_heartbeats > 2) {
+            _ = try self.listener.ring.timeout_remove(0, @intFromPtr(&self.heartbeat_completion), 0);
+            return;
+        }
+        if (!self.sending() and self.unanswered_heartbeats > 0)
+            try self.sendHeartbeat();
+        self.unanswered_heartbeats += 1;
+    }
+
+    fn onHeartbeatTimeoutErr(self: *Conn, err: anyerror) Error!void {
+        switch (err) {
+            error.InterruptedSystemCall,
+            error.MultishotFinished,
+            => {
+                log.warn("heartbeat failed {}, restarting", .{err});
+                return try self.recv();
+            },
+            error.OperationCanceled => {},
+            else => log.err("{} heartbeat failed {}", .{ self.socket, err }),
+        }
+        return try self.close(&self.heartbeat_completion);
+    }
+
+    fn sending(self: *Conn) bool {
+        return self.send_completion.state == .submitted;
     }
 
     fn sendOk(self: *Conn) !void {
@@ -341,12 +390,7 @@ const Conn = struct {
             error.InterruptedSystemCall => return try conn.send(),
             else => log.err("{} send {}", .{ conn.socket, err }),
         }
-        try conn.sendClose();
-    }
-
-    fn sendClose(conn: *Conn) !void {
-        conn.send_completion = Completion.close(conn, Conn.onClose);
-        _ = try conn.listener.ring.close(@intFromPtr(&conn.send_completion), conn.socket);
+        try conn.close(&conn.send_completion);
     }
 
     fn recvClose(conn: *Conn) !void {
@@ -354,11 +398,21 @@ const Conn = struct {
         _ = try conn.listener.ring.close(@intFromPtr(&conn.recv_completion), conn.socket);
     }
 
-    fn onClose(conn: *Conn, _: ?anyerror) Error!void {
-        if (conn.recv_completion.state == .submitted or
-            conn.send_completion.state == .submitted) return;
-        conn.deinitRecvBuf();
-        conn.listener.remove(conn);
+    fn close(self: *Conn, completion: *Completion) !void {
+        if (self.heartbeat_completion.state == .submitted)
+            _ = try self.listener.ring.timeout_remove(0, @intFromPtr(&self.heartbeat_completion), 0);
+        completion.* = Completion.close(self, Conn.onClose);
+        _ = try self.listener.ring.close(@intFromPtr(completion), self.socket);
+    }
+
+    fn onClose(self: *Conn, _: ?anyerror) Error!void {
+        log.debug("{} onClose closing", .{self.socket});
+        if (self.recv_completion.state == .submitted or
+            self.send_completion.state == .submitted or
+            self.heartbeat_completion.state == .submitted) return;
+        log.debug("{} onClose closed", .{self.socket});
+        self.deinitRecvBuf();
+        self.listener.remove(self);
     }
 };
 
