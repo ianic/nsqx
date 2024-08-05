@@ -36,6 +36,7 @@ func main() {
 type TailHandler struct{}
 
 func (th *TailHandler) HandleMessage(m *nsq.Message) error {
-	fmt.Printf("%s", m.Body)
+	//fmt.Printf("%s", m.Body)
+	fmt.Printf(".")
 	return nil
 }
