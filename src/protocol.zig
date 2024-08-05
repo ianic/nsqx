@@ -190,7 +190,8 @@ pub const Parser = struct {
 
     fn readMessageId(p: *Parser, delim: u8) ![16]u8 {
         const buf = p.buf[p.pos..];
-        if (buf.len < 17 or buf[16] != delim) return error.Invalid;
+        if (buf.len < 17) return error.BufferOverflow;
+        if (buf[16] != delim) return error.Invalid;
         p.pos += 17;
         return buf[0..16].*;
     }
