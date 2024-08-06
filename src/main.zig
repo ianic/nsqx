@@ -12,6 +12,8 @@ const Atomic = std.atomic.Value;
 const Completion = @import("completion.zig").Completion;
 const Error = @import("completion.zig").Error;
 const protocol = @import("protocol.zig");
+const Io = @import("io.zig").Io;
+const Op = @import("io.zig").Op;
 
 const recv_buffers = 4096;
 const recv_buffer_len = 4096;
@@ -29,66 +31,20 @@ pub fn main() !void {
     var ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL & linux.IORING_SETUP_SINGLE_ISSUER);
     defer ring.deinit();
 
-    var listener = try Listener.init(allocator, &ring, socket);
+    var io = Io{ .allocator = allocator };
+    try io.init(ring_entries, recv_buffers, recv_buffer_len);
+    defer io.deinit();
+
+    var listener = try Listener.init(allocator, &io);
     defer listener.deinit();
-    try listener.accept();
+    try listener.accept(socket);
 
     catchSignals();
-    var cqes: [ring_entries]std.os.linux.io_uring_cqe = undefined;
-    while (!interrupted()) {
-        const n = try readCompletions(&ring, &cqes);
-        if (n > 0)
-            try flushCompletions(&ring, cqes[0..n]);
-    }
+    try io.loop(run_loop);
+    log.debug("done", .{});
 }
 
-fn interrupted() bool {
-    const sig = signal.load(.monotonic);
-    if (sig != 0) {
-        signal.store(0, .release);
-        log.info("signal {} received", .{sig});
-        switch (sig) {
-            posix.SIG.TERM, posix.SIG.INT => return true,
-            else => {}, // ignore USR1, USR2, PIPE
-        }
-    }
-    return false;
-}
-
-fn readCompletions(ring: *IoUring, cqes: []linux.io_uring_cqe) !usize {
-    _ = ring.submit() catch |err| switch (err) {
-        error.SignalInterrupt => 0,
-        else => return err,
-    };
-    return ring.copy_cqes(cqes, 1) catch |err| switch (err) {
-        error.SignalInterrupt => 0,
-        else => return err,
-    };
-}
-
-fn flushCompletions(ring: *IoUring, cqes: []linux.io_uring_cqe) !void {
-    for (cqes) |cqe| {
-        if (cqe.user_data == 0) continue;
-        const c: *Completion = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-        c.state = .completed;
-        while (true) {
-            c.callback(c, cqe) catch |err| {
-                log.err("callback failed {}", .{err});
-                switch (err) {
-                    error.SubmissionQueueFull => {
-                        _ = ring.submit() catch |submit_err| switch (submit_err) {
-                            error.SignalInterrupt => continue,
-                            else => return submit_err,
-                        };
-                    },
-                    else => return err,
-                }
-            };
-            break;
-        }
-    }
-}
-
+var run_loop = Atomic(bool).init(true);
 var signal = Atomic(c_int).init(0);
 
 fn catchSignals() void {
@@ -97,6 +53,12 @@ fn catchSignals() void {
             .handler = struct {
                 fn wrapper(sig: c_int) callconv(.C) void {
                     signal.store(sig, .release);
+                    switch (sig) {
+                        posix.SIG.TERM, posix.SIG.INT => {
+                            run_loop.store(false, .release);
+                        },
+                        else => {}, // ignore USR1, USR2, PIPE
+                    }
                 }
             }.wrapper,
         },
@@ -112,61 +74,38 @@ fn catchSignals() void {
 
 const Listener = struct {
     allocator: mem.Allocator,
-    socket: socket_t,
-    accept_completion: Completion = undefined,
-
+    io: *Io,
     conns_pool: std.heap.MemoryPool(Conn),
     conns: std.AutoHashMap(socket_t, *Conn),
 
-    ring: *IoUring,
-    recv_buf_grp: IoUring.BufferGroup,
-
-    fn init(allocator: mem.Allocator, ring: *IoUring, socket: socket_t) !Listener {
+    fn init(allocator: mem.Allocator, io: *Io) !Listener {
         return .{
             .allocator = allocator,
-            .ring = ring,
-            .socket = socket,
+            .io = io,
             .conns_pool = std.heap.MemoryPool(Conn).init(allocator),
             .conns = std.AutoHashMap(socket_t, *Conn).init(allocator),
-            .recv_buf_grp = try initBufferGroup(allocator, ring, 1, recv_buffers, recv_buffer_len),
         };
     }
 
-    fn initBufferGroup(allocator: mem.Allocator, ring: *IoUring, id: u16, count: u16, size: u32) !IoUring.BufferGroup {
-        const buffers = try allocator.alloc(u8, count * size);
-        errdefer allocator.free(buffers);
-        return try IoUring.BufferGroup.init(ring, id, buffers, size, count);
-    }
-
     fn deinit(self: *Listener) void {
-        self.allocator.free(self.recv_buf_grp.buffers);
-        self.recv_buf_grp.deinit();
-        self.conns_pool.deinit();
         self.conns.deinit();
+        self.conns_pool.deinit();
     }
 
-    fn accept(self: *Listener) !void {
-        self.accept_completion = Completion.accept(self, Listener.onAccept, Listener.onAcceptErr);
-        _ = try self.ring.accept_multishot(@intFromPtr(&self.accept_completion), self.socket, null, null, 0);
+    fn accept(self: *Listener, socket: socket_t) !void {
+        _ = try self.io.accept(socket, self, accepted, failed);
     }
 
-    fn onAccept(self: *Listener, socket: socket_t) Error!void {
+    fn accepted(self: *Listener, socket: socket_t) Error!void {
         var conn = try self.conns_pool.create();
-        conn.* = Conn{ .allocator = self.allocator, .socket = socket, .listener = self };
+        conn.* = Conn{ .allocator = self.allocator, .socket = socket, .listener = self, .io = self.io };
         try self.conns.put(socket, conn);
         try conn.init();
     }
 
-    fn onAcceptErr(self: *Listener, err: anyerror) Error!void {
-        switch (err) {
-            error.MultishotFinished => return try self.accept(),
-            else => log.err("server accept {}", .{err}),
-        }
-        self.accept_completion = Completion.close(self, Listener.onClose);
-        _ = try self.ring.close(@intFromPtr(&self.accept_completion), self.socket);
+    fn failed(self: *Listener, _: anyerror) Error!void {
+        _ = self;
     }
-
-    fn onClose(_: *Listener, _: ?anyerror) Error!void {}
 
     fn remove(self: *Listener, conn: *Conn) void {
         _ = self.conns.remove(conn.socket);
@@ -180,9 +119,11 @@ const response_ok = "\x00\x00\x00\x06" ++ // size
 
 const Conn = struct {
     allocator: mem.Allocator,
-    recv_completion: Completion = undefined,
-    send_completion: Completion = .{ .state = .completed },
-    heartbeat_completion: Completion = undefined,
+    io: *Io,
+    recv_op: ?*Op = null,
+    send_op: ?*Op = null,
+    ticker_op: ?*Op = null,
+
     socket: socket_t = 0,
     listener: *Listener,
     recv_buf: ?[]u8 = null,
@@ -190,37 +131,36 @@ const Conn = struct {
     send_vec: [2]posix.iovec_const = undefined,
     ready_count: u32 = 0,
     unanswered_heartbeats: u8 = 0,
-    heartbeat_interval: linux.kernel_timespec = .{ .sec = 5, .nsec = 0 },
 
     msg_id: usize = 0,
+    pending_response: ?Response = null,
+
+    const Response = enum {
+        ok,
+        cls,
+        heartbeat,
+    };
 
     fn init(self: *Conn) !void {
-        try self.recv();
-        try self.heartbeatSet();
+        self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
+        self.ticker_op = try self.io.ticker(5, self, tick, tickerFailed);
     }
 
-    fn recv(self: *Conn) !void {
-        self.recv_completion = Completion.recv(self, Conn.onRecv, Conn.onRecvSignal, &self.listener.recv_buf_grp);
-        _ = try self.listener.recv_buf_grp.recv_multishot(@intFromPtr(&self.recv_completion), self.socket, 0);
+    fn tick(self: *Conn) Error!void {
+        if (self.unanswered_heartbeats > 2) {
+            return try self.close();
+        }
+        if (self.unanswered_heartbeats > 0)
+            try self.respond(.heartbeat);
+        self.unanswered_heartbeats += 1;
     }
 
-    fn recvCancel(self: *Conn) !void {
-        _ = try self.listener.ring.cancel(0, @intFromPtr(&self.recv_completion), 0);
-    }
-
-    fn heartbeatSet(self: *Conn) !void {
-        self.heartbeat_completion = Completion.timeout(self, Conn.onHeartbeatTimeout, Conn.onHeartbeatTimeoutErr);
-        const IORING_TIMEOUT_MULTISHOT = 1 << 6;
-        _ = try self.listener.ring.timeout(
-            @intFromPtr(&self.heartbeat_completion),
-            &self.heartbeat_interval,
-            0,
-            IORING_TIMEOUT_MULTISHOT,
-        );
-    }
-
-    fn heartbeatRemove(self: *Conn) !void {
-        _ = try self.listener.ring.timeout_remove(0, @intFromPtr(&self.heartbeat_completion), 0);
+    fn tickerFailed(self: *Conn, err: anyerror) Error!void {
+        self.ticker_op = null;
+        switch (err) {
+            error.Canceled => {},
+            else => log.err("{} ticker failed {}", .{ self.socket, err }),
+        }
     }
 
     fn testSendMsg(self: *Conn) !void {
@@ -231,37 +171,38 @@ const Conn = struct {
         try self.sendMsg(m);
     }
 
-    fn onRecv(self: *Conn, bytes: []const u8) Error!void {
+    fn received(self: *Conn, bytes: []const u8) Error!void {
         var parser = protocol.Parser{ .buf = try self.appendRecvBuf(bytes) };
-        while (parser.next() catch |err| brk: {
-            log.err("protocol parser failed {} '{s}'", .{ err, parser.buf });
-            try self.recvCancel();
-            break :brk null;
+        while (parser.next() catch |err| {
+            log.err("{} protocol parser failed {}", .{ self.socket, err });
+            return try self.close();
         }) |msg| {
             self.unanswered_heartbeats = 0;
             switch (msg) {
                 .identify => |data| {
-                    log.debug("identify: {s}", .{data});
-                    try self.sendOk();
+                    log.debug("{} identify: {s}", .{ self.socket, data });
+                    try self.respond(.ok);
                 },
                 .sub => |sub| {
-                    log.debug("subscribe: {s} {s}", .{ sub.topic, sub.channel });
-                    // try self.sendOk();
+                    log.debug("{} subscribe: {s} {s}", .{ self.socket, sub.topic, sub.channel });
+                    try self.respond(.ok);
                 },
                 .rdy => |count| {
-                    log.debug("ready: {}", .{count});
+                    log.debug("{} ready: {}", .{ self.socket, count });
                     self.ready_count = count;
-                    try self.testSendMsg();
                 },
-                .fin => |_| {
-                    std.debug.print("F", .{});
-                    //log.debug("fin: {x}", .{msg_id});
+                .fin => |msg_id| {
+                    _ = msg_id;
+                    std.debug.print(".", .{});
+                    //log.debug("{} fin {x}", .{ self.socket, msg_id });
                 },
                 .cls => {
-                    try self.sendResponse("CLOSE_WAIT");
+                    self.ready_count = 0;
+                    log.debug("{} cls", .{self.socket});
+                    try self.respond(.cls);
                 },
                 .nop => {
-                    log.debug("nop", .{});
+                    log.debug("{} nop", .{self.socket});
                 },
                 else => {
                     std.debug.print("{}\n", .{msg});
@@ -300,47 +241,13 @@ const Conn = struct {
         }
     }
 
-    fn onRecvSignal(self: *Conn, err: anyerror) Error!void {
+    fn recvFailed(self: *Conn, err: anyerror) Error!void {
+        self.recv_op = null;
         switch (err) {
-            error.NoBufferSpaceAvailable,
-            error.InterruptedSystemCall,
-            error.MultishotFinished,
-            => {
-                log.warn("{} recv failed {}, restarting", .{ self.socket, err });
-                return try self.recv();
-            },
-            error.OperationCanceled, error.EndOfFile, error.ConnectionResetByPeer => {}, // don't log and close
-            else => log.err("{} recv {}", .{ self.socket, err }), // log and close
+            error.EndOfFile => {},
+            else => log.err("{} recv failed {}", .{ self.socket, err }),
         }
-        log.err("{} recv {}", .{ self.socket, err });
-        try self.close(&self.recv_completion);
-    }
-
-    fn onHeartbeatTimeout(self: *Conn) Error!void {
-        if (self.unanswered_heartbeats > 2)
-            return self.heartbeatRemove();
-        if (!self.sending() and self.unanswered_heartbeats > 0)
-            try self.sendHeartbeat();
-        self.unanswered_heartbeats += 1;
-    }
-
-    fn onHeartbeatTimeoutErr(self: *Conn, err: anyerror) Error!void {
-        switch (err) {
-            error.InterruptedSystemCall,
-            error.MultishotFinished,
-            => {
-                log.warn("heartbeat failed {}, restarting", .{err});
-                return try self.recv();
-            },
-            error.OperationCanceled => {},
-            else => log.err("{} heartbeat failed {}", .{ self.socket, err }),
-        }
-        log.err("{} heartbeat failed {}", .{ self.socket, err });
-        return try self.close(&self.heartbeat_completion);
-    }
-
-    fn sending(self: *Conn) bool {
-        return self.send_completion.state == .submitted;
+        try self.close();
     }
 
     fn sendOk(self: *Conn) !void {
@@ -375,56 +282,51 @@ const Conn = struct {
     }
 
     fn send(self: *Conn) !void {
-        assert(self.send_completion.state != .submitted);
-        self.send_completion = Completion.send(self, Conn.onSend, Conn.onSendErr);
-        _ = try self.listener.ring.writev(@intFromPtr(&self.send_completion), self.socket, self.send_vec[0..2], 0);
+        assert(self.send_op == null);
+        self.send_op = try self.io.writev(self.socket, &self.send_vec, self, sent, sendFailed);
     }
 
-    fn onSend(self: *Conn, n: usize) Error!void {
-        const send_len = self.send_vec[0].len + self.send_vec[1].len;
-        // log.debug("onSend {} {}", .{ send_len, n });
-        if (n < send_len) {
-            log.debug("onSend short send n: {} len: {} vec0: {} vec1: {}", .{ n, send_len, self.send_vec[0].len, self.send_vec[1].len });
-            if (n > self.send_vec[0].len) {
-                const n1 = n - self.send_vec[0].len;
-                self.send_vec[1].base += n1;
-                self.send_vec[1].len -= n1;
-                self.send_vec[0].len = 0;
-            } else {
-                self.send_vec[0].base += n;
-                self.send_vec[0].len -= n;
-            }
-            try self.send();
-        } else {
-            self.send_vec[0].len = 0;
-            self.send_vec[1].len = 0;
-            if (send_len == 46)
-                try self.testSendMsg();
+    fn respond(self: *Conn, rsp: Response) !void {
+        if (self.send_op != null) {
+            self.pending_response = rsp;
+            return;
+        }
+        switch (rsp) {
+            .ok => try self.sendResponse("OK"),
+            .heartbeat => try self.sendResponse("_heartbeat_"),
+            .cls => try self.sendResponse("CLOSE_WAIT"),
         }
     }
 
-    fn onSendErr(conn: *Conn, err: anyerror) Error!void {
+    fn sent(self: *Conn, _: usize) Error!void {
+        self.send_op = null;
+        if (self.pending_response) |r| {
+            try self.respond(r);
+            self.pending_response = null;
+        }
+        if (self.send_op == null and self.ready_count > 0)
+            try self.testSendMsg();
+    }
+
+    fn sendFailed(self: *Conn, err: anyerror) Error!void {
+        self.send_op = null;
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
-            error.InterruptedSystemCall => return try conn.send(),
-            else => log.err("{} send {}", .{ conn.socket, err }),
+            else => log.err("{} send failed {}", .{ self.socket, err }),
         }
-        try conn.close(&conn.send_completion);
+        try self.close();
     }
 
-    fn close(self: *Conn, completion: *Completion) !void {
-        if (self.heartbeat_completion.state == .submitted)
-            try self.heartbeatRemove();
-        completion.* = Completion.close(self, Conn.onClose);
-        _ = try self.listener.ring.close(@intFromPtr(completion), self.socket);
-    }
+    fn close(self: *Conn) !void {
+        log.debug("{} close", .{self.socket});
+        try self.io.close(self.socket);
+        if (self.ticker_op) |op| {
+            try op.cancel();
+            op.unsubscribe(self);
+        }
+        if (self.recv_op) |op| op.unsubscribe(self);
+        if (self.send_op) |op| op.unsubscribe(self);
 
-    fn onClose(self: *Conn, _: ?anyerror) Error!void {
-        log.debug("{} onClose closing", .{self.socket});
-        if (self.recv_completion.state == .submitted or
-            self.send_completion.state == .submitted or
-            self.heartbeat_completion.state == .submitted) return;
-        log.debug("{} onClose closed", .{self.socket});
         self.deinitRecvBuf();
         self.listener.remove(self);
     }
