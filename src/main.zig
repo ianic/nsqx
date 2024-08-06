@@ -13,11 +13,16 @@ const protocol = @import("protocol.zig");
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
+const Message = @import("server.zig").Message;
+const Server = @import("server.zig").Server(*Conn);
+const Channel = @import("server.zig").Channel(*Conn);
 
 const recv_buffers = 4096;
 const recv_buffer_len = 4096;
 const port = 4150;
 const ring_entries: u16 = 16;
+
+var server: Server = undefined;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -33,6 +38,9 @@ pub fn main() !void {
     var io = Io{ .allocator = allocator };
     try io.init(ring_entries, recv_buffers, recv_buffer_len);
     defer io.deinit();
+
+    server = Server.init(allocator);
+    defer server.deinit();
 
     var listener = try Listener.init(allocator, &io);
     defer listener.deinit();
@@ -126,7 +134,9 @@ const Conn = struct {
     send_header_buf: [34]u8 = undefined, // message header
     send_vec: [2]posix.iovec_const = undefined, // header and body
 
-    msg_id: usize = 0,
+    channel: ?*Channel = null,
+
+    //msg_id: usize = 0,
 
     const Response = enum {
         ok,
@@ -156,13 +166,13 @@ const Conn = struct {
         }
     }
 
-    fn testSendMsg(self: *Conn) !void {
-        var id: [16]u8 = .{0} ** 16;
-        mem.writeInt(usize, id[8..], self.msg_id, .big);
-        self.msg_id += 1;
-        const m = Message{ .body = "Hello world!", .id = id };
-        try self.sendMsg(m);
-    }
+    // fn testSendMsg(self: *Conn) !void {
+    //     var id: [16]u8 = .{0} ** 16;
+    //     mem.writeInt(usize, id[8..], self.msg_id, .big);
+    //     self.msg_id += 1;
+    //     const m = Message{ .body = "Hello world!", .id = id };
+    //     try self.sendMsg(m);
+    // }
 
     fn received(self: *Conn, bytes: []const u8) Error!void {
         var parser = protocol.Parser{ .buf = try self.appendRecvBuf(bytes) };
@@ -178,6 +188,7 @@ const Conn = struct {
                 },
                 .sub => |sub| {
                     log.debug("{} subscribe: {s} {s}", .{ self.socket, sub.topic, sub.channel });
+                    self.channel = try server.sub(self, sub.topic, sub.channel);
                     try self.respond(.ok);
                 },
                 .rdy => |count| {
@@ -289,8 +300,11 @@ const Conn = struct {
             try self.respond(r);
             self.pending_response = null;
         }
-        if (self.send_op == null and self.ready_count > 0)
-            try self.testSendMsg();
+        if (self.send_op == null and self.ready_count > 0) {
+            if (self.channel) |channel| try channel.ready(self);
+            // TODO javi se u channel da si spreman
+            //try self.testSendMsg();
+        }
     }
 
     fn sendFailed(self: *Conn, err: anyerror) Error!void {
@@ -304,6 +318,7 @@ const Conn = struct {
 
     fn close(self: *Conn) !void {
         log.debug("{} close", .{self.socket});
+        if (self.channel) |channel| channel.unsub(self);
         try self.io.close(self.socket);
         if (self.ticker_op) |op| {
             try op.cancel();
@@ -321,11 +336,4 @@ const FrameType = enum(u32) {
     response = 0,
     err = 1,
     message = 2,
-};
-
-const Message = struct {
-    id: [16]u8 = .{0} ** 16,
-    timestamp: u64 = 0,
-    attempts: u16 = 0,
-    body: []const u8,
 };
