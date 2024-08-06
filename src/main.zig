@@ -75,19 +75,16 @@ const Listener = struct {
     allocator: mem.Allocator,
     io: *Io,
     conns_pool: std.heap.MemoryPool(Conn),
-    conns: std.AutoHashMap(socket_t, *Conn),
 
     fn init(allocator: mem.Allocator, io: *Io) !Listener {
         return .{
             .allocator = allocator,
             .io = io,
             .conns_pool = std.heap.MemoryPool(Conn).init(allocator),
-            .conns = std.AutoHashMap(socket_t, *Conn).init(allocator),
         };
     }
 
     fn deinit(self: *Listener) void {
-        self.conns.deinit();
         self.conns_pool.deinit();
     }
 
@@ -98,41 +95,38 @@ const Listener = struct {
     fn accepted(self: *Listener, socket: socket_t) Error!void {
         var conn = try self.conns_pool.create();
         conn.* = Conn{ .allocator = self.allocator, .socket = socket, .listener = self, .io = self.io };
-        try self.conns.put(socket, conn);
         try conn.init();
     }
 
-    fn failed(self: *Listener, _: anyerror) Error!void {
-        _ = self;
+    fn failed(_: *Listener, err: anyerror) Error!void {
+        log.err("accept failed {}", .{err});
+        // TODO: handle this
     }
 
-    fn remove(self: *Listener, conn: *Conn) void {
-        _ = self.conns.remove(conn.socket);
+    fn release(self: *Listener, conn: *Conn) void {
         self.conns_pool.destroy(conn);
     }
 };
 
-const response_ok = "\x00\x00\x00\x06" ++ // size
-    "\x00\x00\x00\x00" ++ // frame type response
-    "OK";
-
 const Conn = struct {
     allocator: mem.Allocator,
     io: *Io,
-    recv_op: ?*Op = null,
-    send_op: ?*Op = null,
-    ticker_op: ?*Op = null,
-
     socket: socket_t = 0,
     listener: *Listener,
-    recv_buf: ?[]u8 = null,
-    msg_header_buf: [34]u8 = undefined,
-    send_vec: [2]posix.iovec_const = undefined,
+
+    recv_op: ?*Op = null,
+    send_op: ?*Op = null,
+    ticker_op: ?*Op = null, // heartbeat ticker
+    // if currently sending message store here response to send later
+    pending_response: ?Response = null,
     ready_count: u32 = 0,
     unanswered_heartbeats: u8 = 0,
 
+    recv_buf: ?[]u8 = null, // holds unprocessed bytes from previous receive
+    send_header_buf: [34]u8 = undefined, // message header
+    send_vec: [2]posix.iovec_const = undefined, // header and body
+
     msg_id: usize = 0,
-    pending_response: ?Response = null,
 
     const Response = enum {
         ok,
@@ -249,33 +243,25 @@ const Conn = struct {
         try self.close();
     }
 
-    fn sendOk(self: *Conn) !void {
-        try self.sendResponse("OK");
-    }
-
-    fn sendHeartbeat(self: *Conn) !void {
-        try self.sendResponse("_heartbeat_");
-    }
-
     fn sendResponse(self: *Conn, data: []const u8) !void {
-        var hdr = &self.msg_header_buf;
+        var hdr = &self.send_header_buf;
         assert(data.len <= hdr.len - 8);
         mem.writeInt(u32, hdr[0..4], @intCast(4 + data.len), .big);
         mem.writeInt(u32, hdr[4..8], @intFromEnum(FrameType.response), .big);
         @memcpy(hdr[8..][0..data.len], data);
-        self.send_vec[0] = .{ .base = &self.msg_header_buf, .len = data.len + 8 };
+        self.send_vec[0] = .{ .base = &self.send_header_buf, .len = data.len + 8 };
         self.send_vec[1].len = 0;
         try self.send();
     }
 
     fn sendMsg(self: *Conn, msg: Message) !void {
-        var hdr = &self.msg_header_buf;
+        var hdr = &self.send_header_buf;
         mem.writeInt(u32, hdr[0..4], @intCast(msg.body.len + 30), .big);
         mem.writeInt(u32, hdr[4..8], @intFromEnum(FrameType.message), .big);
         mem.writeInt(u64, hdr[8..16], msg.timestamp, .big);
         mem.writeInt(u16, hdr[16..18], msg.attempts, .big);
         hdr[18..34].* = msg.id;
-        self.send_vec[0] = .{ .base = &self.msg_header_buf, .len = hdr.len };
+        self.send_vec[0] = .{ .base = &self.send_header_buf, .len = hdr.len };
         self.send_vec[1] = .{ .base = msg.body.ptr, .len = msg.body.len };
         try self.send();
     }
@@ -327,7 +313,7 @@ const Conn = struct {
         if (self.send_op) |op| op.unsubscribe(self);
 
         self.deinitRecvBuf();
-        self.listener.remove(self);
+        self.listener.release(self);
     }
 };
 
