@@ -9,11 +9,10 @@ const socket_t = std.posix.socket_t;
 const fd_t = std.posix.fd_t;
 const Atomic = std.atomic.Value;
 
-const Completion = @import("completion.zig").Completion;
-const Error = @import("completion.zig").Error;
 const protocol = @import("protocol.zig");
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
+const Error = @import("io.zig").Error;
 
 const recv_buffers = 4096;
 const recv_buffer_len = 4096;

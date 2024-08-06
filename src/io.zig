@@ -15,6 +15,10 @@ pub const Io = struct {
     ring: IoUring = undefined,
     recv_buf_grp: IoUring.BufferGroup = undefined,
     op_pool: std.heap.MemoryPool(Op) = undefined,
+    op_stat: struct {
+        active: usize = 0,
+        completed: usize = 0,
+    } = .{},
 
     pub fn init(self: *Io, ring_entries: u16, recv_buffers: u16, recv_buffer_len: u16) !void {
         self.ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL & linux.IORING_SETUP_SINGLE_ISSUER);
@@ -35,7 +39,14 @@ pub const Io = struct {
         self.ring.deinit();
     }
 
-    fn destroy(self: *Io, op: *Op) void {
+    fn acquire(self: *Io) !*Op {
+        self.op_stat.active += 1;
+        return try self.op_pool.create();
+    }
+
+    fn release(self: *Io, op: *Op) void {
+        self.op_stat.active -= 1;
+        self.op_stat.completed +%= 1;
         self.op_pool.destroy(op);
     }
 
@@ -46,7 +57,7 @@ pub const Io = struct {
         comptime accepted: fn (@TypeOf(context), socket_t) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
-        const op = try self.op_pool.create();
+        const op = try self.acquire();
         op.* = Op.accept(self, socket, context, accepted, failed);
         try op.prep();
         return op;
@@ -59,7 +70,7 @@ pub const Io = struct {
         comptime received: fn (@TypeOf(context), []const u8) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
-        const op = try self.op_pool.create();
+        const op = try self.acquire();
         op.* = Op.recv(self, socket, context, received, failed);
         try op.prep();
         return op;
@@ -73,7 +84,7 @@ pub const Io = struct {
         comptime sent: fn (@TypeOf(context), usize) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
-        const op = try self.op_pool.create();
+        const op = try self.acquire();
         op.* = Op.writev(self, socket, vec, context, sent, failed);
         try op.prep();
         return op;
@@ -86,24 +97,27 @@ pub const Io = struct {
         comptime tick: fn (@TypeOf(context)) Error!void,
         comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
-        const op = try self.op_pool.create();
+        const op = try self.acquire();
         op.* = Op.ticker(self, sec, context, tick, failed);
         try op.prep();
         return op;
     }
 
     pub fn close(self: *Io, socket: socket_t) !void {
-        const op = try self.op_pool.create();
+        const op = try self.acquire();
         op.* = Op.close(self, socket);
         try op.prep();
     }
 
     pub fn loop(self: *Io, run: Atomic(bool)) !void {
         var cqes: [256]std.os.linux.io_uring_cqe = undefined;
-        while (run.load(.monotonic)) {
+        var i: usize = 0;
+        while (run.load(.monotonic)) : (i +%= 1) {
             const n = try self.readCompletions(&cqes);
             if (n > 0)
                 try self.flushCompletions(cqes[0..n]);
+            if (i % 1024 == 0)
+                log.debug("loop round: {}, active ops: {}, completed ops: {}", .{ i, self.op_stat.active, self.op_stat.completed });
         }
     }
 
@@ -123,7 +137,7 @@ pub const Io = struct {
             if (cqe.user_data == 0) continue; // no op for this cqe
             const op: *Op = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
             if (op.context == 0) {
-                self.op_pool.destroy(op);
+                self.release(op);
                 continue;
             }
             while (true) {
@@ -141,7 +155,7 @@ pub const Io = struct {
                     return err;
                 };
                 switch (res) {
-                    .done => self.op_pool.destroy(op),
+                    .done => self.release(op),
                     .restart => try op.prep(),
                     .has_more => {},
                 }
