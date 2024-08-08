@@ -252,8 +252,7 @@ pub fn ServerType(Consumer: type) type {
                 // Iterates over ready consumers. Returns null when there is no
                 // ready consumers.
                 fn consumersIterator(self: *Channel) *ConsumersIterator {
-                    self.iterator.consumers = self.consumers.items;
-                    self.iterator.not_ready_count = 0;
+                    self.iterator.init(self.consumers.items);
                     return &self.iterator;
                 }
 
@@ -261,6 +260,11 @@ pub fn ServerType(Consumer: type) type {
                     consumers: []Consumer = undefined,
                     not_ready_count: usize = 0,
                     idx: usize = 0,
+
+                    fn init(self: *ConsumersIterator, consumers: []Consumer) void {
+                        self.consumers = consumers;
+                        self.not_ready_count = 0;
+                    }
 
                     fn next(self: *ConsumersIterator) ?Consumer {
                         const count = self.consumers.len;
