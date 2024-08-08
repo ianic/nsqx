@@ -218,7 +218,6 @@ pub fn ServerType(Consumer: type) type {
                 allocator: mem.Allocator,
                 topic: *Topic,
                 consumers: std.ArrayList(Consumer),
-                next_consumer: usize = 0,
                 in_flight_msgs: std.AutoArrayHashMap(u64, *ChannelMsg),
                 finished_seqences: std.PriorityQueue(u64, void, lessThan),
                 window_start: u64 = 0,
@@ -274,7 +273,7 @@ pub fn ServerType(Consumer: type) type {
                             self.idx += 1;
                             if (self.idx >= count) self.idx = 0;
                             const consumer = self.consumers[self.idx];
-                            if (consumer.ready()) return consumer;
+                            if (consumer.ready() > 0) return consumer;
                             self.not_ready_count += 1;
                         }
                     }
@@ -342,8 +341,8 @@ pub fn ServerType(Consumer: type) type {
 test "channel consumers iterator" {
     const allocator = testing.allocator;
     const T = struct {
-        _ready: bool = true,
-        fn ready(self: @This()) bool {
+        _ready: usize = 1,
+        fn ready(self: @This()) usize {
             return self._ready;
         }
     };
@@ -357,10 +356,10 @@ test "channel consumers iterator" {
     var iter = channel.consumersIterator();
     try testing.expectEqual(&consumer1, iter.next().?);
     try testing.expectEqual(&consumer1, iter.next().?);
-    consumer1._ready = false;
+    consumer1._ready = 0;
     try testing.expectEqual(null, iter.next());
 
-    consumer1._ready = true;
+    consumer1._ready = 1;
     var consumer2: T = .{};
     var consumer3: T = .{};
     channel = try server.sub(&consumer2, "topic", "channel");
