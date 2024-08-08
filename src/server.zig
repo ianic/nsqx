@@ -215,14 +215,15 @@ pub fn ServerType(Consumer: type) type {
 
         pub fn ChannelType() type {
             return struct {
-                topic: *Topic,
                 allocator: mem.Allocator,
+                topic: *Topic,
                 consumers: std.ArrayList(Consumer),
+                next_consumer: usize = 0,
                 in_flight_msgs: std.AutoArrayHashMap(u64, *ChannelMsg),
                 finished_seqences: std.PriorityQueue(u64, void, lessThan),
                 window_start: u64 = 0,
                 window_end: u64 = 0,
-                next_idx: usize = 0,
+                iterator: ConsumersIterator = .{},
 
                 pub fn init(allocator: mem.Allocator, topic: *Topic) Channel {
                     return .{
@@ -237,21 +238,8 @@ pub fn ServerType(Consumer: type) type {
                 }
 
                 fn wakeup(self: *Channel) !void {
-                    if (self.consumers.items.len == 0) return;
-                    const len = self.consumers.items.len;
-                    if (self.next_idx > len) self.next_idx = 0;
-
-                    var not_ready_consumers: usize = 0;
-                    while (not_ready_consumers < len) {
-                        const consumer = self.consumers.items[self.next_idx];
-                        self.next_idx += 1;
-                        if (self.next_idx == len) self.next_idx = 0;
-
-                        if (consumer.ready() == 0) {
-                            not_ready_consumers += 1;
-                            continue;
-                        }
-
+                    var iter = self.consumersIterator();
+                    while (iter.next()) |consumer| {
                         if (try self.getMsg()) |msg| {
                             // TODO: handle error return message to queue
                             try consumer.sendMsg(msg);
@@ -260,6 +248,33 @@ pub fn ServerType(Consumer: type) type {
                         }
                     }
                 }
+
+                // Iterates over ready consumers. Returns null when there is no
+                // ready consumers.
+                fn consumersIterator(self: *Channel) *ConsumersIterator {
+                    self.iterator.consumers = self.consumers.items;
+                    self.iterator.not_ready_count = 0;
+                    return &self.iterator;
+                }
+
+                const ConsumersIterator = struct {
+                    consumers: []Consumer = undefined,
+                    not_ready_count: usize = 0,
+                    idx: usize = 0,
+
+                    fn next(self: *ConsumersIterator) ?Consumer {
+                        const count = self.consumers.len;
+                        if (count == 0) return null;
+                        while (true) {
+                            if (self.not_ready_count == count) return null;
+                            self.idx += 1;
+                            if (self.idx >= count) self.idx = 0;
+                            const consumer = self.consumers[self.idx];
+                            if (consumer.ready()) return consumer;
+                            self.not_ready_count += 1;
+                        }
+                    }
+                };
 
                 pub fn fin(self: *Channel, msg_id: [16]u8) !bool {
                     const seq = mem.readInt(u64, msg_id[8..], .big);
@@ -311,11 +326,52 @@ pub fn ServerType(Consumer: type) type {
 
                 fn deinit(self: *Channel) void {
                     self.consumers.deinit();
-                    self.in_flight_msgs.deinit();
                     for (self.in_flight_msgs.values()) |msg| self.allocator.destroy(msg);
+                    self.in_flight_msgs.deinit();
                     self.finished_seqences.deinit();
                 }
             };
         }
     };
+}
+
+test "channel consumers iterator" {
+    const allocator = testing.allocator;
+    const T = struct {
+        _ready: bool = true,
+        fn ready(self: @This()) bool {
+            return self._ready;
+        }
+    };
+
+    var server = ServerType(*T).init(allocator);
+    defer server.deinit();
+
+    var consumer1: T = .{};
+    var channel = try server.sub(&consumer1, "topic", "channel");
+
+    var iter = channel.consumersIterator();
+    try testing.expectEqual(&consumer1, iter.next().?);
+    try testing.expectEqual(&consumer1, iter.next().?);
+    consumer1._ready = false;
+    try testing.expectEqual(null, iter.next());
+
+    consumer1._ready = true;
+    var consumer2: T = .{};
+    var consumer3: T = .{};
+    channel = try server.sub(&consumer2, "topic", "channel");
+    channel = try server.sub(&consumer3, "topic", "channel");
+    try testing.expectEqual(3, channel.consumers.items.len);
+
+    iter = channel.consumersIterator();
+    try testing.expectEqual(3, iter.consumers.len);
+    try testing.expectEqual(&consumer2, iter.next().?);
+    try testing.expectEqual(&consumer3, iter.next().?);
+    try testing.expectEqual(&consumer1, iter.next().?);
+    try testing.expectEqual(&consumer2, iter.next().?);
+
+    iter = channel.consumersIterator();
+    try testing.expectEqual(&consumer3, iter.next().?);
+    try testing.expectEqual(&consumer1, iter.next().?);
+    try testing.expectEqual(&consumer2, iter.next().?);
 }
