@@ -1,12 +1,14 @@
 package main
 
 import (
-	"github.com/nsqio/go-nsq"
+	"fmt"
 	"log"
+	"time"
 
-	"os"
-	"os/signal"
-	"syscall"
+	"github.com/nsqio/go-nsq"
+	// "os"
+	// "os/signal"
+	// "syscall"
 )
 
 func main() {
@@ -20,13 +22,17 @@ func main() {
 	if err = producer.Ping(); err != nil {
 		log.Fatal(err)
 	}
-	if producer.Publish("topic", []byte("iso medo u ducan nije reko dobar dan")); err != nil {
-		log.Fatal(err)
+	for i := 0; i < 10; i++ {
+		msg := fmt.Sprintf("%d %d iso medo u ducan nije reko dobar dan", i, time.Now().Unix())
+
+		if producer.Publish("topic", []byte(msg)); err != nil {
+			log.Fatal(err)
+		}
 	}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	// sigChan := make(chan os.Signal, 1)
+	// signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	// <-sigChan
 
 	producer.Stop()
 }

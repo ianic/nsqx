@@ -148,7 +148,7 @@ const Conn = struct {
 
     fn init(self: *Conn) !void {
         self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
-        self.ticker_op = try self.io.ticker(5, self, tick, tickerFailed);
+        self.ticker_op = try self.io.ticker(30, self, tick, tickerFailed);
     }
 
     pub fn ready(self: Conn) u32 {
@@ -210,9 +210,9 @@ const Conn = struct {
                 },
                 .fin => |msg_id| {
                     if (self.channel) |channel| {
-                        const res = channel.fin(msg_id);
-                        //std.debug.print(".", .{});
                         self.in_flight -|= 1;
+                        const res = try channel.fin(msg_id);
+                        if (self.ready() > 0) try channel.ready(self);
                         log.debug("{} fin {x} {}", .{ self.socket, msg_id, res });
                     } else {
                         try self.close();
@@ -313,11 +313,8 @@ const Conn = struct {
             try self.respond(r);
             self.pending_response = null;
         }
-        if (self.send_op == null and self.ready_count > 0) {
+        if (self.ready() > 0)
             if (self.channel) |channel| try channel.ready(self);
-            // TODO javi se u channel da si spreman
-            //try self.testSendMsg();
-        }
     }
 
     fn sendFailed(self: *Conn, err: anyerror) Error!void {

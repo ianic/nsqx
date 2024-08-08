@@ -1,7 +1,9 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const mem = std.mem;
 const posix = std.posix;
 const log = std.log;
+const math = std.math;
 const testing = std.testing;
 
 pub const Message = struct {
@@ -133,6 +135,7 @@ pub fn ServerType(Consumer: type) type {
                 messages: std.ArrayList(TopicMsg),
                 channels: std.StringHashMap(*Channel),
                 sequence: u64 = 0,
+                messages_start_seq: u64 = 1,
 
                 pub fn init(allocator: mem.Allocator) Topic {
                     return .{
@@ -184,9 +187,7 @@ pub fn ServerType(Consumer: type) type {
 
                     var iter = self.channels.valueIterator();
                     while (iter.next()) |channel| {
-                        //if (channel.msg_id == 0 or channel.msg_id == last) {
-                        try channel.*.publish(msg);
-                        //                }
+                        try channel.*.wakeup();
                     }
                 }
 
@@ -197,7 +198,19 @@ pub fn ServerType(Consumer: type) type {
                     };
                     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
                 }
+
+                fn getMsg(self: *Topic, seq: usize) TopicMsg {
+                    const idx = seq - self.messages_start_seq;
+                    const tm = self.messages.items[idx];
+                    assert(tm.sequence == seq);
+                    return tm;
+                }
             };
+        }
+
+        fn lessThan(context: void, a: u64, b: u64) math.Order {
+            _ = context;
+            return math.order(a, b);
         }
 
         pub fn ChannelType() type {
@@ -205,31 +218,60 @@ pub fn ServerType(Consumer: type) type {
                 topic: *Topic,
                 allocator: mem.Allocator,
                 consumers: std.ArrayList(Consumer),
-                in_flight_msgs: std.AutoArrayHashMap(u64, ChannelMsg),
+                in_flight_msgs: std.AutoArrayHashMap(u64, *ChannelMsg),
+                finished_seqences: std.PriorityQueue(u64, void, lessThan),
+                window_start: u64 = 0,
+                window_end: u64 = 0,
+                next_idx: usize = 0,
 
                 pub fn init(allocator: mem.Allocator, topic: *Topic) Channel {
                     return .{
                         .allocator = allocator,
                         .topic = topic,
                         .consumers = std.ArrayList(Consumer).init(allocator),
-                        .in_flight_msgs = std.AutoArrayHashMap(u64, ChannelMsg).init(allocator),
+                        .in_flight_msgs = std.AutoArrayHashMap(u64, *ChannelMsg).init(allocator),
+                        .finished_seqences = std.PriorityQueue(u64, void, lessThan).init(allocator, {}),
+                        .window_start = topic.sequence,
+                        .window_end = topic.sequence,
                     };
                 }
 
-                fn publish(self: *Channel, topic_msg: TopicMsg) !void {
-                    const msg = (try self.in_flight_msgs.getOrPut(topic_msg.sequence)).value_ptr;
-                    msg.* = topic_msg.asChannelMsg();
-                    for (self.consumers.items) |consumer| {
-                        if (consumer.ready() > 0) {
-                            consumer.sendMsg(msg) catch unreachable; // TODO
-                            return;
+                fn wakeup(self: *Channel) !void {
+                    if (self.consumers.items.len == 0) return;
+                    const len = self.consumers.items.len;
+                    if (self.next_idx > len) self.next_idx = 0;
+
+                    var not_ready_consumers: usize = 0;
+                    while (not_ready_consumers < len) {
+                        const consumer = self.consumers.items[self.next_idx];
+                        self.next_idx += 1;
+                        if (self.next_idx == len) self.next_idx = 0;
+
+                        if (consumer.ready() == 0) {
+                            not_ready_consumers += 1;
+                            continue;
+                        }
+
+                        if (try self.getMsg()) |msg| {
+                            // TODO: handle error return message to queue
+                            try consumer.sendMsg(msg);
+                        } else {
+                            break;
                         }
                     }
                 }
 
-                pub fn fin(self: *Channel, msg_id: [16]u8) bool {
+                pub fn fin(self: *Channel, msg_id: [16]u8) !bool {
                     const seq = mem.readInt(u64, msg_id[8..], .big);
-                    return self.in_flight_msgs.swapRemove(seq);
+                    const ok = self.in_flight_msgs.swapRemove(seq);
+                    if (ok) {
+                        try self.finished_seqences.add(seq);
+                        while (self.finished_seqences.peek() == self.window_start + 1) {
+                            self.window_start = self.finished_seqences.remove();
+                        }
+                    }
+                    log.debug("fin {}-{}", .{ self.window_start, self.window_end });
+                    return ok;
                 }
 
                 fn sub(self: *Channel, consumer: Consumer) !void {
@@ -237,6 +279,7 @@ pub fn ServerType(Consumer: type) type {
                 }
 
                 pub fn unsub(self: *Channel, consumer: Consumer) void {
+                    // TODO remove in_flight messages of that consumer
                     for (self.consumers.items, 0..) |item, i| {
                         if (item.socket == consumer.socket) {
                             _ = self.consumers.swapRemove(i);
@@ -246,12 +289,31 @@ pub fn ServerType(Consumer: type) type {
                 }
 
                 pub fn ready(self: *Channel, consumer: Consumer) !void {
-                    _ = self;
-                    _ = consumer;
+                    // TODO send more than one message
+                    if (consumer.ready() == 0) return;
+                    if (try self.getMsg()) |msg| {
+                        try consumer.sendMsg(msg);
+                    }
+                }
+
+                fn getMsg(self: *Channel) !?*ChannelMsg {
+                    if (self.window_end < self.topic.sequence) {
+                        const topic_msg = self.topic.getMsg(self.window_end + 1);
+                        const msg = try self.allocator.create(ChannelMsg);
+                        msg.* = topic_msg.asChannelMsg();
+                        try self.in_flight_msgs.put(topic_msg.sequence, msg);
+                        self.window_end = topic_msg.sequence;
+                        log.debug("get {}-{}", .{ self.window_start, self.window_end });
+                        return msg;
+                    }
+                    return null;
                 }
 
                 fn deinit(self: *Channel) void {
                     self.consumers.deinit();
+                    self.in_flight_msgs.deinit();
+                    for (self.in_flight_msgs.values()) |msg| self.allocator.destroy(msg);
+                    self.finished_seqences.deinit();
                 }
             };
         }
