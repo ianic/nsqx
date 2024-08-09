@@ -48,6 +48,15 @@ pub const ChannelMsg = struct {
         return mem.readInt(u64, self.header[26..34], .big);
     }
 
+    fn id(self: ChannelMsg) [16]u8 {
+        return self.header[18..34].*;
+    }
+
+    fn less(context: void, a: *ChannelMsg, b: *ChannelMsg) math.Order {
+        _ = context;
+        return math.order(a.sequence(), b.sequence());
+    }
+
     test incAttempts {
         const t = TopicMsg{
             .sequence = 0x01020304050607,
@@ -72,6 +81,15 @@ pub const ChannelMsg = struct {
         try testing.expectEqualSlices(u8, expected[18..], c.header[18..]);
         c.incAttempts();
         try testing.expectEqual(3, c.header[17]);
+    }
+
+    fn seqFromId(msg_id: [16]u8) u64 {
+        return mem.readInt(u64, msg_id[8..], .big);
+    }
+    fn idFromSeq(seq: u64) [16]u8 {
+        var msg_id: [16]u8 = .{0} ** 16;
+        mem.writeInt(u64, msg_id[8..16], seq, .big);
+        return msg_id;
     }
 };
 
@@ -218,10 +236,18 @@ pub fn ServerType(Consumer: type) type {
                 allocator: mem.Allocator,
                 topic: *Topic,
                 consumers: std.ArrayList(Consumer),
-                in_flight_msgs: std.AutoArrayHashMap(u64, *ChannelMsg),
-                finished_seqences: std.PriorityQueue(u64, void, lessThan),
-                window_start: u64 = 0,
-                window_end: u64 = 0,
+                // Sent but not jet acknowledged (fin) messages
+                in_flight: std.AutoArrayHashMap(u64, *ChannelMsg),
+                // Re-queued by consumer or timed out
+                requeued: std.PriorityQueue(*ChannelMsg, void, ChannelMsg.less),
+                // Sequences for which we received fin but they are out of order
+                // so we can't move window.start
+                finished: std.PriorityQueue(u64, void, lessThan),
+                // Window to the topic messages.
+                window: struct {
+                    start: usize = 0, // Sequences before this are processed by channel
+                    end: usize = 0, //  Last sequence taken into channel
+                } = .{},
                 iterator: ConsumersIterator = .{},
 
                 pub fn init(allocator: mem.Allocator, topic: *Topic) Channel {
@@ -229,10 +255,10 @@ pub fn ServerType(Consumer: type) type {
                         .allocator = allocator,
                         .topic = topic,
                         .consumers = std.ArrayList(Consumer).init(allocator),
-                        .in_flight_msgs = std.AutoArrayHashMap(u64, *ChannelMsg).init(allocator),
-                        .finished_seqences = std.PriorityQueue(u64, void, lessThan).init(allocator, {}),
-                        .window_start = topic.sequence,
-                        .window_end = topic.sequence,
+                        .in_flight = std.AutoArrayHashMap(u64, *ChannelMsg).init(allocator),
+                        .finished = std.PriorityQueue(u64, void, lessThan).init(allocator, {}),
+                        .requeued = std.PriorityQueue(*ChannelMsg, void, ChannelMsg.less).init(allocator, {}),
+                        .window = .{ .start = topic.sequence, .end = topic.sequence },
                     };
                 }
 
@@ -280,16 +306,34 @@ pub fn ServerType(Consumer: type) type {
                 };
 
                 pub fn fin(self: *Channel, msg_id: [16]u8) !bool {
-                    const seq = mem.readInt(u64, msg_id[8..], .big);
-                    const ok = self.in_flight_msgs.swapRemove(seq);
-                    if (ok) {
-                        try self.finished_seqences.add(seq);
-                        while (self.finished_seqences.peek() == self.window_start + 1) {
-                            self.window_start = self.finished_seqences.remove();
+                    const seq = ChannelMsg.seqFromId(msg_id);
+                    if (self.in_flight.fetchSwapRemove(seq)) |kv| {
+                        const msg = kv.value;
+                        if (seq == self.window.start + 1) {
+                            self.window.start = seq;
+                        } else {
+                            try self.finished.add(seq);
                         }
+                        while (self.finished.peek() == self.window.start + 1) {
+                            self.window.start = self.finished.remove();
+                        }
+
+                        self.allocator.destroy(msg);
+                        log.debug("fin {}-{} true", .{ self.window.start, self.window.end });
+                        return true;
                     }
-                    log.debug("fin {}-{}", .{ self.window_start, self.window_end });
-                    return ok;
+                    log.debug("fin {}-{} false", .{ self.window.start, self.window.end });
+                    return false;
+                }
+
+                pub fn req(self: *Channel, msg_id: [16]u8) !bool {
+                    const seq = ChannelMsg.seqFromId(msg_id);
+                    if (self.in_flight.get(seq)) |msg| {
+                        msg.incAttempts();
+                        try self.requeued.add(msg);
+                        return self.in_flight.swapRemove(seq);
+                    }
+                    return false;
                 }
 
                 fn sub(self: *Channel, consumer: Consumer) !void {
@@ -315,13 +359,20 @@ pub fn ServerType(Consumer: type) type {
                 }
 
                 fn getMsg(self: *Channel) !?*ChannelMsg {
-                    if (self.window_end < self.topic.sequence) {
-                        const topic_msg = self.topic.getMsg(self.window_end + 1);
+                    // First look into re-queued messages
+                    if (self.requeued.removeOrNull()) |msg| {
+                        try self.in_flight.put(msg.sequence(), msg);
+                        return msg;
+                    }
+
+                    // Take next from the topic
+                    if (self.window.end < self.topic.sequence) {
+                        const topic_msg = self.topic.getMsg(self.window.end + 1);
                         const msg = try self.allocator.create(ChannelMsg);
                         msg.* = topic_msg.asChannelMsg();
-                        try self.in_flight_msgs.put(topic_msg.sequence, msg);
-                        self.window_end = topic_msg.sequence;
-                        log.debug("get {}-{}", .{ self.window_start, self.window_end });
+                        try self.in_flight.put(topic_msg.sequence, msg);
+                        self.window.end = topic_msg.sequence;
+                        log.debug("get {}-{}", .{ self.window.start, self.window.end });
                         return msg;
                     }
                     return null;
@@ -329,9 +380,11 @@ pub fn ServerType(Consumer: type) type {
 
                 fn deinit(self: *Channel) void {
                     self.consumers.deinit();
-                    for (self.in_flight_msgs.values()) |msg| self.allocator.destroy(msg);
-                    self.in_flight_msgs.deinit();
-                    self.finished_seqences.deinit();
+                    for (self.in_flight.values()) |msg| self.allocator.destroy(msg);
+                    while (self.requeued.removeOrNull()) |msg| self.allocator.destroy(msg);
+                    self.in_flight.deinit();
+                    self.finished.deinit();
+                    self.requeued.deinit();
                 }
             };
         }
@@ -377,4 +430,111 @@ test "channel consumers iterator" {
     try testing.expectEqual(&consumer3, iter.next().?);
     try testing.expectEqual(&consumer1, iter.next().?);
     try testing.expectEqual(&consumer2, iter.next().?);
+}
+
+test "channel fin req" {
+    const allocator = testing.allocator;
+    const T = struct {
+        ready_count: usize = 0,
+        last_seq: usize = 0,
+        last_id: [16]u8 = undefined,
+
+        const Self = @This();
+        fn ready(self: *Self) usize {
+            return self.ready_count;
+        }
+        fn sendMsg(self: *Self, msg: *ChannelMsg) !void {
+            self.last_seq = msg.sequence();
+            self.last_id = msg.id();
+            self.ready_count = 0;
+        }
+    };
+    const topic_name = "topic";
+    const channel_name = "channel";
+
+    var server = ServerType(*T).init(allocator);
+    defer server.deinit();
+
+    var consumer: T = .{};
+    var channel = try server.sub(&consumer, topic_name, channel_name);
+    const topic = channel.topic;
+
+    try server.publish(&consumer, topic_name, "1");
+    try server.publish(&consumer, topic_name, "2");
+    try server.publish(&consumer, topic_name, "3");
+
+    try testing.expectEqual(3, topic.messages.items.len);
+    try testing.expectEqual(0, channel.in_flight.count());
+    try testing.expectEqual(0, channel.requeued.count());
+    try channel.wakeup();
+    try testing.expectEqual(0, channel.in_flight.count());
+    try testing.expectEqual(0, channel.requeued.count());
+
+    // send 1
+    consumer.ready_count = 1;
+    try channel.wakeup();
+    try testing.expectEqual(1, consumer.last_seq);
+    // inspect
+    try testing.expectEqual(1, channel.in_flight.count());
+    try testing.expectEqual(0, channel.requeued.count());
+    try testing.expectEqual(0, channel.window.start);
+    try testing.expectEqual(1, channel.window.end);
+
+    try testing.expect(try channel.fin(consumer.last_id)); // fin 1
+    try testing.expectEqual(0, channel.in_flight.count());
+    try testing.expectEqual(0, channel.requeued.count());
+    try testing.expectEqual(1, channel.window.start);
+    try testing.expectEqual(1, channel.window.end);
+    try testing.expectEqual(0, channel.finished.count());
+
+    // send 2
+    consumer.ready_count = 1;
+    try channel.wakeup();
+    try testing.expectEqual(2, consumer.last_seq);
+
+    try testing.expectEqual(1, channel.in_flight.count());
+    try testing.expectEqual(0, channel.requeued.count());
+    try testing.expectEqual(1, channel.window.start);
+    try testing.expectEqual(2, channel.window.end);
+
+    // send 3
+    consumer.ready_count = 1;
+    try channel.wakeup();
+    try testing.expectEqual(3, consumer.last_seq);
+
+    try testing.expectEqual(2, channel.in_flight.count());
+    try testing.expectEqual(0, channel.requeued.count());
+    try testing.expectEqual(1, channel.window.start);
+    try testing.expectEqual(3, channel.window.end);
+
+    try testing.expect(try channel.req(ChannelMsg.idFromSeq(2))); // req 2
+    try testing.expectEqual(1, channel.in_flight.count());
+    try testing.expectEqual(1, channel.requeued.count());
+    try testing.expectEqual(1, channel.window.start);
+    try testing.expectEqual(3, channel.window.end);
+
+    try testing.expect(try channel.fin(ChannelMsg.idFromSeq(3))); // fin 3
+    try testing.expectEqual(0, channel.in_flight.count());
+    try testing.expectEqual(1, channel.requeued.count());
+    try testing.expectEqual(1, channel.window.start);
+    try testing.expectEqual(3, channel.window.end);
+    try testing.expectEqual(1, channel.finished.count());
+
+    // re send 2
+    consumer.ready_count = 1;
+    try channel.wakeup();
+    try testing.expectEqual(2, consumer.last_seq);
+
+    try testing.expectEqual(1, channel.in_flight.count());
+    try testing.expectEqual(0, channel.requeued.count());
+    try testing.expectEqual(1, channel.window.start);
+    try testing.expectEqual(3, channel.window.end);
+    try testing.expectEqual(1, channel.finished.count());
+
+    try testing.expect(try channel.fin(ChannelMsg.idFromSeq(2))); // fin 2
+    try testing.expectEqual(0, channel.in_flight.count());
+    try testing.expectEqual(0, channel.requeued.count());
+    try testing.expectEqual(3, channel.window.start);
+    try testing.expectEqual(3, channel.window.end);
+    try testing.expectEqual(0, channel.finished.count());
 }
