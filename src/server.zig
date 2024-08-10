@@ -291,11 +291,11 @@ pub fn ServerType(Consumer: type) type {
                     var iter = self.consumersIterator();
                     while (iter.next()) |consumer| {
                         if (try self.getMsg()) |msg| {
-                            // TODO: handle error return message to queue
-                            try consumer.sendMsg(msg);
-                        } else {
-                            break;
-                        }
+                            consumer.sendMsg(msg) catch |err| {
+                                log.err("failed to send msg {}, requeueing", .{err});
+                                assert(try self.req(msg.id()));
+                            };
+                        } else break;
                     }
                 }
 
