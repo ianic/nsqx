@@ -347,3 +347,8 @@ const FrameType = enum(u32) {
     err = 1,
     message = 2,
 };
+
+test {
+    _ = @import("server.zig");
+    _ = @import("protocol.zig");
+}

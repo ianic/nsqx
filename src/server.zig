@@ -94,6 +94,19 @@ pub const ChannelMsg = struct {
     }
 };
 
+fn timestamp() u64 {
+    var ts: posix.timespec = undefined;
+    posix.clock_gettime(.REALTIME, &ts) catch |err| switch (err) {
+        error.UnsupportedClock, error.Unexpected => return 0, // "Precision of timing depends on hardware and OS".
+    };
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn lessU64(context: void, a: u64, b: u64) math.Order {
+    _ = context;
+    return math.order(a, b);
+}
+
 test {
     _ = ChannelMsg;
     _ = TopicMsgList;
@@ -204,48 +217,34 @@ pub fn ServerType(Consumer: type) type {
                     };
                     self.messages.append(msg);
 
-                    { // wake up channels
+                    { // Notify all channels that there is pending message
                         var iter = self.channels.valueIterator();
                         while (iter.next()) |channel| try channel.*.publish(msg);
                     }
                 }
 
-                fn windowMoved(self: *Topic, first_seq: u64) void {
-                    if (self.channels.count() == 1) {
-                        self.messages.release(self.allocator, first_seq);
-                        return;
+                // Channel has finished sending all messages before and including seq.
+                // Release that pending messages.
+                fn finished(self: *Topic, seq: u64) void {
+                    switch (self.channels.count()) {
+                        0 => return,
+                        1 => {
+                            self.messages.release(self.allocator, seq);
+                            return;
+                        },
+                        else => {},
                     }
 
-                    // min window start of all channels
-                    var min: u64 = std.math.maxInt(u64);
+                    // Find min sequence of all channels
+                    var min_seq: u64 = std.math.maxInt(u64);
                     var iter = self.channels.valueIterator();
                     while (iter.next()) |channel| {
-                        const start = channel.*.sequence;
-                        if (start < min) min = start;
+                        const channel_seq = channel.*.sequence;
+                        if (channel_seq < min_seq) min_seq = channel_seq;
                     }
-                    self.messages.release(self.allocator, min);
-                }
-
-                fn timestamp() u64 {
-                    var ts: posix.timespec = undefined;
-                    posix.clock_gettime(.REALTIME, &ts) catch |err| switch (err) {
-                        error.UnsupportedClock, error.Unexpected => return 0, // "Precision of timing depends on hardware and OS".
-                    };
-                    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-                }
-
-                fn getMsg(self: *Topic, seq: usize) TopicMsg {
-                    const idx = seq - self.messages_start_seq;
-                    const tm = self.messages.items[idx];
-                    assert(tm.sequence == seq);
-                    return tm;
+                    self.messages.release(self.allocator, min_seq);
                 }
             };
-        }
-
-        fn lessThan(context: void, a: u64, b: u64) math.Order {
-            _ = context;
-            return math.order(a, b);
         }
 
         pub fn ChannelType() type {
@@ -259,7 +258,7 @@ pub fn ServerType(Consumer: type) type {
                 requeued: std.PriorityQueue(*ChannelMsg, void, ChannelMsg.less),
                 // Sequences for which we received fin but they are out of order
                 // so we can't move sequence
-                finished: std.PriorityQueue(u64, void, lessThan),
+                finished: std.PriorityQueue(u64, void, lessU64),
                 // Last sequence sent and acknowledged by some consumer
                 sequence: u64 = 0,
                 // Pointer to the next message in the topic, null if we reached
@@ -275,7 +274,7 @@ pub fn ServerType(Consumer: type) type {
                         .topic = topic,
                         .consumers = std.ArrayList(Consumer).init(allocator),
                         .in_flight = std.AutoArrayHashMap(u64, *ChannelMsg).init(allocator),
-                        .finished = std.PriorityQueue(u64, void, lessThan).init(allocator, {}),
+                        .finished = std.PriorityQueue(u64, void, lessU64).init(allocator, {}),
                         .requeued = std.PriorityQueue(*ChannelMsg, void, ChannelMsg.less).init(allocator, {}),
                         // Channel starts at the last topic message at the moment of channel creation
                         .sequence = topic.sequence,
@@ -347,7 +346,7 @@ pub fn ServerType(Consumer: type) type {
                                 self.sequence = self.finished.remove();
                             }
                             if (self.sequence > before) {
-                                self.topic.windowMoved(self.sequence);
+                                self.topic.finished(self.sequence);
                             }
                         }
                         return true;
@@ -576,6 +575,99 @@ test "channel fin req" {
         try testing.expectEqual(3, channel.sequence);
         try testing.expectEqual(0, channel.finished.count());
         try testing.expectEqual(0, topic.messages.count());
+    }
+}
+
+test "multiple channels" {
+    const allocator = testing.allocator;
+    const T = struct {
+        const Self = @This();
+
+        channel: ?*ServerType(*Self).Channel = null,
+        sequences: std.ArrayList(u64),
+        ready_no: usize = 1,
+
+        fn init(alloc: mem.Allocator) Self {
+            return .{ .sequences = std.ArrayList(u64).init(alloc) };
+        }
+
+        fn deinit(self: *Self) void {
+            self.sequences.deinit();
+        }
+
+        fn ready(self: *Self) usize {
+            self.ready_no += 1;
+            return if (self.ready_no % 2 == 0) 1 else 0;
+        }
+
+        fn sendMsg(self: *Self, msg: *ChannelMsg) !void {
+            try self.sequences.append(msg.sequence());
+            assert(try self.channel.?.fin(msg.id()));
+        }
+    };
+    const Server = ServerType(*T);
+    const topic_name = "topic";
+    const channel_name1 = "channel1";
+    const channel_name2 = "channel2";
+
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    var c1: T = T.init(allocator);
+    defer c1.deinit();
+    c1.channel = try server.sub(&c1, topic_name, channel_name1);
+
+    const no = 1024;
+
+    { // single channel, single consumer
+        for (0..no) |_|
+            try server.publish(&c1, topic_name, "message body");
+
+        try testing.expectEqual(no, c1.sequences.items.len);
+        var expected: u64 = 1;
+        for (c1.sequences.items) |seq| {
+            try testing.expectEqual(expected, seq);
+            expected += 1;
+        }
+    }
+
+    var c2: T = T.init(allocator);
+    defer c2.deinit();
+    c2.channel = try server.sub(&c2, topic_name, channel_name2);
+
+    { // two channels on the same topic
+        for (0..no) |_|
+            try server.publish(&c1, topic_name, "another message body");
+
+        try testing.expectEqual(no * 2, c1.sequences.items.len);
+        try testing.expectEqual(no, c2.sequences.items.len);
+    }
+
+    var c3: T = T.init(allocator);
+    defer c3.deinit();
+    c3.channel = try server.sub(&c3, topic_name, channel_name2);
+
+    { // two channels, one has single consumer another has two consumers
+        for (0..no) |_|
+            try server.publish(&c1, topic_name, "yet another message body");
+
+        try testing.expectEqual(no * 3, c1.sequences.items.len);
+        // Two consumers on the same channel are all getting some messages
+        try testing.expectEqual(no * 2, c3.sequences.items.len + c2.sequences.items.len);
+        // But all of them are delivered in order and can be found in one or another consumer
+        var idx3: usize = 0;
+        var idx2: usize = no;
+        for (no * 2 + 1..no * 3 + 1) |seq| {
+            if (c3.sequences.items[idx3] == seq) {
+                idx3 += 1;
+                continue;
+            }
+            if (c2.sequences.items[idx2] == seq) {
+                idx2 += 1;
+                continue;
+            }
+            unreachable;
+        }
     }
 }
 
