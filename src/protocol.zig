@@ -33,6 +33,13 @@ pub const Message = union(MessageTag) {
     cls: void,
     nop: void,
     auth: []const u8,
+
+    pub fn isPublish(self: @This()) bool {
+        return switch (self) {
+            .spub, .mpub, .dpub => true,
+            else => false,
+        };
+    }
 };
 
 const MessageTag = enum {
@@ -111,8 +118,9 @@ pub const Parser = struct {
                 try p.matchString("MPUB ");
                 const topic = try p.readString('\n');
                 const size = try p.readInt();
+                if (size < 4) return error.Invalid;
                 const msgs = try p.readInt();
-                const data = try p.readBytes(size);
+                const data = try p.readBytes(size - 4);
                 // check that individual messages has [size][data]
                 const data_end_pos = p.pos;
                 p.pos -= data.len;
@@ -305,7 +313,7 @@ test "pub" {
 
 test "mpub" {
     const buf = "MPUB pero\n" ++
-        "\x00\x00\x00\x10" ++ // body size
+        "\x00\x00\x00\x14" ++ // body size
         "\x00\x00\x00\x02" ++ // number of message
         "\x00\x00\x00\x05zdero" ++ // message 1 [size][body]
         "\x00\x00\x00\x03bar"; // message 2 [size][body]
