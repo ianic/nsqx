@@ -146,9 +146,20 @@ pub fn ServerType(Consumer: type) type {
             return t;
         }
 
-        pub fn publish(self: *Server, consumer: Consumer, topic: []const u8, data: []const u8) !void {
+        pub fn publish(self: *Server, topic: []const u8, data: []const u8) !void {
             const t = try self.getTopic(topic);
-            return try t.publish(consumer, data);
+            return try t.publish(data);
+        }
+
+        pub fn mpub(self: *Server, topic: []const u8, msgs: u32, data: []const u8) !void {
+            const t = try self.getTopic(topic);
+            var pos: usize = 0;
+            for (0..msgs) |_| {
+                const len = mem.readInt(u32, data[pos..][0..4], .big);
+                pos += 4;
+                try t.publish(data[pos..][0..len]);
+                pos += len;
+            }
         }
 
         pub fn deinit(self: *Server) void {
@@ -207,7 +218,7 @@ pub fn ServerType(Consumer: type) type {
                     self.messages.deinit(self.allocator);
                 }
 
-                pub fn publish(self: *Topic, _: Consumer, data: []const u8) !void {
+                pub fn publish(self: *Topic, data: []const u8) !void {
                     const msg = try self.allocator.create(TopicMsg);
                     self.sequence += 1;
                     msg.* = .{
@@ -491,9 +502,9 @@ test "channel fin req" {
     var channel = try server.sub(&consumer, topic_name, channel_name);
     const topic = channel.topic;
 
-    try server.publish(&consumer, topic_name, "1");
-    try server.publish(&consumer, topic_name, "2");
-    try server.publish(&consumer, topic_name, "3");
+    try server.publish(topic_name, "1");
+    try server.publish(topic_name, "2");
+    try server.publish(topic_name, "3");
 
     { // 3 messages in topic, 0 take by channel
         try testing.expectEqual(3, topic.messages.count());
@@ -621,7 +632,7 @@ test "multiple channels" {
 
     { // single channel, single consumer
         for (0..no) |_|
-            try server.publish(&c1, topic_name, "message body");
+            try server.publish(topic_name, "message body");
 
         try testing.expectEqual(no, c1.sequences.items.len);
         var expected: u64 = 1;
@@ -637,7 +648,7 @@ test "multiple channels" {
 
     { // two channels on the same topic
         for (0..no) |_|
-            try server.publish(&c1, topic_name, "another message body");
+            try server.publish(topic_name, "another message body");
 
         try testing.expectEqual(no * 2, c1.sequences.items.len);
         try testing.expectEqual(no, c2.sequences.items.len);
@@ -649,7 +660,7 @@ test "multiple channels" {
 
     { // two channels, one has single consumer another has two consumers
         for (0..no) |_|
-            try server.publish(&c1, topic_name, "yet another message body");
+            try server.publish(topic_name, "yet another message body");
 
         try testing.expectEqual(no * 3, c1.sequences.items.len);
         // Two consumers on the same channel are all getting some messages
