@@ -20,7 +20,7 @@ pub const Io = struct {
         completed: usize = 0,
     } = .{},
 
-    pub fn init(self: *Io, ring_entries: u16, recv_buffers: u16, recv_buffer_len: u16) !void {
+    pub fn init(self: *Io, ring_entries: u16, recv_buffers: u16, recv_buffer_len: u32) !void {
         self.ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL & linux.IORING_SETUP_SINGLE_ISSUER);
         self.recv_buf_grp = try self.initBufferGroup(1, recv_buffers, recv_buffer_len);
         self.op_pool = std.heap.MemoryPool(Op).init(self.allocator);
