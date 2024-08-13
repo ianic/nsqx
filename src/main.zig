@@ -18,10 +18,10 @@ const Server = @import("server.zig").ServerType(*Conn);
 const Channel = @import("server.zig").ServerType(*Conn).Channel;
 const ChannelMsg = @import("server.zig").ChannelMsg;
 
-const recv_buffers = 4096;
-const recv_buffer_len = 4096;
+const recv_buffers = 256;
+const recv_buffer_len = 64 * 1024;
 const port = 4150;
-const ring_entries: u16 = 16;
+const ring_entries: u16 = 16 * 1024;
 
 var server: Server = undefined;
 
@@ -132,7 +132,8 @@ const Conn = struct {
     in_flight: u32 = 0,
     unanswered_heartbeats: u8 = 0,
 
-    recv_buf: ?[]u8 = null, // holds unprocessed bytes from previous receive
+    recv_buf: []u8 = &.{}, // holds unprocessed bytes from previous receive
+    recv_buf_pos: usize = 0,
     send_header_buf: [34]u8 = undefined, // message header
     send_vec: [2]posix.iovec_const = undefined, // header and body
 
@@ -174,21 +175,15 @@ const Conn = struct {
         }
     }
 
-    // fn testSendMsg(self: *Conn) !void {
-    //     var id: [16]u8 = .{0} ** 16;
-    //     mem.writeInt(usize, id[8..], self.msg_id, .big);
-    //     self.msg_id += 1;
-    //     const m = Message{ .body = "Hello world!", .id = id };
-    //     try self.sendMsg(m);
-    // }
-
     fn received(self: *Conn, bytes: []const u8) Error!void {
+        var is_publish = false;
         var parser = protocol.Parser{ .buf = try self.appendRecvBuf(bytes) };
         while (parser.next() catch |err| {
             log.err("{} protocol parser failed {}", .{ self.socket, err });
             return try self.close();
         }) |msg| {
             self.unanswered_heartbeats = 0;
+            is_publish = msg.isPublish();
             switch (msg) {
                 .identify => |data| {
                     log.debug("{} identify: {s}", .{ self.socket, data });
@@ -201,7 +196,12 @@ const Conn = struct {
                 },
                 .spub => |spub| {
                     log.debug("{} publish: {s}", .{ self.socket, spub.topic });
-                    try server.publish(self, spub.topic, spub.data);
+                    try server.publish(spub.topic, spub.data);
+                    try self.respond(.ok);
+                },
+                .mpub => |mpub| {
+                    log.debug("{} multi publish: {s} messages: {}", .{ self.socket, mpub.topic, mpub.msgs });
+                    try server.mpub(mpub.topic, mpub.msgs, mpub.data);
                     try self.respond(.ok);
                 },
                 .rdy => |count| {
@@ -237,30 +237,44 @@ const Conn = struct {
         if (unparsed.len > 0)
             try self.setRecvBuf(unparsed)
         else
-            self.deinitRecvBuf();
+            self.deinitRecvBuf(is_publish);
     }
 
     fn appendRecvBuf(self: *Conn, bytes: []const u8) ![]const u8 {
-        if (self.recv_buf) |old_buf| {
-            const new_buf = try self.allocator.realloc(old_buf, old_buf.len + bytes.len);
-            @memcpy(new_buf[old_buf.len..], bytes);
-            self.recv_buf = new_buf;
-            return new_buf;
-        }
-        return bytes;
+        if (self.recv_buf_pos == 0) return bytes;
+
+        const new_len = self.recv_buf_pos + bytes.len;
+        if (new_len > self.recv_buf.len)
+            self.recv_buf = try self.allocator.realloc(self.recv_buf, new_len);
+        @memcpy(self.recv_buf[self.recv_buf_pos..][0..bytes.len], bytes);
+        self.recv_buf_pos = new_len;
+        return self.recv_buf[0..new_len];
     }
 
     fn setRecvBuf(self: *Conn, bytes: []const u8) !void {
-        const new_buf = try self.allocator.dupe(u8, bytes);
-        self.deinitRecvBuf();
-        self.recv_buf = new_buf;
+        if (self.recv_buf_pos > 0) {
+            if (self.recv_buf_pos == bytes.len) return;
+            if (bytes.len * 2 <= self.recv_buf_pos) {
+                @memcpy(self.recv_buf[0..bytes.len], bytes);
+            } else {
+                std.mem.copyForwards(u8, self.recv_buf[0..bytes.len], bytes);
+            }
+            self.recv_buf_pos = bytes.len;
+            return;
+        }
+        if (bytes.len > self.recv_buf.len) {
+            self.allocator.free(self.recv_buf);
+            self.recv_buf = try self.allocator.alloc(u8, bytes.len);
+        }
+        @memcpy(self.recv_buf[0..bytes.len], bytes);
+        self.recv_buf_pos = bytes.len;
     }
 
-    fn deinitRecvBuf(self: *Conn) void {
-        if (self.recv_buf) |recv_buf| {
-            self.allocator.free(recv_buf);
-            self.recv_buf = null;
-        }
+    fn deinitRecvBuf(self: *Conn, lazy: bool) void {
+        self.recv_buf_pos = 0;
+        if (lazy) return;
+        self.allocator.free(self.recv_buf);
+        self.recv_buf = &.{};
     }
 
     fn recvFailed(self: *Conn, err: anyerror) Error!void {
@@ -337,7 +351,7 @@ const Conn = struct {
         if (self.recv_op) |op| op.unsubscribe(self);
         if (self.send_op) |op| op.unsubscribe(self);
 
-        self.deinitRecvBuf();
+        self.deinitRecvBuf(false);
         self.listener.release(self);
     }
 };
