@@ -26,13 +26,15 @@ const ring_entries: u16 = 16 * 1024;
 var server: Server = undefined;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    // defer _ = gpa.deinit();
+    // const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
 
     const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, port);
     const socket = (try addr.listen(.{ .reuse_address = true })).stream.handle;
 
+    //  IORING_SETUP_DEFER_TASKRUN
     var ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL & linux.IORING_SETUP_SINGLE_ISSUER);
     defer ring.deinit();
 
@@ -133,13 +135,10 @@ const Conn = struct {
     unanswered_heartbeats: u8 = 0,
 
     recv_buf: []u8 = &.{}, // holds unprocessed bytes from previous receive
-    recv_buf_pos: usize = 0,
     send_header_buf: [34]u8 = undefined, // message header
     send_vec: [2]posix.iovec_const = undefined, // header and body
 
     channel: ?*Channel = null,
-
-    //msg_id: usize = 0,
 
     const Response = enum {
         ok,
@@ -176,14 +175,12 @@ const Conn = struct {
     }
 
     fn received(self: *Conn, bytes: []const u8) Error!void {
-        var is_publish = false;
         var parser = protocol.Parser{ .buf = try self.appendRecvBuf(bytes) };
         while (parser.next() catch |err| {
             log.err("{} protocol parser failed {}", .{ self.socket, err });
             return try self.close();
         }) |msg| {
             self.unanswered_heartbeats = 0;
-            is_publish = msg.isPublish();
             switch (msg) {
                 .identify => |data| {
                     log.debug("{} identify: {s}", .{ self.socket, data });
@@ -237,42 +234,25 @@ const Conn = struct {
         if (unparsed.len > 0)
             try self.setRecvBuf(unparsed)
         else
-            self.deinitRecvBuf(is_publish);
+            self.deinitRecvBuf();
     }
 
     fn appendRecvBuf(self: *Conn, bytes: []const u8) ![]const u8 {
-        if (self.recv_buf_pos == 0) return bytes;
-
-        const new_len = self.recv_buf_pos + bytes.len;
-        if (new_len > self.recv_buf.len)
-            self.recv_buf = try self.allocator.realloc(self.recv_buf, new_len);
-        @memcpy(self.recv_buf[self.recv_buf_pos..][0..bytes.len], bytes);
-        self.recv_buf_pos = new_len;
-        return self.recv_buf[0..new_len];
+        if (self.recv_buf.len == 0) return bytes;
+        const old_len = self.recv_buf.len;
+        self.recv_buf = try self.allocator.realloc(self.recv_buf, old_len + bytes.len);
+        @memcpy(self.recv_buf[old_len..], bytes);
+        return self.recv_buf;
     }
 
     fn setRecvBuf(self: *Conn, bytes: []const u8) !void {
-        if (self.recv_buf_pos > 0) {
-            if (self.recv_buf_pos == bytes.len) return;
-            if (bytes.len * 2 <= self.recv_buf_pos) {
-                @memcpy(self.recv_buf[0..bytes.len], bytes);
-            } else {
-                std.mem.copyForwards(u8, self.recv_buf[0..bytes.len], bytes);
-            }
-            self.recv_buf_pos = bytes.len;
-            return;
-        }
-        if (bytes.len > self.recv_buf.len) {
-            self.allocator.free(self.recv_buf);
-            self.recv_buf = try self.allocator.alloc(u8, bytes.len);
-        }
-        @memcpy(self.recv_buf[0..bytes.len], bytes);
-        self.recv_buf_pos = bytes.len;
+        if (self.recv_buf.len == bytes.len) return;
+        const new_buf = try self.allocator.dupe(u8, bytes);
+        self.deinitRecvBuf();
+        self.recv_buf = new_buf;
     }
 
-    fn deinitRecvBuf(self: *Conn, lazy: bool) void {
-        self.recv_buf_pos = 0;
-        if (lazy) return;
+    fn deinitRecvBuf(self: *Conn) void {
         self.allocator.free(self.recv_buf);
         self.recv_buf = &.{};
     }
@@ -351,7 +331,7 @@ const Conn = struct {
         if (self.recv_op) |op| op.unsubscribe(self);
         if (self.send_op) |op| op.unsubscribe(self);
 
-        self.deinitRecvBuf(false);
+        self.deinitRecvBuf();
         self.listener.release(self);
     }
 };
