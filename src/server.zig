@@ -220,11 +220,12 @@ pub fn ServerType(Consumer: type) type {
 
                 pub fn publish(self: *Topic, data: []const u8) !void {
                     const msg = try self.allocator.create(TopicMsg);
+                    const body = try self.allocator.dupe(u8, data);
                     self.sequence += 1;
                     msg.* = .{
                         .sequence = self.sequence,
                         .timestamp = timestamp(),
-                        .body = try self.allocator.dupe(u8, data),
+                        .body = body,
                     };
                     self.messages.append(msg);
 

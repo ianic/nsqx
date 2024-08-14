@@ -1,0 +1,53 @@
+[bench_writer] 2024/08/12 11:01:27 duration: 10.002706478s - 459.444mb/s - 2408808.061ops/s - 0.415us/op total messages count: 24094600
+
+ hydra  nsq/bench/bench_writer  master [!?] ➜ ./bench_writer
+[bench_writer] 2024/08/12 11:02:03 duration: 10.004275953s - 460.599mb/s - 2414867.414ops/s - 0.414us/op total messages count: 24159000
+
+# baseline
+ hydra  nsq/bench/bench_writer  master [!?] ➜ ./bench_writer
+[bench_writer] 2024/08/12 11:02:54 duration: 10.002490329s - 459.084mb/s - 2406920.598ops/s - 0.415us/op total messages count: 24075200
+
+# iskljucio message body dupe
+ hydra  nsq/bench/bench_writer  master [!?] ➜ ./bench_writer
+[bench_writer] 2024/08/12 11:03:55 duration: 10.001556153s - 1155.624mb/s - 6058797.158ops/s - 0.165us/op total messages count: 60597400
+
+# page_allocator
+ hydra  nsq/bench/bench_writer  master [!?] ➜ ./bench_writer
+[bench_writer] 2024/08/12 11:07:13 duration: 10.017888607s - 59.445mb/s - 311662.479ops/s - 3.209us/op total messages count: 3122200
+
+# iskljucio server.mpub radi samo io
+ hydra  nsq/bench/bench_writer  master [!?] ➜ ./bench_writer
+[bench_writer] 2024/08/12 11:10:31 duration: 10.001925729s - 2328.371mb/s - 12207369.192ops/s - 0.082us/op total messages count: 122097200
+
+# uz malo inteligentniji recv_buf release
+ hydra  nsq/bench/bench_writer  master [!?] ➜ ./bench_writer
+[bench_writer] 2024/08/12 12:02:33 duration: 10.002439835s - 525.556mb/s - 2755427.721ops/s - 0.363us/op total messages count: 27561000
+
+ hydra  nsq/bench/bench_writer  master [!?] ➜ ./bench_writer
+[bench_writer] 2024/08/13 17:07:37 duration: 10.002725205s - 537.783mb/s - 2819531.620ops/s - 0.355us/op total messages count: 28203000
+
+# ako sada maknem msg body dupe, time dobijem glupost al cist da izmjerim koliko to kosta
+ hydra  nsq/bench/bench_writer  master [!?] ➜ ./bench_writer
+[bench_writer] 2024/08/13 17:19:31 duration: 10.001513258s - 1449.247mb/s - 7598230.192ops/s - 0.132us/op total messages count: 75993800
+
+
+ hydra  nsq  master [!?] ➜ ./bench.sh
+# using --mem-queue-size=32000000 --data-path= --size=200 --batch-size=200
+# compiling/running nsqd
+# creating topic/channel
+# compiling bench_reader/bench_writer
+PUB: [bench_writer] 2024/08/12 10:12:27 duration: 10.005205903s - 579.471mb/s - 3038098.395ops/s - 0.329us/op total messages count: 30396800
+SUB: [bench_reader] 2024/08/12 10:12:37 duration: 10.001450544s - 97.291mb/s - 510086.410ops/s - 1.960us/op total messages count 5101604
+waiting for pprof...
+
+
+# kada sam promjenio allocator na std.heap.c_allocator
+ hydra  nsq/bench/bench_writer  master [!?] ➜ ./bench_writer
+[bench_writer] 2024/08/14 10:32:19 duration: 10.001899631s - 1243.714mb/s - 6520641.319ops/s - 0.153us/op total messages count: 65218800
+
+# promjena u odnosu na gpa:
+ hydra  nsq/bench/bench_writer  master [!?] ➜ ./bench_writer
+[bench_writer] 2024/08/14 10:34:11 duration: 10.008415495s - 533.753mb/s - 2798405.004ops/s - 0.357us/op total messages count: 28007600
+
+
+1243 533 = 2.332 times
