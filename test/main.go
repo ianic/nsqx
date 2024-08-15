@@ -11,6 +11,7 @@ import (
 
 func main() {
 	cfg := nsq.NewConfig()
+	cfg.MaxInFlight = 16
 
 	consumer, err := nsq.NewConsumer("topic", "channel", cfg)
 	if err != nil {

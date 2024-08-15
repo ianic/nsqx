@@ -136,10 +136,10 @@ const Conn = struct {
 
     recv_buf: []u8 = &.{}, // holds unprocessed bytes from previous receive
     send_header_buf: [34]u8 = undefined, // message header
-    send_vec: [2]posix.iovec_const = undefined, // header and body
-
+    send_vec: [msgs_batch_size * 2]posix.iovec_const = undefined, // header and body
     channel: ?*Channel = null,
 
+    const msgs_batch_size = 64;
     const Response = enum {
         ok,
         cls,
@@ -154,7 +154,10 @@ const Conn = struct {
     pub fn ready(self: Conn) u32 {
         if (self.send_op != null) return 0;
         if (self.in_flight > self.ready_count) return 0;
-        return self.ready_count - self.in_flight;
+        return @min(
+            self.ready_count - self.in_flight,
+            msgs_batch_size,
+        );
     }
 
     fn tick(self: *Conn) Error!void {
@@ -204,12 +207,14 @@ const Conn = struct {
                 .rdy => |count| {
                     log.debug("{} ready: {}", .{ self.socket, count });
                     self.ready_count = count;
+                    if (self.channel) |channel|
+                        if (self.ready() > 0) channel.ready(self);
                 },
                 .fin => |msg_id| {
                     if (self.channel) |channel| {
                         self.in_flight -|= 1;
                         const res = try channel.fin(msg_id);
-                        if (self.ready() > 0) try channel.ready(self);
+                        if (self.ready() > 0) channel.ready(self);
                         log.debug("{} fin {x} {}", .{ self.socket, msg_id, res });
                     } else {
                         try self.close();
@@ -273,20 +278,31 @@ const Conn = struct {
         mem.writeInt(u32, hdr[4..8], @intFromEnum(FrameType.response), .big);
         @memcpy(hdr[8..][0..data.len], data);
         self.send_vec[0] = .{ .base = &self.send_header_buf, .len = data.len + 8 };
-        self.send_vec[1].len = 0;
-        try self.send();
+        try self.send(1);
+    }
+
+    pub fn sendMsgs(self: *Conn, msgs: []*ChannelMsg) !void {
+        assert(msgs.len <= msgs_batch_size);
+        var n: usize = 0;
+        for (msgs) |msg| {
+            self.send_vec[n] = .{ .base = &msg.header, .len = msg.header.len };
+            self.send_vec[n + 1] = .{ .base = msg.body.ptr, .len = msg.body.len };
+            n += 2;
+        }
+        try self.send(n);
+        self.in_flight += @intCast(msgs.len);
     }
 
     pub fn sendMsg(self: *Conn, msg: *ChannelMsg) !void {
         self.send_vec[0] = .{ .base = &msg.header, .len = msg.header.len };
         self.send_vec[1] = .{ .base = msg.body.ptr, .len = msg.body.len };
-        try self.send();
+        try self.send(2);
         self.in_flight += 1;
     }
 
-    fn send(self: *Conn) !void {
+    fn send(self: *Conn, vec_len: usize) !void {
         assert(self.send_op == null);
-        self.send_op = try self.io.writev(self.socket, &self.send_vec, self, sent, sendFailed);
+        self.send_op = try self.io.writev(self.socket, self.send_vec[0..vec_len], self, sent, sendFailed);
     }
 
     fn respond(self: *Conn, rsp: Response) !void {
@@ -308,7 +324,7 @@ const Conn = struct {
             self.pending_response = null;
         }
         if (self.ready() > 0)
-            if (self.channel) |channel| try channel.ready(self);
+            if (self.channel) |channel| channel.ready(self);
     }
 
     fn sendFailed(self: *Conn, err: anyerror) Error!void {

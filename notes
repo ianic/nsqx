@@ -51,3 +51,11 @@ waiting for pprof...
 
 
 1243 533 = 2.332 times
+
+# reader batch size 1, batch size 128
+[bench_reader] 2024/08/15 12:19:55 duration: 10.001249796s - 160.441mb/s - 841173.171ops/s - 1.189us/op total messages count 8412783
+[bench_reader] 2024/08/15 12:19:16 duration: 10.001134326s - 574.463mb/s - 3011840.759ops/s - 0.332us/op total messages count 30121824
+
+# batch size 32, 64
+[bench_reader] 2024/08/15 12:20:46 duration: 10.001501673s - 509.811mb/s - 2672875.621ops/s - 0.374us/op total messages count 26732770
+[bench_reader] 2024/08/15 12:21:36 duration: 10.001139127s - 543.656mb/s - 2850325.412ops/s - 0.351us/op total messages count 28506501

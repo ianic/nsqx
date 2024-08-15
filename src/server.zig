@@ -300,15 +300,50 @@ pub fn ServerType(Consumer: type) type {
                 }
 
                 fn wakeup(self: *Channel) !void {
+                    //var msgs_buf: [256]*ChannelMsg = undefined;
                     var iter = self.consumersIterator();
                     while (iter.next()) |consumer| {
-                        if (try self.getMsg()) |msg| {
-                            consumer.sendMsg(msg) catch |err| {
-                                log.err("failed to send msg {}, requeueing", .{err});
-                                assert(try self.req(msg.id()));
-                            };
-                        } else break;
+                        if (self.fillConsumer(consumer) == 0) break;
+
+                        // var msgs = msgs_buf[0..@min(consumer.ready(), msgs_buf.len)];
+                        // var n: usize = 0;
+                        // while (n < msgs.len) : (n += 1) {
+                        //     if (try self.getMsg()) |msg| msgs[n] = msg else break;
+                        // }
+                        // if (n == 0) break;
+                        // consumer.sendMsgs(msgs[0..n]) catch |err| {
+                        //     log.err("failed to send msg {}, requeueing", .{err});
+                        //     for (msgs[0..n]) |msg|
+                        //         assert(try self.req(msg.id()));
+                        // };
+
+                        //     while (consumer.ready() > 0) {
+                        //         if (try self.getMsg()) |msg| consumer.prepSend(msg);
+                        //             consumer.sendMsg(msg) catch |err| {
+                        //                 log.err("failed to send msg {}, requeueing", .{err});
+                        //                 assert(try self.req(msg.id()));
+                        //             };
+                        //         } else break;
+                        // }
                     }
+                }
+
+                // TODO error handling
+                fn fillConsumer(self: *Channel, consumer: Consumer) usize {
+                    var msgs_buf: [256]*ChannelMsg = undefined;
+                    var msgs = msgs_buf[0..@min(consumer.ready(), msgs_buf.len)];
+                    var n: usize = 0;
+                    while (n < msgs.len) : (n += 1) {
+                        if (self.getMsg() catch null) |msg| msgs[n] = msg else break;
+                    }
+                    if (n == 0) return 0;
+                    consumer.sendMsgs(msgs[0..n]) catch |err| {
+                        log.err("failed to send msg {}, requeueing", .{err});
+                        for (msgs[0..n]) |msg|
+                            assert(self.req(msg.id()) catch false);
+                        return 0;
+                    };
+                    return n;
                 }
 
                 // Iterates over ready consumers. Returns null when there is no
@@ -390,12 +425,12 @@ pub fn ServerType(Consumer: type) type {
                     }
                 }
 
-                pub fn ready(self: *Channel, consumer: Consumer) !void {
-                    // TODO send more than one message
+                pub fn ready(self: *Channel, consumer: Consumer) void {
                     if (consumer.ready() == 0) return;
-                    if (try self.getMsg()) |msg| {
-                        try consumer.sendMsg(msg);
-                    }
+                    _ = self.fillConsumer(consumer);
+                    // if (try self.getMsg()) |msg| {
+                    //     try consumer.sendMsg(msg);
+                    // }
                 }
 
                 fn getMsg(self: *Channel) !?*ChannelMsg {

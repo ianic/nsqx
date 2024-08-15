@@ -320,25 +320,12 @@ pub const Op = struct {
                 switch (cqe.err()) {
                     .SUCCESS => {
                         const n: usize = @intCast(cqe.res);
-                        // handle short send
-                        var v = op.args.writev.vec;
-                        const send_len = v[0].len + v[1].len;
-                        if (n < send_len) {
-                            log.debug("writev short send n: {} len: {} vec0: {} vec1: {}", .{ n, send_len, v[0].len, v[1].len });
-                            if (n > v[0].len) {
-                                const n1 = n - v[0].len;
-                                v[1].base += n1;
-                                v[1].len -= n1;
-                                v[0].len = 0;
-                            } else {
-                                v[0].base += n;
-                                v[0].len -= n;
-                            }
+                        const v = resizeIovec(op.args.writev.vec, n);
+                        if (v.len > 0) { // restart on short send
+                            log.warn("short send {}", .{n}); // TODO: remove
                             op.args.writev.vec = v;
-                            v = op.args.writev.vec;
                             return .restart;
                         }
-
                         try sent(ctx, n);
                     },
                     .INTR => return .restart,
@@ -401,3 +388,41 @@ pub const Op = struct {
 };
 
 const testing = std.testing;
+
+// Remove prefix len from iovecs
+fn resizeIovec(iovecs: []posix.iovec_const, prefix_len: usize) []posix.iovec_const {
+    if (iovecs.len == 0) return iovecs[0..0];
+    var i: usize = 0;
+    var n: usize = prefix_len;
+    while (n >= iovecs[i].len) {
+        n -= iovecs[i].len;
+        i += 1;
+        if (i >= iovecs.len) return iovecs[0..0];
+    }
+    iovecs[i].base += n;
+    iovecs[i].len -= n;
+    return iovecs[i..];
+}
+
+test "resize iovec" {
+    const data = "iso medo u ducan";
+    var iovecs = [_]posix.iovec_const{
+        .{ .base = data.ptr, .len = 4 },
+        .{ .base = data[4..].ptr, .len = 5 },
+        .{ .base = data[9..].ptr, .len = 7 },
+    };
+
+    var ret = resizeIovec(iovecs[0..], 6);
+    try testing.expectEqual(2, ret.len);
+    try testing.expectEqual(3, ret[0].len);
+    try testing.expectEqual(7, ret[1].len);
+    try testing.expectEqualStrings("do ", ret[0].base[0..ret[0].len]);
+    try testing.expectEqualStrings("u ducan", ret[1].base[0..ret[1].len]);
+
+    ret = resizeIovec(ret, 5);
+    try testing.expectEqual(1, ret.len);
+    try testing.expectEqualStrings("ducan", ret[0].base[0..ret[0].len]);
+
+    ret = resizeIovec(ret, 5);
+    try testing.expectEqual(0, ret.len);
+}
