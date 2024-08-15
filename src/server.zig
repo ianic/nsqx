@@ -6,12 +6,7 @@ const log = std.log;
 const math = std.math;
 const testing = std.testing;
 
-pub const Message = struct {
-    id: [16]u8 = .{0} ** 16,
-    timestamp: u64 = 0,
-    attempts: u16 = 0,
-    body: []const u8,
-};
+pub const max_msgs_send_batch_size = 512;
 
 const TopicMsg = struct {
     sequence: u64,
@@ -84,9 +79,10 @@ pub const ChannelMsg = struct {
         try testing.expectEqual(3, c.header[17]);
     }
 
-    fn seqFromId(msg_id: [16]u8) u64 {
+    pub fn seqFromId(msg_id: [16]u8) u64 {
         return mem.readInt(u64, msg_id[8..], .big);
     }
+
     fn idFromSeq(seq: u64) [16]u8 {
         var msg_id: [16]u8 = .{0} ** 16;
         mem.writeInt(u64, msg_id[8..16], seq, .big);
@@ -300,50 +296,27 @@ pub fn ServerType(Consumer: type) type {
                 }
 
                 fn wakeup(self: *Channel) !void {
-                    //var msgs_buf: [256]*ChannelMsg = undefined;
                     var iter = self.consumersIterator();
-                    while (iter.next()) |consumer| {
-                        if (self.fillConsumer(consumer) == 0) break;
-
-                        // var msgs = msgs_buf[0..@min(consumer.ready(), msgs_buf.len)];
-                        // var n: usize = 0;
-                        // while (n < msgs.len) : (n += 1) {
-                        //     if (try self.getMsg()) |msg| msgs[n] = msg else break;
-                        // }
-                        // if (n == 0) break;
-                        // consumer.sendMsgs(msgs[0..n]) catch |err| {
-                        //     log.err("failed to send msg {}, requeueing", .{err});
-                        //     for (msgs[0..n]) |msg|
-                        //         assert(try self.req(msg.id()));
-                        // };
-
-                        //     while (consumer.ready() > 0) {
-                        //         if (try self.getMsg()) |msg| consumer.prepSend(msg);
-                        //             consumer.sendMsg(msg) catch |err| {
-                        //                 log.err("failed to send msg {}, requeueing", .{err});
-                        //                 assert(try self.req(msg.id()));
-                        //             };
-                        //         } else break;
-                        // }
-                    }
+                    while (iter.next()) |consumer|
+                        if (!self.fillConsumer(consumer)) break;
                 }
 
                 // TODO error handling
-                fn fillConsumer(self: *Channel, consumer: Consumer) usize {
-                    var msgs_buf: [256]*ChannelMsg = undefined;
+                fn fillConsumer(self: *Channel, consumer: Consumer) bool {
+                    var msgs_buf: [max_msgs_send_batch_size]*ChannelMsg = undefined;
                     var msgs = msgs_buf[0..@min(consumer.ready(), msgs_buf.len)];
                     var n: usize = 0;
                     while (n < msgs.len) : (n += 1) {
                         if (self.getMsg() catch null) |msg| msgs[n] = msg else break;
                     }
-                    if (n == 0) return 0;
+                    if (n == 0) return false;
                     consumer.sendMsgs(msgs[0..n]) catch |err| {
                         log.err("failed to send msg {}, requeueing", .{err});
                         for (msgs[0..n]) |msg|
                             assert(self.req(msg.id()) catch false);
-                        return 0;
+                        return false;
                     };
-                    return n;
+                    return n == msgs.len;
                 }
 
                 // Iterates over ready consumers. Returns null when there is no
@@ -371,7 +344,9 @@ pub fn ServerType(Consumer: type) type {
                             self.idx += 1;
                             if (self.idx >= count) self.idx = 0;
                             const consumer = self.consumers[self.idx];
-                            if (consumer.ready() > 0) return consumer;
+                            if (consumer.ready() > 0) {
+                                return consumer;
+                            }
                             self.not_ready_count += 1;
                         }
                     }

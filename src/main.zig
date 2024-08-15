@@ -17,6 +17,7 @@ const Message = @import("server.zig").Message;
 const Server = @import("server.zig").ServerType(*Conn);
 const Channel = @import("server.zig").ServerType(*Conn).Channel;
 const ChannelMsg = @import("server.zig").ChannelMsg;
+const max_msgs_send_batch_size = @import("server.zig").max_msgs_send_batch_size;
 
 const recv_buffers = 256;
 const recv_buffer_len = 64 * 1024;
@@ -34,8 +35,11 @@ pub fn main() !void {
     const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, port);
     const socket = (try addr.listen(.{ .reuse_address = true })).stream.handle;
 
-    //  IORING_SETUP_DEFER_TASKRUN
-    var ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL & linux.IORING_SETUP_SINGLE_ISSUER);
+    var ring = try IoUring.init(
+        ring_entries,
+        linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER,
+        // linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_DEFER_TASKRUN,
+    );
     defer ring.deinit();
 
     var io = Io{ .allocator = allocator };
@@ -136,10 +140,18 @@ const Conn = struct {
 
     recv_buf: []u8 = &.{}, // holds unprocessed bytes from previous receive
     send_header_buf: [34]u8 = undefined, // message header
-    send_vec: [msgs_batch_size * 2]posix.iovec_const = undefined, // header and body
+    send_vec: [max_msgs_send_batch_size * 2]posix.iovec_const = undefined, // header and body for each message
+    send_msghdr: posix.msghdr_const = .{
+        .iov = undefined,
+        .iovlen = undefined,
+        .name = null,
+        .namelen = 0,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    },
     channel: ?*Channel = null,
 
-    const msgs_batch_size = 64;
     const Response = enum {
         ok,
         cls,
@@ -156,7 +168,7 @@ const Conn = struct {
         if (self.in_flight > self.ready_count) return 0;
         return @min(
             self.ready_count - self.in_flight,
-            msgs_batch_size,
+            max_msgs_send_batch_size,
         );
     }
 
@@ -215,7 +227,7 @@ const Conn = struct {
                         self.in_flight -|= 1;
                         const res = try channel.fin(msg_id);
                         if (self.ready() > 0) channel.ready(self);
-                        log.debug("{} fin {x} {}", .{ self.socket, msg_id, res });
+                        log.debug("{} fin {} {}", .{ self.socket, ChannelMsg.seqFromId(msg_id), res });
                     } else {
                         try self.close();
                     }
@@ -282,7 +294,7 @@ const Conn = struct {
     }
 
     pub fn sendMsgs(self: *Conn, msgs: []*ChannelMsg) !void {
-        assert(msgs.len <= msgs_batch_size);
+        assert(msgs.len <= max_msgs_send_batch_size);
         var n: usize = 0;
         for (msgs) |msg| {
             self.send_vec[n] = .{ .base = &msg.header, .len = msg.header.len };
@@ -302,7 +314,10 @@ const Conn = struct {
 
     fn send(self: *Conn, vec_len: usize) !void {
         assert(self.send_op == null);
-        self.send_op = try self.io.writev(self.socket, self.send_vec[0..vec_len], self, sent, sendFailed);
+        self.send_msghdr.iov = &self.send_vec;
+        self.send_msghdr.iovlen = @intCast(vec_len);
+        self.send_op = try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed);
+        //self.send_op = try self.io.writev(self.socket, self.send_vec[0..vec_len], self, sent, sendFailed);
     }
 
     fn respond(self: *Conn, rsp: Response) !void {
@@ -339,13 +354,13 @@ const Conn = struct {
     fn close(self: *Conn) !void {
         log.debug("{} close", .{self.socket});
         if (self.channel) |channel| channel.unsub(self);
-        try self.io.close(self.socket);
         if (self.ticker_op) |op| {
             try op.cancel();
             op.unsubscribe(self);
         }
         if (self.recv_op) |op| op.unsubscribe(self);
         if (self.send_op) |op| op.unsubscribe(self);
+        try self.io.close(self.socket);
 
         self.deinitRecvBuf();
         self.listener.release(self);
