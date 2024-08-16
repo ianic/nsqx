@@ -94,7 +94,6 @@ pub const Io = struct {
         self: *Io,
         socket: socket_t,
         msghdr: *posix.msghdr_const,
-        //vec: []posix.iovec_const,
         context: anytype,
         comptime sent: fn (@TypeOf(context), usize) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
@@ -152,7 +151,7 @@ pub const Io = struct {
             if (cqe.user_data == 0) continue; // no op for this cqe
             const op: *Op = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
             if (op.context == 0) {
-                self.release(op);
+                if (!flagMore(cqe)) self.release(op);
                 continue;
             }
             while (true) {
@@ -169,16 +168,21 @@ pub const Io = struct {
                     }
                     return err;
                 };
-                switch (res) {
-                    .done => self.release(op),
-                    .restart => try op.prep(),
-                    .has_more => {},
+                if (!flagMore(cqe)) {
+                    switch (res) {
+                        .done => self.release(op),
+                        .restart => try op.prep(),
+                    }
                 }
                 break;
             }
         }
     }
 };
+
+fn flagMore(cqe: linux.io_uring_cqe) bool {
+    return cqe.flags & linux.IORING_CQE_F_MORE > 0;
+}
 
 pub const Error = error{
     OutOfMemory,
@@ -198,7 +202,6 @@ pub const Op = struct {
 
     const CallbackResult = enum {
         done,
-        has_more,
         restart,
     };
 
@@ -269,9 +272,7 @@ pub const Op = struct {
                         return .done;
                     },
                 }
-                if (cqe.flags & linux.IORING_CQE_F_MORE == 0)
-                    return .restart;
-                return .has_more;
+                return .restart;
             }
         };
         return .{
@@ -303,19 +304,17 @@ pub const Op = struct {
 
                         const buffer_id = try cqe.buffer_id();
                         const bytes = op.io.recv_buf_grp.get(buffer_id)[0..n];
+                        defer op.io.recv_buf_grp.put(buffer_id);
                         try received(ctx, bytes);
-                        op.io.recv_buf_grp.put(buffer_id);
                     },
-                    .NOBUFS => log.warn("recv buffer group NOBUFS temporary error", .{}),
+                    .NOBUFS => {}, //log.warn("recv buffer group NOBUFS temporary error", .{}),
                     .INTR => {},
                     else => |errno| {
                         try failed(ctx, errFromErrno(errno));
                         return .done;
                     },
                 }
-                if (cqe.flags & linux.IORING_CQE_F_MORE == 0)
-                    return .restart;
-                return .has_more;
+                return .restart;
             }
         };
         return .{
@@ -395,7 +394,7 @@ pub const Op = struct {
                             m += op.args.sendv.msghdr.iov[i].len;
                         // While sending with MSG_WAITALL we don't expect to get short send
                         if (n < m) {
-                            log.warn("unexpected short send len: {} sent: {}", .{ m, n });
+                            log.warn("{} unexpected short send len: {} sent: {}", .{ op.args.sendv.socket, m, n });
                             var v: []posix.iovec_const = undefined;
                             v.ptr = @constCast(op.args.sendv.msghdr.iov);
                             v.len = @intCast(op.args.sendv.msghdr.iovlen);
@@ -444,9 +443,7 @@ pub const Op = struct {
                         return .done;
                     },
                 }
-                if (cqe.flags & linux.IORING_CQE_F_MORE == 0)
-                    return .restart;
-                return .has_more;
+                return .restart;
             }
         };
         return .{
