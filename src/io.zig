@@ -14,16 +14,96 @@ pub const Io = struct {
     allocator: mem.Allocator,
     ring: IoUring = undefined,
     recv_buf_grp: IoUring.BufferGroup = undefined,
-    op_pool: std.heap.MemoryPool(Op) = undefined,
-    op_stat: struct {
-        active: usize = 0,
-        completed: usize = 0,
+    recv_buf_grp_stat: struct {
+        success: usize = 0,
+        no_bufs: usize = 0,
+
+        pub fn noBufs(self: @This()) f64 {
+            const total = self.success + self.no_bufs;
+            if (total == 0) return 0;
+            return @as(f64, @floatFromInt(self.no_bufs)) / @as(f64, @floatFromInt(total)) * 100;
+        }
     } = .{},
+    stat: Stat = .{},
+
+    const Stat = struct {
+        all: SubCom = .{},
+
+        accept: SubCom = .{},
+        close: SubCom = .{},
+        recv: SubCom = .{},
+        writev: SubCom = .{},
+        sendv: SubCom = .{},
+        ticker: SubCom = .{},
+
+        const SubCom = struct {
+            submitted: usize = 0,
+            completed: usize = 0,
+            restarted: usize = 0,
+            max_active: usize = 0,
+
+            pub fn active(self: @This()) usize {
+                return self.submitted - self.restarted - self.completed;
+            }
+            fn sub(self: *SubCom) void {
+                self.submitted += 1;
+                if (self.active() > self.max_active)
+                    self.max_active = self.active();
+            }
+            fn comp(self: *SubCom) void {
+                self.completed += 1;
+            }
+            fn restart(self: *SubCom) void {
+                self.restarted += 1;
+            }
+            pub fn print(self: @This()) void {
+                std.debug.print(
+                    "active: {:>8}, max active: {:>8}, submitted: {:>8}, restarted: {:>8}, completed: {:>8}",
+                    .{ self.active(), self.max_active, self.submitted, self.restarted, self.completed },
+                );
+            }
+        };
+
+        fn sub(self: *Stat, op: *Op) void {
+            self.all.sub();
+            switch (op.args) {
+                .accept => self.accept.sub(),
+                .close => self.close.sub(),
+                .recv => self.recv.sub(),
+                .writev => self.writev.sub(),
+                .sendv => self.sendv.sub(),
+                .ticker => self.ticker.sub(),
+            }
+        }
+
+        fn comp(self: *Stat, op: *Op) void {
+            self.all.comp();
+            switch (op.args) {
+                .accept => self.accept.comp(),
+                .close => self.close.comp(),
+                .recv => self.recv.comp(),
+                .writev => self.writev.comp(),
+                .sendv => self.sendv.comp(),
+                .ticker => self.ticker.comp(),
+            }
+        }
+
+        fn restart(self: *Stat, op: *Op) void {
+            self.all.restart();
+            switch (op.args) {
+                .accept => self.accept.restart(),
+                .close => self.close.restart(),
+                .recv => self.recv.restart(),
+                .writev => self.writev.restart(),
+                .sendv => self.sendv.restart(),
+                .ticker => self.ticker.restart(),
+            }
+        }
+    };
 
     pub fn init(self: *Io, ring_entries: u16, recv_buffers: u16, recv_buffer_len: u32) !void {
         self.ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL & linux.IORING_SETUP_SINGLE_ISSUER);
         self.recv_buf_grp = try self.initBufferGroup(1, recv_buffers, recv_buffer_len);
-        self.op_pool = std.heap.MemoryPool(Op).init(self.allocator);
     }
 
     fn initBufferGroup(self: *Io, id: u16, count: u16, size: u32) !IoUring.BufferGroup {
@@ -35,19 +115,16 @@ pub const Io = struct {
     pub fn deinit(self: *Io) void {
         self.allocator.free(self.recv_buf_grp.buffers);
         self.recv_buf_grp.deinit();
-        self.op_pool.deinit();
         self.ring.deinit();
     }
 
     fn acquire(self: *Io) !*Op {
-        self.op_stat.active += 1;
-        return try self.op_pool.create();
+        return try self.allocator.create(Op);
     }
 
     fn release(self: *Io, op: *Op) void {
-        self.op_stat.active -= 1;
-        self.op_stat.completed +%= 1;
-        self.op_pool.destroy(op);
+        self.stat.comp(op);
+        self.allocator.destroy(op);
     }
 
     pub fn accept(
@@ -125,13 +202,10 @@ pub const Io = struct {
 
     pub fn loop(self: *Io, run: Atomic(bool)) !void {
         var cqes: [256]std.os.linux.io_uring_cqe = undefined;
-        var i: usize = 0;
-        while (run.load(.monotonic)) : (i +%= 1) {
+        while (run.load(.monotonic)) {
             const n = try self.readCompletions(&cqes);
             if (n > 0)
                 try self.flushCompletions(cqes[0..n]);
-            if (i % 1024 == 0)
-                log.debug("loop round: {}, active ops: {}, completed ops: {}", .{ i, self.op_stat.active, self.op_stat.completed });
         }
     }
 
@@ -171,7 +245,10 @@ pub const Io = struct {
                 if (!flagMore(cqe)) {
                     switch (res) {
                         .done => self.release(op),
-                        .restart => try op.prep(),
+                        .restart => {
+                            self.stat.restart(op);
+                            try op.prep();
+                        },
                     }
                 }
                 break;
@@ -242,14 +319,15 @@ pub const Op = struct {
     }
 
     fn prep(op: *Op) PrepError!void {
+        op.io.stat.sub(op);
         const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
         switch (op.args) {
             .accept => |socket| _ = try op.io.ring.accept_multishot(@intFromPtr(op), socket, null, null, 0),
             .close => |socket| _ = try op.io.ring.close(@intFromPtr(op), socket),
             .recv => |socket| _ = try op.io.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
-            .writev => |*args| _ = try op.io.ring.writev(@intFromPtr(op), args.socket, args.vec, 0),
-            .sendv => |*args| _ = try op.io.ring.sendmsg(@intFromPtr(op), args.socket, args.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
-            .ticker => |ts| _ = try op.io.ring.timeout(@intFromPtr(op), &ts, 0, IORING_TIMEOUT_MULTISHOT),
+            .writev => |*arg| _ = try op.io.ring.writev(@intFromPtr(op), arg.socket, arg.vec, 0),
+            .sendv => |*arg| _ = try op.io.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
+            .ticker => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, IORING_TIMEOUT_MULTISHOT),
         }
     }
 
@@ -306,8 +384,12 @@ pub const Op = struct {
                         const bytes = op.io.recv_buf_grp.get(buffer_id)[0..n];
                         defer op.io.recv_buf_grp.put(buffer_id);
                         try received(ctx, bytes);
+                        op.io.recv_buf_grp_stat.success += 1;
                     },
-                    .NOBUFS => {}, //log.warn("recv buffer group NOBUFS temporary error", .{}),
+                    .NOBUFS => {
+                        op.io.recv_buf_grp_stat.no_bufs += 1;
+                        //log.warn("{} recv buffer group NOBUFS temporary error", .{op.args.recv});
+                    },
                     .INTR => {},
                     else => |errno| {
                         try failed(ctx, errFromErrno(errno));

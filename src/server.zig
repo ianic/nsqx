@@ -5,7 +5,10 @@ const posix = std.posix;
 const log = std.log;
 const math = std.math;
 const testing = std.testing;
+const socket_t = posix.socket_t;
 
+// TODO: can't set this larger than 512, getting InvalidArgument in send
+// why?
 pub const max_msgs_send_batch_size = 512;
 
 const TopicMsg = struct {
@@ -33,6 +36,7 @@ const TopicMsg = struct {
 pub const ChannelMsg = struct {
     header: [34]u8,
     body: []const u8,
+    in_flight_socket: socket_t = 0,
 
     fn incAttempts(self: *ChannelMsg) void {
         const buf = self.header[16..18];
@@ -298,20 +302,24 @@ pub fn ServerType(Consumer: type) type {
                 fn wakeup(self: *Channel) !void {
                     var iter = self.consumersIterator();
                     while (iter.next()) |consumer|
-                        if (!self.fillConsumer(consumer)) break;
+                        if (!try self.fillConsumer(consumer)) break;
                 }
 
                 // TODO error handling
-                fn fillConsumer(self: *Channel, consumer: Consumer) bool {
+                fn fillConsumer(self: *Channel, consumer: Consumer) !bool {
                     var msgs_buf: [max_msgs_send_batch_size]*ChannelMsg = undefined;
                     var msgs = msgs_buf[0..@min(consumer.ready(), msgs_buf.len)];
                     var n: usize = 0;
                     while (n < msgs.len) : (n += 1) {
-                        if (self.getMsg() catch null) |msg| msgs[n] = msg else break;
+                        if (self.getMsg() catch null) |msg| {
+                            msg.in_flight_socket = consumer.socket;
+                            try self.in_flight.put(msg.sequence(), msg);
+                            msgs[n] = msg;
+                        } else break;
                     }
                     if (n == 0) return false;
                     consumer.sendMsgs(msgs[0..n]) catch |err| {
-                        log.err("failed to send msg {}, requeueing", .{err});
+                        log.err("failed to send msg {}, re-queuing", .{err});
                         for (msgs[0..n]) |msg|
                             assert(self.req(msg.id()) catch false);
                         return false;
@@ -379,6 +387,7 @@ pub fn ServerType(Consumer: type) type {
                 pub fn req(self: *Channel, msg_id: [16]u8) !bool {
                     const seq = ChannelMsg.seqFromId(msg_id);
                     if (self.in_flight.get(seq)) |msg| {
+                        msg.in_flight_socket = 0;
                         msg.incAttempts();
                         try self.requeued.add(msg);
                         return self.in_flight.swapRemove(seq);
@@ -390,7 +399,19 @@ pub fn ServerType(Consumer: type) type {
                     try self.consumers.append(consumer);
                 }
 
-                pub fn unsub(self: *Channel, consumer: Consumer) void {
+                pub fn unsub(self: *Channel, consumer: Consumer) !void {
+                    //log.info("unsub {}, in flight {}", .{ consumer.socket, self.in_flight.count() });
+                    outer: while (true) {
+                        for (self.in_flight.values()) |msg| {
+                            if (msg.in_flight_socket == consumer.socket) {
+                                //log.info("req on unsub {}", .{consumer.socket});
+                                _ = try self.req(msg.id());
+                                continue :outer; // restart on delete from in_flight
+                            }
+                        }
+                        break;
+                    }
+
                     // TODO remove in_flight messages of that consumer
                     for (self.consumers.items, 0..) |item, i| {
                         if (item.socket == consumer.socket) {
@@ -400,25 +421,19 @@ pub fn ServerType(Consumer: type) type {
                     }
                 }
 
-                pub fn ready(self: *Channel, consumer: Consumer) void {
+                pub fn ready(self: *Channel, consumer: Consumer) !void {
                     if (consumer.ready() == 0) return;
-                    _ = self.fillConsumer(consumer);
-                    // if (try self.getMsg()) |msg| {
-                    //     try consumer.sendMsg(msg);
-                    // }
+                    _ = try self.fillConsumer(consumer);
                 }
 
                 fn getMsg(self: *Channel) !?*ChannelMsg {
                     // First look into re-queued messages
-                    if (self.requeued.removeOrNull()) |msg| {
-                        try self.in_flight.put(msg.sequence(), msg);
-                        return msg;
-                    }
+                    if (self.requeued.removeOrNull()) |msg| return msg;
+
                     // Then try to find next message in topic
                     if (self.nextTopicMsg()) |topic_msg| {
                         const msg = try self.allocator.create(ChannelMsg);
                         msg.* = topic_msg.asChannelMsg();
-                        try self.in_flight.put(topic_msg.sequence, msg);
                         return msg;
                     }
                     return null;
@@ -489,6 +504,7 @@ test "channel consumers iterator" {
 test "channel fin req" {
     const allocator = testing.allocator;
     const T = struct {
+        socket: socket_t = 0,
         ready_count: usize = 0,
         last_seq: usize = 0,
         last_id: [16]u8 = undefined,
@@ -605,6 +621,7 @@ test "multiple channels" {
     const T = struct {
         const Self = @This();
 
+        socket: socket_t = 0,
         channel: ?*ServerType(*Self).Channel = null,
         sequences: std.ArrayList(u64),
         ready_no: usize = 1,
@@ -734,9 +751,20 @@ const TopicMsgList = struct {
         self.last = null;
     }
 
-    fn count(self: *Self) u64 {
+    pub fn count(self: *Self) u64 {
         if (self.last == null) return 0;
         return self.last.?.sequence - self.first.?.sequence + 1;
+    }
+
+    pub fn size(self: *Self) u64 {
+        if (self.last == null) return 0;
+        var s: u64 = 0;
+        var node = self.first.?;
+        while (true) {
+            s += node.body.len + @sizeOf(TopicMsg);
+            if (node.next) |n| node = n else break;
+        }
+        return s;
     }
 
     test TopicMsgList {

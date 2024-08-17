@@ -26,6 +26,10 @@ const ring_entries: u16 = 16 * 1024;
 
 var server: Server = undefined;
 
+pub const std_options = std.Options{
+    .log_level = .info,
+};
+
 pub fn main() !void {
     // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     // defer _ = gpa.deinit();
@@ -54,7 +58,78 @@ pub fn main() !void {
     try listener.accept(socket);
 
     catchSignals();
-    try io.loop(run_loop);
+    while (true) {
+        try io.loop(run_loop);
+        const sig = signal.load(.monotonic);
+        signal.store(0, .release);
+        run_loop.store(true, .release);
+        switch (sig) {
+            posix.SIG.USR1 => {
+                const print = std.debug.print;
+                print("listener connections:\n", .{});
+                print("  active {}, accepted: {}, completed: {}\n", .{ listener.accepted - listener.completed, listener.accepted, listener.completed });
+
+                print("io operations:", .{});
+                print("\n  all    ", .{});
+                io.stat.all.print();
+                print("\n  recv   ", .{});
+                io.stat.recv.print();
+                print("\n  sendv  ", .{});
+                io.stat.sendv.print();
+                print("\n  ticker ", .{});
+                io.stat.ticker.print();
+                print("\n  close  ", .{});
+                io.stat.close.print();
+                print("\n  accept ", .{});
+                io.stat.accept.print();
+                print("\n", .{});
+
+                print(
+                    "  receive buffers group:\n    success: {}, no-buffs: {} {d:5.2}%\n",
+                    .{ io.recv_buf_grp_stat.success, io.recv_buf_grp_stat.no_bufs, io.recv_buf_grp_stat.noBufs() },
+                );
+
+                print("server topics: {}\n", .{server.topics.count()});
+                var ti = server.topics.iterator();
+                while (ti.next()) |te| {
+                    const topic_name = te.key_ptr.*;
+                    const topic = te.value_ptr.*;
+                    const size = topic.messages.size();
+                    print("\t{s} messages: {d} bytes: {} {}Mb {}Gb, sequence: {}\n", .{
+                        topic_name,
+                        topic.messages.count(),
+                        size,
+                        size / 1024 / 1024,
+                        size / 1024 / 1024 / 1024,
+                        topic.sequence,
+                    });
+
+                    var ci = topic.channels.iterator();
+                    while (ci.next()) |ce| {
+                        const channel_name = ce.key_ptr.*;
+                        const channel = ce.value_ptr.*;
+                        print("\t --{s} consumers: {} in flight messages: {} offset: {}\n", .{
+                            channel_name,
+                            channel.consumers.items.len,
+                            channel.in_flight.count(),
+                            channel.sequence,
+                        });
+                    }
+                }
+            },
+            posix.SIG.USR2 => {
+                const c = @cImport(@cInclude("malloc.h"));
+
+                c.malloc_stats();
+                const ret = c.malloc_trim(0);
+                log.info("malloc_trim: {}", .{ret});
+                c.malloc_stats();
+            },
+            posix.SIG.TERM, posix.SIG.INT => break,
+            else => {},
+        }
+    }
+
     log.debug("done", .{});
 }
 
@@ -67,12 +142,7 @@ fn catchSignals() void {
             .handler = struct {
                 fn wrapper(sig: c_int) callconv(.C) void {
                     signal.store(sig, .release);
-                    switch (sig) {
-                        posix.SIG.TERM, posix.SIG.INT => {
-                            run_loop.store(false, .release);
-                        },
-                        else => {}, // ignore USR1, USR2, PIPE
-                    }
+                    run_loop.store(false, .release);
                 }
             }.wrapper,
         },
@@ -89,18 +159,18 @@ fn catchSignals() void {
 const Listener = struct {
     allocator: mem.Allocator,
     io: *Io,
-    conns_pool: std.heap.MemoryPool(Conn),
+    accepted: usize = 0,
+    completed: usize = 0,
 
     fn init(allocator: mem.Allocator, io: *Io) !Listener {
         return .{
             .allocator = allocator,
             .io = io,
-            .conns_pool = std.heap.MemoryPool(Conn).init(allocator),
         };
     }
 
     fn deinit(self: *Listener) void {
-        self.conns_pool.deinit();
+        _ = self;
     }
 
     fn accept(self: *Listener, socket: socket_t) !void {
@@ -108,9 +178,10 @@ const Listener = struct {
     }
 
     fn accepted(self: *Listener, socket: socket_t) Error!void {
-        var conn = try self.conns_pool.create();
+        var conn = try self.allocator.create(Conn);
         conn.* = Conn{ .allocator = self.allocator, .socket = socket, .listener = self, .io = self.io };
         try conn.init();
+        self.accepted +%= 1;
     }
 
     fn failed(_: *Listener, err: anyerror) Error!void {
@@ -119,7 +190,8 @@ const Listener = struct {
     }
 
     fn release(self: *Listener, conn: *Conn) void {
-        self.conns_pool.destroy(conn);
+        self.allocator.destroy(conn);
+        self.completed +%= 1;
     }
 };
 
@@ -192,7 +264,7 @@ const Conn = struct {
     fn received(self: *Conn, bytes: []const u8) Error!void {
         var parser = protocol.Parser{ .buf = try self.appendRecvBuf(bytes) };
         while (parser.next() catch |err| {
-            log.err("{} protocol parser failed {}", .{ self.socket, err });
+            log.err("{} protocol parser failed {}, un-parsed: {d}", .{ self.socket, err, parser.unparsed()[0..@min(128, parser.unparsed().len)] });
             return try self.close();
         }) |msg| {
             self.unanswered_heartbeats = 0;
@@ -220,13 +292,13 @@ const Conn = struct {
                     log.debug("{} ready: {}", .{ self.socket, count });
                     self.ready_count = count;
                     if (self.channel) |channel|
-                        if (self.ready() > 0) channel.ready(self);
+                        if (self.ready() > 0) try channel.ready(self);
                 },
                 .fin => |msg_id| {
                     if (self.channel) |channel| {
                         self.in_flight -|= 1;
                         const res = try channel.fin(msg_id);
-                        if (self.ready() > 0) channel.ready(self);
+                        if (self.ready() > 0) try channel.ready(self);
                         log.debug("{} fin {} {}", .{ self.socket, ChannelMsg.seqFromId(msg_id), res });
                     } else {
                         try self.close();
@@ -278,6 +350,7 @@ const Conn = struct {
         self.recv_op = null;
         switch (err) {
             error.EndOfFile => {},
+            error.ConnectionResetByPeer => {},
             else => log.err("{} recv failed {}", .{ self.socket, err }),
         }
         try self.close();
@@ -339,7 +412,7 @@ const Conn = struct {
             self.pending_response = null;
         }
         if (self.ready() > 0)
-            if (self.channel) |channel| channel.ready(self);
+            if (self.channel) |channel| try channel.ready(self);
     }
 
     fn sendFailed(self: *Conn, err: anyerror) Error!void {
@@ -353,12 +426,15 @@ const Conn = struct {
 
     fn close(self: *Conn) !void {
         log.debug("{} close", .{self.socket});
-        if (self.channel) |channel| channel.unsub(self);
+        if (self.channel) |channel| try channel.unsub(self);
         if (self.ticker_op) |op| {
             try op.cancel();
             op.unsubscribe(self);
         }
-        if (self.recv_op) |op| op.unsubscribe(self);
+        if (self.recv_op) |op| {
+            try op.cancel();
+            op.unsubscribe(self);
+        }
         if (self.send_op) |op| op.unsubscribe(self);
         try self.io.close(self.socket);
 
