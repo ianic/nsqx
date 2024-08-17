@@ -26,9 +26,9 @@ const ring_entries: u16 = 16 * 1024;
 
 var server: Server = undefined;
 
-pub const std_options = std.Options{
-    .log_level = .info,
-};
+// pub const std_options = std.Options{
+//     .log_level = .info,
+// };
 
 pub fn main() !void {
     // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -195,6 +195,8 @@ const Listener = struct {
     }
 };
 
+const heartbeat_interval = 15; // seconds, set to 1/2 of what client asks
+
 const Conn = struct {
     allocator: mem.Allocator,
     io: *Io,
@@ -208,7 +210,7 @@ const Conn = struct {
     pending_response: ?Response = null,
     ready_count: u32 = 0,
     in_flight: u32 = 0,
-    unanswered_heartbeats: u8 = 0,
+    outstanding_heartbeats: u8 = 0,
 
     recv_buf: []u8 = &.{}, // holds unprocessed bytes from previous receive
     send_header_buf: [34]u8 = undefined, // message header
@@ -232,7 +234,7 @@ const Conn = struct {
 
     fn init(self: *Conn) !void {
         self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
-        self.ticker_op = try self.io.ticker(30, self, tick, tickerFailed);
+        self.ticker_op = try self.io.ticker(15, self, tick, tickerFailed);
     }
 
     pub fn ready(self: Conn) u32 {
@@ -245,12 +247,15 @@ const Conn = struct {
     }
 
     fn tick(self: *Conn) Error!void {
-        if (self.unanswered_heartbeats > 2) {
+        if (self.outstanding_heartbeats > 4) {
+            log.debug("{} no heartbeat, closing", .{self.socket});
             return try self.close();
         }
-        if (self.unanswered_heartbeats > 0)
+        if (self.outstanding_heartbeats > 0) {
+            log.debug("{} send heartbeat", .{self.socket});
             try self.respond(.heartbeat);
-        self.unanswered_heartbeats += 1;
+        }
+        self.outstanding_heartbeats += 1;
     }
 
     fn tickerFailed(self: *Conn, err: anyerror) Error!void {
@@ -267,7 +272,7 @@ const Conn = struct {
             log.err("{} protocol parser failed {}, un-parsed: {d}", .{ self.socket, err, parser.unparsed()[0..@min(128, parser.unparsed().len)] });
             return try self.close();
         }) |msg| {
-            self.unanswered_heartbeats = 0;
+            self.outstanding_heartbeats = 0;
             switch (msg) {
                 .identify => |data| {
                     log.debug("{} identify: {s}", .{ self.socket, data });
