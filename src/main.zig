@@ -19,16 +19,16 @@ const Channel = @import("server.zig").ServerType(*Conn).Channel;
 const ChannelMsg = @import("server.zig").ChannelMsg;
 const max_msgs_send_batch_size = @import("server.zig").max_msgs_send_batch_size;
 
-const recv_buffers = 256;
+const recv_buffers = 1024;
 const recv_buffer_len = 64 * 1024;
 const port = 4150;
 const ring_entries: u16 = 16 * 1024;
 
 var server: Server = undefined;
 
-// pub const std_options = std.Options{
-//     .log_level = .info,
-// };
+pub const std_options = std.Options{
+    .log_level = .info,
+};
 
 pub fn main() !void {
     // var gpa = std.heap.GeneralPurposeAllocator(.{}){};

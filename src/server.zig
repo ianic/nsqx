@@ -153,13 +153,7 @@ pub fn ServerType(Consumer: type) type {
 
         pub fn mpub(self: *Server, topic: []const u8, msgs: u32, data: []const u8) !void {
             const t = try self.getTopic(topic);
-            var pos: usize = 0;
-            for (0..msgs) |_| {
-                const len = mem.readInt(u32, data[pos..][0..4], .big);
-                pos += 4;
-                try t.publish(data[pos..][0..len]);
-                pos += len;
-            }
+            return try t.multiPublish(msgs, data);
         }
 
         pub fn deinit(self: *Server) void {
@@ -219,6 +213,24 @@ pub fn ServerType(Consumer: type) type {
                 }
 
                 pub fn publish(self: *Topic, data: []const u8) !void {
+                    const msg = try self.create(data);
+                    try self.notifyChannels(msg);
+                }
+
+                pub fn multiPublish(self: *Topic, msgs: u32, data: []const u8) !void {
+                    var pos: usize = 0;
+                    var first_msg: ?*TopicMsg = null;
+                    for (0..msgs) |_| {
+                        const len = mem.readInt(u32, data[pos..][0..4], .big);
+                        pos += 4;
+                        const msg = try self.create(data[pos..][0..len]);
+                        if (first_msg == null) first_msg = msg;
+                        pos += len;
+                    }
+                    if (first_msg) |msg| try self.notifyChannels(msg);
+                }
+
+                fn create(self: *Topic, data: []const u8) !*TopicMsg {
                     const msg = try self.allocator.create(TopicMsg);
                     const body = try self.allocator.dupe(u8, data);
                     self.sequence += 1;
@@ -228,11 +240,13 @@ pub fn ServerType(Consumer: type) type {
                         .body = body,
                     };
                     self.messages.append(msg);
+                    return msg;
+                }
 
-                    { // Notify all channels that there is pending message
-                        var iter = self.channels.valueIterator();
-                        while (iter.next()) |channel| try channel.*.publish(msg);
-                    }
+                // Notify all channels that there is pending message
+                fn notifyChannels(self: *Topic, msg: *TopicMsg) !void {
+                    var iter = self.channels.valueIterator();
+                    while (iter.next()) |channel| try channel.*.publish(msg);
                 }
 
                 // Channel has finished sending all messages before and including seq.
@@ -305,6 +319,7 @@ pub fn ServerType(Consumer: type) type {
                         if (!try self.fillConsumer(consumer)) break;
                 }
 
+                // Returns true if there is more messages for next consumer
                 // TODO error handling
                 fn fillConsumer(self: *Channel, consumer: Consumer) !bool {
                     var msgs_buf: [max_msgs_send_batch_size]*ChannelMsg = undefined;
