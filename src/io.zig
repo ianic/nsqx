@@ -56,8 +56,16 @@ pub const Io = struct {
             fn restart(self: *SubCom) void {
                 self.restarted += 1;
             }
-            pub fn print(self: @This()) void {
-                std.debug.print(
+            pub fn format(
+                self: SubCom,
+                comptime fmt: []const u8,
+                options: std.fmt.FormatOptions,
+                writer: anytype,
+            ) !void {
+                _ = fmt;
+                _ = options;
+
+                try writer.print(
                     "active: {:>8}, max active: {:>8}, submitted: {:>8}, restarted: {:>8}, completed: {:>8}",
                     .{ self.active(), self.max_active, self.submitted, self.restarted, self.completed },
                 );

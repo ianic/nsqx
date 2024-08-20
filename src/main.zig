@@ -69,20 +69,13 @@ pub fn main() !void {
                 print("listener connections:\n", .{});
                 print("  active {}, accepted: {}, completed: {}\n", .{ listener.accepted - listener.completed, listener.accepted, listener.completed });
 
-                print("io operations:", .{});
-                print("\n  all    ", .{});
-                io.stat.all.print();
-                print("\n  recv   ", .{});
-                io.stat.recv.print();
-                print("\n  sendv  ", .{});
-                io.stat.sendv.print();
-                print("\n  ticker ", .{});
-                io.stat.ticker.print();
-                print("\n  close  ", .{});
-                io.stat.close.print();
-                print("\n  accept ", .{});
-                io.stat.accept.print();
-                print("\n", .{});
+                print("io operations:\n", .{});
+                print("  all    {}\n", .{io.stat.all});
+                print("  recv   {}\n", .{io.stat.recv});
+                print("  sendv  {}\n", .{io.stat.sendv});
+                print("  ticker {}\n", .{io.stat.ticker});
+                print("  close  {}\n", .{io.stat.close});
+                print("  accept {}\n", .{io.stat.accept});
 
                 print(
                     "  receive buffers group:\n    success: {}, no-buffs: {} {d:5.2}%\n",
@@ -112,7 +105,7 @@ pub fn main() !void {
                             channel_name,
                             channel.consumers.items.len,
                             channel.in_flight.count(),
-                            channel.sequence,
+                            channel.offset,
                         });
                     }
                 }
@@ -290,7 +283,7 @@ const Conn = struct {
                 },
                 .mpub => |mpub| {
                     log.debug("{} multi publish: {s} messages: {}", .{ self.socket, mpub.topic, mpub.msgs });
-                    try server.mpub(mpub.topic, mpub.msgs, mpub.data);
+                    try server.multiPublish(mpub.topic, mpub.msgs, mpub.data);
                     try self.respond(.ok);
                 },
                 .rdy => |count| {
