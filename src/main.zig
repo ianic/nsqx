@@ -60,8 +60,7 @@ pub fn main() !void {
     catchSignals();
     while (true) {
         try io.tick();
-        server.tick();
-        // try io.loop(run_loop);
+
         const sig = signal.load(.monotonic);
         if (sig != 0) {
             signal.store(0, .release);
@@ -271,6 +270,8 @@ const Conn = struct {
     }
 
     fn received(self: *Conn, bytes: []const u8) Error!void {
+        var ready_changed: bool = false;
+
         var parser = protocol.Parser{ .buf = try self.appendRecvBuf(bytes) };
         while (parser.next() catch |err| {
             log.err("{} protocol parser failed {}, un-parsed: {d}", .{ self.socket, err, parser.unparsed()[0..@min(128, parser.unparsed().len)] });
@@ -300,18 +301,17 @@ const Conn = struct {
                 .rdy => |count| {
                     log.debug("{} ready: {}", .{ self.socket, count });
                     self.ready_count = count;
-                    if (self.channel) |channel|
-                        if (self.ready() > 0) try channel.ready(self);
+                    ready_changed = true;
                 },
                 .fin => |msg_id| {
                     if (self.channel) |channel| {
                         self.in_flight -|= 1;
-                        const res = try channel.fin(msg_id);
-                        if (self.ready() > 0) try channel.ready(self);
+                        const res = try channel.fin(msg_id); // TODO handle res
                         log.debug("{} fin {} {}", .{ self.socket, ChannelMsg.seqFromId(msg_id), res });
                     } else {
                         try self.close();
                     }
+                    ready_changed = true;
                 },
                 .cls => {
                     self.ready_count = 0;
@@ -333,6 +333,10 @@ const Conn = struct {
             try self.setRecvBuf(unparsed)
         else
             self.deinitRecvBuf();
+
+        if (ready_changed)
+            if (self.channel) |channel|
+                try channel.ready(self);
     }
 
     fn appendRecvBuf(self: *Conn, bytes: []const u8) ![]const u8 {
@@ -420,8 +424,7 @@ const Conn = struct {
             try self.respond(r);
             self.pending_response = null;
         }
-        if (self.ready() > 0)
-            if (self.channel) |channel| try channel.ready(self);
+        if (self.channel) |channel| try channel.ready(self);
     }
 
     fn sendFailed(self: *Conn, err: anyerror) Error!void {

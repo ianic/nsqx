@@ -120,7 +120,6 @@ pub fn ServerType(Consumer: type) type {
 
         allocator: mem.Allocator,
         topics: std.StringHashMap(*Topic),
-        pub_bytes: usize = 0,
 
         pub fn init(allocator: mem.Allocator) Server {
             return .{
@@ -150,13 +149,11 @@ pub fn ServerType(Consumer: type) type {
         pub fn publish(self: *Server, topic_name: []const u8, data: []const u8) !void {
             const topic = try self.getTopic(topic_name);
             try topic.publish(data);
-            self.pub_bytes += data.len;
         }
 
         pub fn multiPublish(self: *Server, topic_name: []const u8, msgs: u32, data: []const u8) !void {
             const topic = try self.getTopic(topic_name);
             try topic.multiPublish(msgs, data);
-            self.pub_bytes += data.len;
         }
 
         pub fn deinit(self: *Server) void {
@@ -168,17 +165,6 @@ pub fn ServerType(Consumer: type) type {
                 self.allocator.free(e.key_ptr.*);
             }
             self.topics.deinit();
-        }
-
-        pub fn tick(self: *Server) void {
-            if (self.pub_bytes > 4 * 1024 * 1024) {
-                var iter = self.topics.valueIterator();
-                while (iter.next()) |ptr| {
-                    const topic = ptr.*;
-                    topic.cleanup();
-                }
-                self.pub_bytes = 0;
-            }
         }
 
         fn TopicType() type {
@@ -234,7 +220,7 @@ pub fn ServerType(Consumer: type) type {
                 }
 
                 pub fn publish(self: *Topic, data: []const u8) !void {
-                    _ = try self.create(data);
+                    try self.append(data);
                     try self.notifyChannels();
                 }
 
@@ -243,13 +229,13 @@ pub fn ServerType(Consumer: type) type {
                     for (0..msgs) |_| {
                         const len = mem.readInt(u32, data[pos..][0..4], .big);
                         pos += 4;
-                        _ = try self.create(data[pos..][0..len]);
+                        try self.append(data[pos..][0..len]);
                         pos += len;
                     }
                     try self.notifyChannels();
                 }
 
-                fn create(self: *Topic, data: []const u8) !*TopicMsg {
+                fn append(self: *Topic, data: []const u8) !void {
                     const msg = try self.allocator.create(TopicMsg);
                     const body = try self.allocator.dupe(u8, data);
                     self.sequence += 1;
@@ -260,7 +246,6 @@ pub fn ServerType(Consumer: type) type {
                     };
                     self.messages.append(msg);
                     if (self.next == null) self.next = msg;
-                    return msg;
                 }
 
                 // Notify all channels that there is pending message
@@ -274,21 +259,20 @@ pub fn ServerType(Consumer: type) type {
 
                 // Channel has moved its offset to seq.
                 // Messages before and including that seq can be released.
-                fn fin(self: *Topic, _: u64) void {
-                    self.fin_count += 1;
-                }
+                fn fin(self: *Topic, seq: u64) void {
+                    if (self.channels.count() == 1) {
+                        self.messages.release(self.allocator, seq);
+                        return;
+                    }
 
-                fn cleanup(self: *Topic) void {
-                    if (self.fin_count == 0) return;
                     // Find min sequence of all channels
                     var min_seq: u64 = std.math.maxInt(u64);
                     var iter = self.channels.valueIterator();
-                    while (iter.next()) |channel| {
-                        const seq = channel.*.offset;
-                        if (seq < min_seq) min_seq = seq;
+                    while (iter.next()) |ptr| {
+                        const channel = ptr.*;
+                        if (channel.offset < min_seq) min_seq = channel.offset;
                     }
                     self.messages.release(self.allocator, min_seq);
-                    self.fin_count = 0;
                 }
             };
         }
@@ -398,7 +382,10 @@ pub fn ServerType(Consumer: type) type {
                 };
 
                 pub fn fin(self: *Channel, msg_id: [16]u8) !bool {
-                    const seq = ChannelMsg.seqFromId(msg_id);
+                    return self.finSeq(ChannelMsg.seqFromId(msg_id));
+                }
+
+                pub fn finSeq(self: *Channel, seq: u64) !bool {
                     if (self.in_flight.fetchSwapRemove(seq)) |kv| {
                         self.allocator.destroy(kv.value);
 
@@ -598,7 +585,6 @@ test "channel fin req" {
         try testing.expectEqual(0, channel.requeued.count());
         try testing.expectEqual(1, channel.offset);
         try testing.expectEqual(0, channel.finished.count());
-        topic.cleanup();
         try testing.expectEqual(2, topic.messages.count());
     }
     { // send seq 2, 1 msg in flight
@@ -651,7 +637,6 @@ test "channel fin req" {
         try testing.expectEqual(0, channel.requeued.count());
         try testing.expectEqual(3, channel.offset);
         try testing.expectEqual(0, channel.finished.count());
-        topic.cleanup();
         try testing.expectEqual(0, topic.messages.count());
     }
 }
@@ -794,7 +779,6 @@ test "first channel gets all messages accumulated in topic" {
 
     try testing.expectEqual(no, channel.offset);
     try testing.expectEqual(no, consumer.sequences.items.len);
-    topic.cleanup();
     try testing.expectEqual(0, topic.messages.count());
 }
 
