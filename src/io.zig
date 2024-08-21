@@ -27,8 +27,10 @@ pub const Io = struct {
     stat: Stat = .{},
 
     const Stat = struct {
-        all: SubCom = .{},
+        loops: usize = 0,
+        cqes: usize = 0,
 
+        all: SubCom = .{},
         accept: SubCom = .{},
         close: SubCom = .{},
         recv: SubCom = .{},
@@ -193,11 +195,11 @@ pub const Io = struct {
         self: *Io,
         sec: i64,
         context: anytype,
-        comptime tick: fn (@TypeOf(context)) Error!void,
+        comptime ticked: fn (@TypeOf(context)) Error!void,
         comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
         const op = try self.acquire();
-        op.* = Op.ticker(self, sec, context, tick, failed);
+        op.* = Op.ticker(self, sec, context, ticked, failed);
         try op.prep();
         return op;
     }
@@ -209,12 +211,15 @@ pub const Io = struct {
     }
 
     pub fn loop(self: *Io, run: Atomic(bool)) !void {
+        while (run.load(.monotonic)) try self.tick();
+    }
+
+    pub fn tick(self: *Io) !void {
         var cqes: [256]std.os.linux.io_uring_cqe = undefined;
-        while (run.load(.monotonic)) {
-            const n = try self.readCompletions(&cqes);
-            if (n > 0)
-                try self.flushCompletions(cqes[0..n]);
-        }
+        self.stat.loops += 1;
+        const n = try self.readCompletions(&cqes);
+        if (n > 0)
+            try self.flushCompletions(cqes[0..n]);
     }
 
     fn readCompletions(self: *Io, cqes: []linux.io_uring_cqe) !usize {
@@ -229,6 +234,7 @@ pub const Io = struct {
     }
 
     fn flushCompletions(self: *Io, cqes: []linux.io_uring_cqe) !void {
+        self.stat.cqes += cqes.len;
         for (cqes) |cqe| {
             if (cqe.user_data == 0) continue; // no op for this cqe
             const op: *Op = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
@@ -518,7 +524,7 @@ pub const Op = struct {
         io: *Io,
         sec: i64,
         context: anytype,
-        comptime tick: fn (@TypeOf(context)) Error!void,
+        comptime ticked: fn (@TypeOf(context)) Error!void,
         comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
     ) Op {
         const Context = @TypeOf(context);
@@ -526,7 +532,7 @@ pub const Op = struct {
             fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
-                    .SUCCESS, .TIME => try tick(ctx),
+                    .SUCCESS, .TIME => try ticked(ctx),
                     .INTR => {},
                     else => |errno| {
                         if (failed) |f| try f(ctx, errFromErrno(errno));

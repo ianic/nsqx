@@ -120,7 +120,7 @@ pub fn ServerType(Consumer: type) type {
 
         allocator: mem.Allocator,
         topics: std.StringHashMap(*Topic),
-        published_size: usize = 0,
+        pub_bytes: usize = 0,
 
         pub fn init(allocator: mem.Allocator) Server {
             return .{
@@ -150,13 +150,13 @@ pub fn ServerType(Consumer: type) type {
         pub fn publish(self: *Server, topic_name: []const u8, data: []const u8) !void {
             const topic = try self.getTopic(topic_name);
             try topic.publish(data);
-            self.checkCleanup(data.len);
+            self.pub_bytes += data.len;
         }
 
         pub fn multiPublish(self: *Server, topic_name: []const u8, msgs: u32, data: []const u8) !void {
             const topic = try self.getTopic(topic_name);
             try topic.multiPublish(msgs, data);
-            self.checkCleanup(data.len);
+            self.pub_bytes += data.len;
         }
 
         pub fn deinit(self: *Server) void {
@@ -170,18 +170,14 @@ pub fn ServerType(Consumer: type) type {
             self.topics.deinit();
         }
 
-        fn checkCleanup(self: *Server, size: usize) void {
-            self.published_size += size;
-            if (self.published_size > 16 * 1024 * 1024) {
-                self.cleanup();
-                self.published_size = 0;
-            }
-        }
-
-        fn cleanup(self: *Server) void {
-            var iter = self.topics.valueIterator();
-            while (iter.next()) |ptr| {
-                ptr.*.cleanup();
+        pub fn tick(self: *Server) void {
+            if (self.pub_bytes > 4 * 1024 * 1024) {
+                var iter = self.topics.valueIterator();
+                while (iter.next()) |ptr| {
+                    const topic = ptr.*;
+                    topic.cleanup();
+                }
+                self.pub_bytes = 0;
             }
         }
 
@@ -191,6 +187,7 @@ pub fn ServerType(Consumer: type) type {
                 messages: TopicMsgList,
                 channels: std.StringHashMap(*Channel),
                 sequence: u64 = 0,
+                next: ?*TopicMsg = null,
                 fin_count: usize = 0, // fin's in channels
 
                 pub fn init(allocator: mem.Allocator) Topic {
@@ -237,21 +234,19 @@ pub fn ServerType(Consumer: type) type {
                 }
 
                 pub fn publish(self: *Topic, data: []const u8) !void {
-                    const msg = try self.create(data);
-                    try self.notifyChannels(msg);
+                    _ = try self.create(data);
+                    try self.notifyChannels();
                 }
 
                 pub fn multiPublish(self: *Topic, msgs: u32, data: []const u8) !void {
                     var pos: usize = 0;
-                    var first_msg: ?*TopicMsg = null;
                     for (0..msgs) |_| {
                         const len = mem.readInt(u32, data[pos..][0..4], .big);
                         pos += 4;
-                        const msg = try self.create(data[pos..][0..len]);
-                        if (first_msg == null) first_msg = msg;
+                        _ = try self.create(data[pos..][0..len]);
                         pos += len;
                     }
-                    if (first_msg) |msg| try self.notifyChannels(msg);
+                    try self.notifyChannels();
                 }
 
                 fn create(self: *Topic, data: []const u8) !*TopicMsg {
@@ -264,20 +259,23 @@ pub fn ServerType(Consumer: type) type {
                         .body = body,
                     };
                     self.messages.append(msg);
+                    if (self.next == null) self.next = msg;
                     return msg;
                 }
 
                 // Notify all channels that there is pending message
-                fn notifyChannels(self: *Topic, msg: *TopicMsg) !void {
-                    var iter = self.channels.valueIterator();
-                    while (iter.next()) |channel| try channel.*.publish(msg);
+                fn notifyChannels(self: *Topic) !void {
+                    if (self.next) |msg| {
+                        var iter = self.channels.valueIterator();
+                        while (iter.next()) |ptr| try ptr.*.topicAppended(msg);
+                        self.next = null;
+                    }
                 }
 
-                // Channel has finished sending all messages before and including seq.
-                // Release that pending messages.
+                // Channel has moved its offset to seq.
+                // Messages before and including that seq can be released.
                 fn fin(self: *Topic, _: u64) void {
                     self.fin_count += 1;
-                    if (self.fin_count > 1024) self.cleanup();
                 }
 
                 fn cleanup(self: *Topic) void {
@@ -330,9 +328,11 @@ pub fn ServerType(Consumer: type) type {
                     };
                 }
 
-                fn publish(self: *Channel, tmsg: *TopicMsg) !void {
-                    if (self.next == null) self.next = tmsg;
-                    try self.wakeup();
+                fn topicAppended(self: *Channel, tmsg: *TopicMsg) !void {
+                    if (self.next == null) {
+                        self.next = tmsg;
+                        try self.wakeup();
+                    }
                 }
 
                 fn wakeup(self: *Channel) !void {

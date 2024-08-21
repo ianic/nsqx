@@ -59,71 +59,82 @@ pub fn main() !void {
 
     catchSignals();
     while (true) {
-        try io.loop(run_loop);
+        try io.tick();
+        server.tick();
+        // try io.loop(run_loop);
         const sig = signal.load(.monotonic);
-        signal.store(0, .release);
-        run_loop.store(true, .release);
-        switch (sig) {
-            posix.SIG.USR1 => {
-                const print = std.debug.print;
-                print("listener connections:\n", .{});
-                print("  active {}, accepted: {}, completed: {}\n", .{ listener.accepted - listener.completed, listener.accepted, listener.completed });
-
-                print("io operations:\n", .{});
-                print("  all    {}\n", .{io.stat.all});
-                print("  recv   {}\n", .{io.stat.recv});
-                print("  sendv  {}\n", .{io.stat.sendv});
-                print("  ticker {}\n", .{io.stat.ticker});
-                print("  close  {}\n", .{io.stat.close});
-                print("  accept {}\n", .{io.stat.accept});
-
-                print(
-                    "  receive buffers group:\n    success: {}, no-buffs: {} {d:5.2}%\n",
-                    .{ io.recv_buf_grp_stat.success, io.recv_buf_grp_stat.no_bufs, io.recv_buf_grp_stat.noBufs() },
-                );
-
-                print("server topics: {}\n", .{server.topics.count()});
-                var ti = server.topics.iterator();
-                while (ti.next()) |te| {
-                    const topic_name = te.key_ptr.*;
-                    const topic = te.value_ptr.*;
-                    const size = topic.messages.size();
-                    print("\t{s} messages: {d} bytes: {} {}Mb {}Gb, sequence: {}\n", .{
-                        topic_name,
-                        topic.messages.count(),
-                        size,
-                        size / 1024 / 1024,
-                        size / 1024 / 1024 / 1024,
-                        topic.sequence,
-                    });
-
-                    var ci = topic.channels.iterator();
-                    while (ci.next()) |ce| {
-                        const channel_name = ce.key_ptr.*;
-                        const channel = ce.value_ptr.*;
-                        print("\t --{s} consumers: {} in flight messages: {} offset: {}\n", .{
-                            channel_name,
-                            channel.consumers.items.len,
-                            channel.in_flight.count(),
-                            channel.offset,
-                        });
-                    }
-                }
-            },
-            posix.SIG.USR2 => {
-                const c = @cImport(@cInclude("malloc.h"));
-
-                c.malloc_stats();
-                const ret = c.malloc_trim(0);
-                log.info("malloc_trim: {}", .{ret});
-                c.malloc_stats();
-            },
-            posix.SIG.TERM, posix.SIG.INT => break,
-            else => {},
+        if (sig != 0) {
+            signal.store(0, .release);
+            //run_loop.store(true, .release);
+            switch (sig) {
+                posix.SIG.USR1 => try showStat(&listener, &io),
+                posix.SIG.USR2 => mallocTrim(),
+                posix.SIG.TERM, posix.SIG.INT => break,
+                else => {},
+            }
         }
     }
 
     log.debug("done", .{});
+}
+
+fn mallocTrim() void {
+    const c = @cImport(@cInclude("malloc.h"));
+    c.malloc_stats();
+    const ret = c.malloc_trim(0);
+    log.info("malloc_trim: {}", .{ret});
+    c.malloc_stats();
+}
+
+fn showStat(listener: *Listener, io: *Io) !void {
+    const print = std.debug.print;
+    print("listener connections:\n", .{});
+    print("  active {}, accepted: {}, completed: {}\n", .{ listener.accepted - listener.completed, listener.accepted, listener.completed });
+
+    print("io operations: loops: {}, cqes: {}, cqes/loop {}\n", .{
+        io.stat.loops,
+        io.stat.cqes,
+        if (io.stat.loops > 0) io.stat.cqes / io.stat.loops else 0,
+    });
+    print("  all    {}\n", .{io.stat.all});
+    print("  recv   {}\n", .{io.stat.recv});
+    print("  sendv  {}\n", .{io.stat.sendv});
+    print("  ticker {}\n", .{io.stat.ticker});
+    print("  close  {}\n", .{io.stat.close});
+    print("  accept {}\n", .{io.stat.accept});
+
+    print(
+        "  receive buffers group:\n    success: {}, no-buffs: {} {d:5.2}%\n",
+        .{ io.recv_buf_grp_stat.success, io.recv_buf_grp_stat.no_bufs, io.recv_buf_grp_stat.noBufs() },
+    );
+
+    print("server topics: {}\n", .{server.topics.count()});
+    var ti = server.topics.iterator();
+    while (ti.next()) |te| {
+        const topic_name = te.key_ptr.*;
+        const topic = te.value_ptr.*;
+        const size = topic.messages.size();
+        print("\t{s} messages: {d} bytes: {} {}Mb {}Gb, sequence: {}\n", .{
+            topic_name,
+            topic.messages.count(),
+            size,
+            size / 1024 / 1024,
+            size / 1024 / 1024 / 1024,
+            topic.sequence,
+        });
+
+        var ci = topic.channels.iterator();
+        while (ci.next()) |ce| {
+            const channel_name = ce.key_ptr.*;
+            const channel = ce.value_ptr.*;
+            print("\t --{s} consumers: {} in flight messages: {} offset: {}\n", .{
+                channel_name,
+                channel.consumers.items.len,
+                channel.in_flight.count(),
+                channel.offset,
+            });
+        }
+    }
 }
 
 var run_loop = Atomic(bool).init(true);
