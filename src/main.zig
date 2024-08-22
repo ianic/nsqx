@@ -39,13 +39,6 @@ pub fn main() !void {
     const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, port);
     const socket = (try addr.listen(.{ .reuse_address = true })).stream.handle;
 
-    var ring = try IoUring.init(
-        ring_entries,
-        linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER,
-        // linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_DEFER_TASKRUN,
-    );
-    defer ring.deinit();
-
     var io = Io{ .allocator = allocator };
     try io.init(ring_entries, recv_buffers, recv_buffer_len);
     defer io.deinit();

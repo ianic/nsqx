@@ -112,7 +112,7 @@ pub const Io = struct {
     };
 
     pub fn init(self: *Io, ring_entries: u16, recv_buffers: u16, recv_buffer_len: u32) !void {
-        self.ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL & linux.IORING_SETUP_SINGLE_ISSUER);
+        self.ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER);
         self.recv_buf_grp = try self.initBufferGroup(1, recv_buffers, recv_buffer_len);
     }
 
