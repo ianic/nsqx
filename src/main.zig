@@ -64,7 +64,6 @@ pub fn main() !void {
         const sig = signal.load(.monotonic);
         if (sig != 0) {
             signal.store(0, .release);
-            //run_loop.store(true, .release);
             switch (sig) {
                 posix.SIG.USR1 => try showStat(&listener, &io),
                 posix.SIG.USR2 => mallocTrim(),
@@ -136,7 +135,6 @@ fn showStat(listener: *Listener, io: *Io) !void {
     }
 }
 
-var run_loop = Atomic(bool).init(true);
 var signal = Atomic(c_int).init(0);
 
 fn catchSignals() void {
@@ -145,7 +143,6 @@ fn catchSignals() void {
             .handler = struct {
                 fn wrapper(sig: c_int) callconv(.C) void {
                     signal.store(sig, .release);
-                    run_loop.store(false, .release);
                 }
             }.wrapper,
         },

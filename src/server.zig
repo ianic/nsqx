@@ -287,7 +287,7 @@ pub fn ServerType(Consumer: type) type {
                 // Re-queued by consumer or timed out
                 requeued: std.PriorityQueue(*ChannelMsg, void, ChannelMsg.less),
                 // Sequences for which we received fin but they are out of order
-                // so we can't move sequence
+                // so we can't move offset
                 finished: std.PriorityQueue(u64, void, lessU64),
                 // Last sequence sent and acknowledged by some consumer
                 offset: u64 = 0,
@@ -424,19 +424,17 @@ pub fn ServerType(Consumer: type) type {
                 }
 
                 pub fn unsub(self: *Channel, consumer: Consumer) !void {
-                    //log.info("unsub {}, in flight {}", .{ consumer.socket, self.in_flight.count() });
+                    // Remove in_flight messages of that consumer
                     outer: while (true) {
                         for (self.in_flight.values()) |msg| {
                             if (msg.in_flight_socket == consumer.socket) {
-                                //log.info("req on unsub {}", .{consumer.socket});
                                 _ = try self.req(msg.id());
                                 continue :outer; // restart on delete from in_flight
                             }
                         }
                         break;
                     }
-
-                    // TODO remove in_flight messages of that consumer
+                    // Remove consumer
                     for (self.consumers.items, 0..) |item, i| {
                         if (item.socket == consumer.socket) {
                             _ = self.consumers.swapRemove(i);
