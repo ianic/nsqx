@@ -82,7 +82,7 @@ pub const Io = struct {
                 .recv => self.recv.sub(),
                 .writev => self.writev.sub(),
                 .sendv => self.sendv.sub(),
-                .ticker => self.ticker.sub(),
+                .ticker, .timer => self.ticker.sub(),
             }
         }
 
@@ -94,7 +94,7 @@ pub const Io = struct {
                 .recv => self.recv.comp(),
                 .writev => self.writev.comp(),
                 .sendv => self.sendv.comp(),
-                .ticker => self.ticker.comp(),
+                .ticker, .timer => self.ticker.comp(),
             }
         }
 
@@ -106,14 +106,18 @@ pub const Io = struct {
                 .recv => self.recv.restart(),
                 .writev => self.writev.restart(),
                 .sendv => self.sendv.restart(),
-                .ticker => self.ticker.restart(),
+                .ticker, .timer => self.ticker.restart(),
             }
         }
     };
 
     pub fn init(self: *Io, ring_entries: u16, recv_buffers: u16, recv_buffer_len: u32) !void {
         self.ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER);
-        self.recv_buf_grp = try self.initBufferGroup(1, recv_buffers, recv_buffer_len);
+        if (recv_buffers > 0) {
+            self.recv_buf_grp = try self.initBufferGroup(1, recv_buffers, recv_buffer_len);
+        } else {
+            self.recv_buf_grp.buffers_count = 0;
+        }
     }
 
     fn initBufferGroup(self: *Io, id: u16, count: u16, size: u32) !IoUring.BufferGroup {
@@ -123,8 +127,10 @@ pub const Io = struct {
     }
 
     pub fn deinit(self: *Io) void {
-        self.allocator.free(self.recv_buf_grp.buffers);
-        self.recv_buf_grp.deinit();
+        if (self.recv_buf_grp.buffers_count > 0) {
+            self.allocator.free(self.recv_buf_grp.buffers);
+            self.recv_buf_grp.deinit();
+        }
         self.ring.deinit();
     }
 
@@ -200,6 +206,19 @@ pub const Io = struct {
     ) !*Op {
         const op = try self.acquire();
         op.* = Op.ticker(self, sec, context, ticked, failed);
+        try op.prep();
+        return op;
+    }
+
+    pub fn timer(
+        self: *Io,
+        delay: u64, // milliseconds
+        context: anytype,
+        comptime ticked: fn (@TypeOf(context)) Error!void,
+        comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
+    ) !*Op {
+        const op = try self.acquire();
+        op.* = Op.timer(self, delay, context, ticked, failed);
         try op.prep();
         return op;
     }
@@ -309,6 +328,7 @@ pub const Op = struct {
             msghdr: *posix.msghdr_const,
         },
         ticker: linux.kernel_timespec,
+        timer: linux.kernel_timespec,
     };
 
     const Kind = enum {
@@ -318,6 +338,7 @@ pub const Op = struct {
         writev,
         sendv,
         ticker,
+        timer,
     };
 
     pub fn cancel(op: *Op) !void {
@@ -342,6 +363,7 @@ pub const Op = struct {
             .writev => |*arg| _ = try op.io.ring.writev(@intFromPtr(op), arg.socket, arg.vec, 0),
             .sendv => |*arg| _ = try op.io.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
             .ticker => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, IORING_TIMEOUT_MULTISHOT),
+            .timer => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, 0),
         }
     }
 
@@ -550,6 +572,35 @@ pub const Op = struct {
         };
     }
 
+    fn timer(
+        io: *Io,
+        nsec: u64, // milliseconds
+        context: anytype,
+        comptime ticked: fn (@TypeOf(context)) Error!void,
+        comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
+    ) Op {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
+                const ctx: Context = @ptrFromInt(op.context);
+                switch (cqe.err()) {
+                    .SUCCESS, .TIME => try ticked(ctx),
+                    .INTR => return .restart,
+                    else => |errno| if (failed) |f| try f(ctx, errFromErrno(errno)),
+                }
+                return .done;
+            }
+        };
+        const sec = nsec / std.time.ns_per_s;
+        const ns = (nsec - sec * std.time.ns_per_s);
+        return .{
+            .io = io,
+            .context = @intFromPtr(context),
+            .callback = wrapper.complete,
+            .args = .{ .timer = .{ .sec = @intCast(sec), .nsec = @intCast(ns) } },
+        };
+    }
+
     fn close(
         io: *Io,
         socket: socket_t,
@@ -601,4 +652,58 @@ test "resize iovec" {
 
     ret = resizeIovec(ret, 5);
     try testing.expectEqual(0, ret.len);
+}
+
+test "ticker" {
+    const allocator = testing.allocator;
+
+    var io = Io{ .allocator = allocator };
+    try io.init(4, 0, 0);
+    defer io.deinit();
+
+    const Ctx = struct {
+        count: usize = 0,
+        pub fn ticked(self: *@This()) Error!void {
+            self.count += 1;
+        }
+    };
+    var ctx = Ctx{};
+
+    const op = try io.ticker(1, &ctx, Ctx.ticked, null);
+    defer allocator.destroy(op);
+    try io.tick();
+    try testing.expectEqual(1, ctx.count);
+}
+
+test "timer" {
+    const allocator = testing.allocator;
+    var io = Io{ .allocator = allocator };
+    try io.init(4, 0, 0);
+    defer io.deinit();
+
+    const Ctx = struct {
+        count: usize = 0,
+        pub fn ticked(self: *@This()) Error!void {
+            self.count += 1;
+        }
+    };
+    var ctx = Ctx{};
+
+    //const start = timestamp();
+    _ = try io.timer(1, &ctx, Ctx.ticked, null);
+    try io.tick();
+    try testing.expectEqual(1, ctx.count);
+    // const ns = timestamp() - start;
+    // std.debug.print("after = {} {}\n", .{ ns, ns / std.time.ns_per_s });
+    _ = try io.timer(1, &ctx, Ctx.ticked, null);
+    try io.tick();
+    try testing.expectEqual(2, ctx.count);
+}
+
+fn timestamp() u64 {
+    var ts: posix.timespec = undefined;
+    posix.clock_gettime(.REALTIME, &ts) catch |err| switch (err) {
+        error.UnsupportedClock, error.Unexpected => return 0, // "Precision of timing depends on hardware and OS".
+    };
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
