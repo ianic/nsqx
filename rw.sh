@@ -3,6 +3,12 @@
 cd ~/Code/nsql
 zig build -Doptimize=ReleaseFast
 
+cd ~/Code/go/nsq/bench/bench_writer/
+go build
+cd ~/Code/go/nsq/bench/bench_reader/
+go build
+
+cd ~/Code/nsql
 ./zig-out/bin/nsql 2>stat &
 nsqd_pid=$!
 
