@@ -30,36 +30,38 @@ pub const Io = struct {
         loops: usize = 0,
         cqes: usize = 0,
 
-        all: SubCom = .{},
-        accept: SubCom = .{},
-        close: SubCom = .{},
-        recv: SubCom = .{},
-        writev: SubCom = .{},
-        sendv: SubCom = .{},
-        ticker: SubCom = .{},
+        all: Counter = .{},
+        accept: Counter = .{},
+        close: Counter = .{},
+        recv: Counter = .{},
+        writev: Counter = .{},
+        sendv: Counter = .{},
+        ticker: Counter = .{},
 
-        const SubCom = struct {
+        // Counter of submitted/completed operations
+        const Counter = struct {
             submitted: usize = 0,
             completed: usize = 0,
             restarted: usize = 0,
             max_active: usize = 0,
 
-            pub fn active(self: @This()) usize {
+            // Current number of active operations
+            pub fn active(self: Counter) usize {
                 return self.submitted - self.restarted - self.completed;
             }
-            fn sub(self: *SubCom) void {
+            fn submit(self: *Counter) void {
                 self.submitted += 1;
                 if (self.active() > self.max_active)
                     self.max_active = self.active();
             }
-            fn comp(self: *SubCom) void {
+            fn complete(self: *Counter) void {
                 self.completed += 1;
             }
-            fn restart(self: *SubCom) void {
+            fn restart(self: *Counter) void {
                 self.restarted += 1;
             }
             pub fn format(
-                self: SubCom,
+                self: Counter,
                 comptime fmt: []const u8,
                 options: std.fmt.FormatOptions,
                 writer: anytype,
@@ -74,27 +76,27 @@ pub const Io = struct {
             }
         };
 
-        fn sub(self: *Stat, op: *Op) void {
-            self.all.sub();
+        fn submit(self: *Stat, op: *Op) void {
+            self.all.submit();
             switch (op.args) {
-                .accept => self.accept.sub(),
-                .close => self.close.sub(),
-                .recv => self.recv.sub(),
-                .writev => self.writev.sub(),
-                .sendv => self.sendv.sub(),
-                .ticker, .timer => self.ticker.sub(),
+                .accept => self.accept.submit(),
+                .close => self.close.submit(),
+                .recv => self.recv.submit(),
+                .writev => self.writev.submit(),
+                .sendv => self.sendv.submit(),
+                .ticker, .timer => self.ticker.submit(),
             }
         }
 
-        fn comp(self: *Stat, op: *Op) void {
-            self.all.comp();
+        fn complete(self: *Stat, op: *Op) void {
+            self.all.complete();
             switch (op.args) {
-                .accept => self.accept.comp(),
-                .close => self.close.comp(),
-                .recv => self.recv.comp(),
-                .writev => self.writev.comp(),
-                .sendv => self.sendv.comp(),
-                .ticker, .timer => self.ticker.comp(),
+                .accept => self.accept.complete(),
+                .close => self.close.complete(),
+                .recv => self.recv.complete(),
+                .writev => self.writev.complete(),
+                .sendv => self.sendv.complete(),
+                .ticker, .timer => self.ticker.complete(),
             }
         }
 
@@ -139,7 +141,7 @@ pub const Io = struct {
     }
 
     fn release(self: *Io, op: *Op) void {
-        self.stat.comp(op);
+        self.stat.complete(op);
         self.allocator.destroy(op);
     }
 
@@ -354,7 +356,7 @@ pub const Op = struct {
     }
 
     fn prep(op: *Op) PrepError!void {
-        op.io.stat.sub(op);
+        op.io.stat.submit(op);
         const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
         switch (op.args) {
             .accept => |socket| _ = try op.io.ring.accept_multishot(@intFromPtr(op), socket, null, null, 0),
