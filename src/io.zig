@@ -10,6 +10,9 @@ const fd_t = std.posix.fd_t;
 const errFromErrno = @import("errno.zig").toError;
 const Atomic = std.atomic.Value;
 
+const ns_per_ms = std.time.ns_per_ms;
+const ns_per_s = std.time.ns_per_s;
+
 pub const Io = struct {
     allocator: mem.Allocator,
     ring: IoUring = undefined,
@@ -214,13 +217,13 @@ pub const Io = struct {
 
     pub fn timer(
         self: *Io,
-        delay: u64, // milliseconds
+        nsec: u64, // delay in nanoseconds
         context: anytype,
         comptime ticked: fn (@TypeOf(context)) Error!void,
         comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
         const op = try self.acquire();
-        op.* = Op.timer(self, delay, context, ticked, failed);
+        op.* = Op.timer(self, nsec, context, ticked, failed);
         try op.prep();
         return op;
     }
@@ -593,8 +596,8 @@ pub const Op = struct {
                 return .done;
             }
         };
-        const sec = nsec / std.time.ns_per_s;
-        const ns = (nsec - sec * std.time.ns_per_s);
+        const sec = nsec / ns_per_s;
+        const ns = (nsec - sec * ns_per_s);
         return .{
             .io = io,
             .context = @intFromPtr(context),
@@ -707,5 +710,185 @@ fn timestamp() u64 {
     posix.clock_gettime(.REALTIME, &ts) catch |err| switch (err) {
         error.UnsupportedClock, error.Unexpected => return 0, // "Precision of timing depends on hardware and OS".
     };
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    return @as(u64, @intCast(ts.sec)) * ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+const TimerOp = struct {
+    context: usize,
+    fire_at: u64,
+    callback: *const fn (*TimerOp, u64) Error!void,
+
+    fn init(
+        context: anytype,
+        comptime cb: fn (@TypeOf(context), u64) Error!void,
+        fire_at: u64,
+    ) TimerOp {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(op: *TimerOp, ts: u64) Error!void {
+                const ctx: Context = @ptrFromInt(op.context);
+                try cb(ctx, ts);
+            }
+        };
+        return .{
+            .context = @intFromPtr(context),
+            .callback = wrapper.complete,
+            .fire_at = fire_at,
+        };
+    }
+
+    fn less(_: void, a: *TimerOp, b: *TimerOp) std.math.Order {
+        return std.math.order(a.fire_at, b.fire_at);
+    }
+};
+
+const Timer = struct {
+    allocator: mem.Allocator,
+    io: *Io,
+    io_op: ?*Op = null,
+    queue: std.PriorityQueue(*TimerOp, void, TimerOp.less),
+
+    const Self = @This();
+
+    pub fn init(allocator: mem.Allocator, io: *Io) Timer {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .queue = std.PriorityQueue(*TimerOp, void, TimerOp.less).init(allocator, {}),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        while (self.queue.removeOrNull()) |op| {
+            self.allocator.destroy(op);
+        }
+        self.queue.deinit();
+    }
+
+    pub fn set(
+        self: *Self,
+        context: anytype,
+        comptime cb: fn (@TypeOf(context), u64) Error!void,
+        fire_after: u64,
+    ) !void {
+        const ts = timestamp();
+        const fire_at = ts + fire_after;
+        const op = try self.allocator.create(TimerOp);
+        op.* = TimerOp.init(context, cb, fire_at);
+        try self.queue.add(op);
+        if (self.io_op == null) {
+            var at = fire_at;
+            while (self.queue.peek()) |e| {
+                if (e.fire_at <= ts) {
+                    try self.fire(e, ts);
+                    continue;
+                }
+                at = e.fire_at;
+                break;
+            }
+            self.io_op = try self.io.timer(at - ts, self, Timer.ticked, Timer.failed);
+        }
+    }
+
+    fn fire(self: *Self, op: *TimerOp, ts: u64) !void {
+        try op.callback(op, ts);
+        _ = self.queue.remove();
+        self.allocator.destroy(op);
+    }
+
+    fn ticked(self: *Self) Error!void {
+        const ts = timestamp();
+        var at: u64 = 0;
+        while (self.queue.peek()) |e| {
+            if (e.fire_at <= ts) {
+                try self.fire(e, ts);
+                continue;
+            }
+            at = e.fire_at;
+            break;
+        }
+        if (at == 0) {
+            self.io_op = null;
+            return;
+        }
+        self.io_op = try self.io.timer(at - ts, self, Timer.ticked, Timer.failed);
+    }
+
+    fn failed(self: *Self, err: anyerror) Error!void {
+        log.err("timer failed {}", .{err});
+        try self.ticked();
+    }
+
+    // Removes one operation
+    pub fn clear(self: *Self, context: anytype) !void {
+        const ctx: usize = @intFromPtr(context);
+        var it = self.queue.iterator();
+        var idx: usize = 0;
+        while (it.next()) |e| {
+            if (e.context == ctx) {
+                const op = self.queue.removeIndex(idx);
+                self.allocator.destroy(op);
+                break;
+            }
+            idx += 1;
+        }
+    }
+
+    fn tick(self: *Self, ts: u64) !void {
+        while (self.queue.peek()) |op| {
+            if (op.fire_at <= ts) {
+                try op.callback(op, ts);
+                _ = self.queue.remove();
+                self.allocator.destroy(op);
+            } else {
+                return;
+            }
+        }
+    }
+};
+
+test "timer 2" {
+    const allocator = testing.allocator;
+    var io = Io{ .allocator = allocator };
+    try io.init(4, 0, 0);
+    defer io.deinit();
+
+    const Ctx = struct {
+        created_at: u64,
+        fired_at: u64 = 0,
+        fn onTimer(self: *@This(), ts: u64) !void {
+            self.fired_at = ts;
+        }
+        fn delay(self: *@This()) u64 {
+            if (self.fired_at == 0) return 0;
+            return self.fired_at - self.created_at;
+        }
+    };
+    const ts = timestamp();
+    var ctx1 = Ctx{ .created_at = ts };
+    var ctx2 = Ctx{ .created_at = ts };
+    var ctx3 = Ctx{ .created_at = ts };
+
+    var timer = Timer.init(testing.allocator, &io);
+    defer timer.deinit();
+    const ctx1_delay = 1 * ns_per_ms;
+    const ctx2_delay = 2 * ns_per_ms;
+    const ctx3_delay = 3 * ns_per_ms;
+    try timer.set(&ctx1, Ctx.onTimer, ctx1_delay);
+    try timer.set(&ctx2, Ctx.onTimer, ctx2_delay);
+    try timer.set(&ctx3, Ctx.onTimer, ctx3_delay);
+
+    try io.tick();
+    try timer.clear(&ctx2);
+    try io.tick();
+    try io.tick();
+
+    const tolerance = ns_per_ms / 5;
+    try testing.expect(ctx1.delay() > ctx1_delay and ctx1.delay() < ctx1_delay + tolerance);
+    //std.debug.print("ctx1.delay(): {}\n", .{ctx1.delay()});
+
+    try testing.expectEqual(0, ctx2.fired_at);
+
+    try testing.expect(ctx3.delay() > ctx3_delay and ctx3.delay() < ctx3_delay + tolerance);
+    //std.debug.print("ctx3.delay(): {}\n", .{ctx3.delay()});
 }

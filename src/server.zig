@@ -6,6 +6,7 @@ const log = std.log;
 const math = std.math;
 const testing = std.testing;
 const socket_t = posix.socket_t;
+const ns_per_s = std.time.ns_per_s;
 
 // TODO: can't set this larger than 512, getting InvalidArgument in send
 // why?
@@ -37,6 +38,7 @@ pub const ChannelMsg = struct {
     header: [34]u8,
     body: []const u8,
     in_flight_socket: socket_t = 0,
+    timeout: u64 = 0,
 
     fn incAttempts(self: *ChannelMsg) void {
         const buf = self.header[16..18];
@@ -48,12 +50,16 @@ pub const ChannelMsg = struct {
         return mem.readInt(u64, self.header[26..34], .big);
     }
 
+    fn attempts(self: ChannelMsg) u16 {
+        const buf = self.header[16..18];
+        return mem.readInt(u16, buf, .big);
+    }
+
     fn id(self: ChannelMsg) [16]u8 {
         return self.header[18..34].*;
     }
 
-    fn less(context: void, a: *ChannelMsg, b: *ChannelMsg) math.Order {
-        _ = context;
+    fn less(_: void, a: *ChannelMsg, b: *ChannelMsg) math.Order {
         return math.order(a.sequence(), b.sequence());
     }
 
@@ -297,6 +303,14 @@ pub fn ServerType(Consumer: type) type {
                 // Round robin consumers iterator. Preserves last consumer index
                 // between inits.
                 iterator: ConsumersIterator = .{},
+                // Message timeout in nanoseconds, 0 - disabled
+                message_timeout: u64 = 0,
+                stat: struct {
+                    sent: usize = 0,
+                    finished: usize = 0,
+                    timeouted: usize = 0,
+                    requeued: usize = 0,
+                } = .{},
 
                 pub fn init(allocator: mem.Allocator, topic: *Topic) Channel {
                     return .{
@@ -334,7 +348,7 @@ pub fn ServerType(Consumer: type) type {
                     while (n < msgs.len) : (n += 1) {
                         if (self.getMsg() catch null) |msg| {
                             msg.in_flight_socket = consumer.socket;
-                            try self.in_flight.put(msg.sequence(), msg);
+                            try self.inFlightAppend(msg);
                             msgs[n] = msg;
                         } else break;
                     }
@@ -346,6 +360,24 @@ pub fn ServerType(Consumer: type) type {
                         return false;
                     };
                     return n == msgs.len;
+                }
+
+                fn inFlightAppend(self: *Channel, msg: *ChannelMsg) !void {
+                    self.stat.sent += 1;
+                    //msg.timestamp = timer.timestamp();
+                    try self.in_flight.put(msg.sequence(), msg);
+                }
+
+                fn inFlightTimeout(self: *Channel, ts: u64) !void {
+                    var msgs = std.ArrayList(*ChannelMsg).init(self.allocator);
+                    defer msgs.deinit();
+                    for (self.in_flight.values()) |msg| {
+                        if (msg.timeout <= ts) try msgs.append(msg);
+                    }
+                    for (msgs.items) |msg| {
+                        try self.requeue(msg);
+                    }
+                    self.stat.timeouted += msgs.items.len;
                 }
 
                 // Iterates over ready consumers. Returns null when there is no
@@ -387,6 +419,7 @@ pub fn ServerType(Consumer: type) type {
 
                 pub fn finSeq(self: *Channel, seq: u64) !bool {
                     if (self.in_flight.fetchSwapRemove(seq)) |kv| {
+                        self.stat.finished += 1;
                         self.allocator.destroy(kv.value);
 
                         { // Move self.sequence or add seq to finished
@@ -411,12 +444,18 @@ pub fn ServerType(Consumer: type) type {
                 pub fn req(self: *Channel, msg_id: [16]u8) !bool {
                     const seq = ChannelMsg.seqFromId(msg_id);
                     if (self.in_flight.get(seq)) |msg| {
-                        msg.in_flight_socket = 0;
-                        msg.incAttempts();
-                        try self.requeued.add(msg);
-                        return self.in_flight.swapRemove(seq);
+                        try self.requeue(msg);
+                        return true;
                     }
                     return false;
+                }
+
+                fn requeue(self: *Channel, msg: *ChannelMsg) !void {
+                    msg.in_flight_socket = 0;
+                    msg.incAttempts();
+                    try self.requeued.add(msg);
+                    assert(self.in_flight.swapRemove(msg.sequence()));
+                    self.stat.requeued += 1;
                 }
 
                 fn sub(self: *Channel, consumer: Consumer) !void {
@@ -778,6 +817,58 @@ test "first channel gets all messages accumulated in topic" {
     try testing.expectEqual(no, channel.offset);
     try testing.expectEqual(no, consumer.sequences.items.len);
     try testing.expectEqual(0, topic.messages.count());
+}
+
+test "timeout messages" {
+    const allocator = testing.allocator;
+    const Server = ServerType(*TestConsumer);
+    const topic_name = "topic";
+    const channel_name = "channel1";
+    const no = 4;
+
+    var server = Server.init(allocator);
+    defer server.deinit();
+
+    var consumer = TestConsumer.init(allocator);
+    defer consumer.deinit();
+    const channel = try server.sub(&consumer, topic_name, channel_name);
+    consumer.channel = channel;
+
+    // publish messages to the topic which don't have channels created
+    for (0..no) |_| {
+        try server.publish(topic_name, "message body");
+        try consumer.pull();
+    }
+    try testing.expectEqual(4, channel.in_flight.count());
+    try testing.expectEqual(4, channel.stat.sent);
+
+    // set timestamps
+    for (channel.in_flight.values(), 1..) |msg, i| {
+        try testing.expectEqual(1, msg.attempts());
+        msg.timeout = i;
+    }
+    try channel.inFlightTimeout(1);
+    try testing.expectEqual(1, channel.stat.requeued);
+    try testing.expectEqual(3, channel.in_flight.count());
+    try testing.expectEqual(1, channel.requeued.count());
+    try testing.expectEqual(1, channel.stat.timeouted);
+    try channel.inFlightTimeout(3);
+    try testing.expectEqual(3, channel.stat.requeued);
+    try testing.expectEqual(1, channel.in_flight.count());
+    try testing.expectEqual(3, channel.requeued.count());
+    try testing.expectEqual(3, channel.stat.timeouted);
+    try testing.expectEqual(0, channel.stat.finished);
+    try consumer.fin();
+    try testing.expectEqual(1, channel.stat.finished);
+    try testing.expectEqual(0, channel.in_flight.count());
+    try consumer.pull();
+    try consumer.pull();
+    try testing.expectEqual(6, channel.stat.sent);
+    try testing.expectEqual(2, channel.in_flight.count());
+    try testing.expectEqual(1, channel.requeued.count());
+    for (channel.in_flight.values()) |msg| {
+        try testing.expectEqual(2, msg.attempts());
+    }
 }
 
 // Linked list of topic messages
