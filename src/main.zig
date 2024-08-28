@@ -13,10 +13,11 @@ const protocol = @import("protocol.zig");
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
-const Message = @import("server.zig").Message;
-const Server = @import("server.zig").ServerType(*Conn);
-const Channel = @import("server.zig").ServerType(*Conn).Channel;
-const ChannelMsg = @import("server.zig").ChannelMsg;
+const Timer = @import("io.zig").Timer;
+const Server = @import("server.zig").ServerType(*Conn, *Timer);
+const Channel = Server.Channel;
+const ConsumerOpt = @import("server.zig").ConsumerOpt;
+const ChannelMsg = @import("server.zig").ChannelMsg; // TODO rename to Message
 const max_msgs_send_batch_size = @import("server.zig").max_msgs_send_batch_size;
 
 const recv_buffers = 1024;
@@ -42,8 +43,10 @@ pub fn main() !void {
     var io = Io{ .allocator = allocator };
     try io.init(ring_entries, recv_buffers, recv_buffer_len);
     defer io.deinit();
+    var timer = Timer.init(allocator, &io);
+    defer timer.deinit();
 
-    server = Server.init(allocator);
+    server = Server.init(allocator, &timer);
     defer server.deinit();
 
     var listener = try Listener.init(allocator, &io);
@@ -66,7 +69,7 @@ pub fn main() !void {
         }
     }
 
-    log.debug("done", .{});
+    log.info("done", .{});
 }
 
 fn mallocTrim() void {
@@ -218,6 +221,7 @@ const Conn = struct {
         .flags = 0,
     },
     channel: ?*Channel = null,
+    opt: ConsumerOpt = .{},
 
     const Response = enum {
         ok,

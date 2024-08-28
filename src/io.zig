@@ -16,6 +16,7 @@ const ns_per_s = std.time.ns_per_s;
 pub const Io = struct {
     allocator: mem.Allocator,
     ring: IoUring = undefined,
+    timestamp: u64 = 0,
     recv_buf_grp: IoUring.BufferGroup = undefined,
     recv_buf_grp_stat: struct {
         success: usize = 0,
@@ -118,6 +119,7 @@ pub const Io = struct {
 
     pub fn init(self: *Io, ring_entries: u16, recv_buffers: u16, recv_buffer_len: u32) !void {
         self.ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER);
+        self.timestamp = timestamp();
         if (recv_buffers > 0) {
             self.recv_buf_grp = try self.initBufferGroup(1, recv_buffers, recv_buffer_len);
         } else {
@@ -242,8 +244,10 @@ pub const Io = struct {
         var cqes: [256]std.os.linux.io_uring_cqe = undefined;
         self.stat.loops += 1;
         const n = try self.readCompletions(&cqes);
-        if (n > 0)
+        if (n > 0) {
+            self.timestamp = timestamp();
             try self.flushCompletions(cqes[0..n]);
+        }
     }
 
     fn readCompletions(self: *Io, cqes: []linux.io_uring_cqe) !usize {
@@ -694,12 +698,10 @@ test "timer" {
     };
     var ctx = Ctx{};
 
-    //const start = timestamp();
     _ = try io.timer(1, &ctx, Ctx.ticked, null);
     try io.tick();
     try testing.expectEqual(1, ctx.count);
-    // const ns = timestamp() - start;
-    // std.debug.print("after = {} {}\n", .{ ns, ns / std.time.ns_per_s });
+
     _ = try io.timer(1, &ctx, Ctx.ticked, null);
     try io.tick();
     try testing.expectEqual(2, ctx.count);
@@ -716,24 +718,27 @@ fn timestamp() u64 {
 const TimerOp = struct {
     context: usize,
     fire_at: u64,
-    callback: *const fn (*TimerOp, u64) Error!void,
+    user_data: u64,
+    callback: *const fn (*TimerOp) Error!void,
 
     fn init(
         context: anytype,
         comptime cb: fn (@TypeOf(context), u64) Error!void,
         fire_at: u64,
+        user_data: u64,
     ) TimerOp {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *TimerOp, ts: u64) Error!void {
+            fn complete(op: *TimerOp) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
-                try cb(ctx, ts);
+                try cb(ctx, op.user_data);
             }
         };
         return .{
             .context = @intFromPtr(context),
             .callback = wrapper.complete,
             .fire_at = fire_at,
+            .user_data = user_data,
         };
     }
 
@@ -742,7 +747,7 @@ const TimerOp = struct {
     }
 };
 
-const Timer = struct {
+pub const Timer = struct {
     allocator: mem.Allocator,
     io: *Io,
     io_op: ?*Op = null,
@@ -765,46 +770,40 @@ const Timer = struct {
         self.queue.deinit();
     }
 
+    pub fn now(self: *Self) u64 {
+        return self.io.timestamp;
+    }
+
     pub fn set(
         self: *Self,
         context: anytype,
         comptime cb: fn (@TypeOf(context), u64) Error!void,
-        fire_after: u64,
+        fire_at: u64,
+        user_data: u64,
     ) !void {
-        const ts = timestamp();
-        const fire_at = ts + fire_after;
-        const op = try self.allocator.create(TimerOp);
-        op.* = TimerOp.init(context, cb, fire_at);
-        try self.queue.add(op);
-        if (self.io_op == null) {
-            var at = fire_at;
-            while (self.queue.peek()) |e| {
-                if (e.fire_at <= ts) {
-                    try self.fire(e, ts);
-                    continue;
-                }
-                at = e.fire_at;
-                break;
-            }
-            self.io_op = try self.io.timer(at - ts, self, Timer.ticked, Timer.failed);
+        { // add new op
+            const op = try self.allocator.create(TimerOp);
+            op.* = TimerOp.init(context, cb, fire_at, user_data);
+            try self.queue.add(op);
         }
+        // if timer is not armed
+        if (self.io_op == null) try self.ticked();
     }
 
-    fn fire(self: *Self, op: *TimerOp, ts: u64) !void {
-        try op.callback(op, ts);
-        _ = self.queue.remove();
-        self.allocator.destroy(op);
-    }
-
+    // fire expired callbacks and arm next timer
     fn ticked(self: *Self) Error!void {
-        const ts = timestamp();
+        const ts = self.now();
         var at: u64 = 0;
-        while (self.queue.peek()) |e| {
-            if (e.fire_at <= ts) {
-                try self.fire(e, ts);
+        while (self.queue.peek()) |op| {
+            if (op.fire_at <= ts) {
+                { // fire callback
+                    try op.callback(op);
+                    _ = self.queue.remove();
+                    self.allocator.destroy(op);
+                }
                 continue;
             }
-            at = e.fire_at;
+            at = op.fire_at;
             break;
         }
         if (at == 0) {
@@ -819,7 +818,7 @@ const Timer = struct {
         try self.ticked();
     }
 
-    // Removes one operation
+    // Removes one operation, TODO: remove all
     pub fn clear(self: *Self, context: anytype) !void {
         const ctx: usize = @intFromPtr(context);
         var it = self.queue.iterator();
@@ -833,21 +832,9 @@ const Timer = struct {
             idx += 1;
         }
     }
-
-    fn tick(self: *Self, ts: u64) !void {
-        while (self.queue.peek()) |op| {
-            if (op.fire_at <= ts) {
-                try op.callback(op, ts);
-                _ = self.queue.remove();
-                self.allocator.destroy(op);
-            } else {
-                return;
-            }
-        }
-    }
 };
 
-test "timer 2" {
+test "Timer" {
     const allocator = testing.allocator;
     var io = Io{ .allocator = allocator };
     try io.init(4, 0, 0);
@@ -856,27 +843,28 @@ test "timer 2" {
     const Ctx = struct {
         created_at: u64,
         fired_at: u64 = 0,
-        fn onTimer(self: *@This(), ts: u64) !void {
-            self.fired_at = ts;
+        fn onTimer(self: *@This(), user_data: u64) !void {
+            _ = user_data;
+            self.fired_at = timestamp();
         }
         fn delay(self: *@This()) u64 {
             if (self.fired_at == 0) return 0;
             return self.fired_at - self.created_at;
         }
     };
-    const ts = timestamp();
-    var ctx1 = Ctx{ .created_at = ts };
-    var ctx2 = Ctx{ .created_at = ts };
-    var ctx3 = Ctx{ .created_at = ts };
 
     var timer = Timer.init(testing.allocator, &io);
+    var ctx1 = Ctx{ .created_at = timer.now() };
+    var ctx2 = Ctx{ .created_at = timer.now() };
+    var ctx3 = Ctx{ .created_at = timer.now() };
+
     defer timer.deinit();
     const ctx1_delay = 1 * ns_per_ms;
     const ctx2_delay = 2 * ns_per_ms;
     const ctx3_delay = 3 * ns_per_ms;
-    try timer.set(&ctx1, Ctx.onTimer, ctx1_delay);
-    try timer.set(&ctx2, Ctx.onTimer, ctx2_delay);
-    try timer.set(&ctx3, Ctx.onTimer, ctx3_delay);
+    try timer.set(&ctx1, Ctx.onTimer, ctx1_delay + timer.now(), 0);
+    try timer.set(&ctx2, Ctx.onTimer, ctx2_delay + timer.now(), 0);
+    try timer.set(&ctx3, Ctx.onTimer, ctx3_delay + timer.now(), 0);
 
     try io.tick();
     try timer.clear(&ctx2);
