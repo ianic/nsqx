@@ -27,9 +27,9 @@ const ring_entries: u16 = 16 * 1024;
 
 var server: Server = undefined;
 
-pub const std_options = std.Options{
-    .log_level = .info,
-};
+// pub const std_options = std.Options{
+//     .log_level = .info,
+// };
 
 pub fn main() !void {
     // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -108,7 +108,7 @@ fn showStat(listener: *Listener, io: *Io) !void {
         const topic_name = te.key_ptr.*;
         const topic = te.value_ptr.*;
         const size = topic.messages.size();
-        print("\t{s} messages: {d} bytes: {} {}Mb {}Gb, sequence: {}\n", .{
+        print("  {s} messages: {d} bytes: {} {}Mb {}Gb, sequence: {}\n", .{
             topic_name,
             topic.messages.count(),
             size,
@@ -121,11 +121,18 @@ fn showStat(listener: *Listener, io: *Io) !void {
         while (ci.next()) |ce| {
             const channel_name = ce.key_ptr.*;
             const channel = ce.value_ptr.*;
-            print("\t --{s} consumers: {} in flight messages: {} offset: {}\n", .{
+            print("  --{s} consumers: {},  in flight messages: {}, requeued: {}, offset: {}\n", .{
                 channel_name,
                 channel.consumers.items.len,
                 channel.in_flight.count(),
+                channel.requeued.count(),
                 channel.offset,
+            });
+            print("    sent: {}, finished: {}, timeouted: {}, requeued: {}\n", .{
+                channel.stat.sent,
+                channel.stat.finished,
+                channel.stat.timeouted,
+                channel.stat.requeued,
             });
         }
     }
@@ -306,6 +313,15 @@ const Conn = struct {
                         try self.close();
                     }
                     ready_changed = true;
+                },
+                .req => |req| {
+                    if (self.channel) |channel| {
+                        self.in_flight -|= 1;
+                        const res = try channel.req(req.msg_id); // TODO handle res
+                        log.debug("{} req {} {}", .{ self.socket, ChannelMsg.seqFromId(req.msg_id), res });
+                    } else {
+                        try self.close();
+                    }
                 },
                 .cls => {
                     self.ready_count = 0;

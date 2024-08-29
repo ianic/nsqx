@@ -383,35 +383,36 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                 }
 
                 fn setTimeout(self: *Channel, expires_at: u64) !void {
-                    if (self.timeout > expires_at) {
-                        try self.timer.set(self, Channel.timerTimeout, expires_at, self.timeout);
-                        self.timeout = expires_at;
-                    }
+                    if (expires_at >= self.timeout) return;
+                    try self.timer.set(self, Channel.timerTimeout, expires_at, self.timeout);
+                    self.timeout = expires_at;
                 }
 
                 fn timerTimeout(self: *Channel, user_data: u64) Error!void {
                     self.timeout = user_data;
-                    if (try self.inFlightTimeout(self.timer.now())) |expires_at|
-                        try self.setTimeout(expires_at);
+                    const msgs, const expires_at = try self.inFlightTimeout(self.timer.now());
+                    try self.setTimeout(expires_at);
+                    if (msgs > 0) try self.wakeup();
                 }
 
-                fn inFlightTimeout(self: *Channel, ts: u64) !?u64 {
+                fn inFlightTimeout(self: *Channel, ts: u64) !struct { usize, u64 } {
                     var msgs = std.ArrayList(*ChannelMsg).init(self.allocator);
                     defer msgs.deinit();
-                    var min_expires_at: ?u64 = null;
+                    var min_expires_at: u64 = no_timeout;
                     for (self.in_flight.values()) |msg| {
                         if (msg.expires_at <= ts) {
                             try msgs.append(msg);
                         } else {
-                            if (min_expires_at == null or min_expires_at.? > msg.expires_at)
+                            if (min_expires_at > msg.expires_at)
                                 min_expires_at = msg.expires_at;
                         }
                     }
                     for (msgs.items) |msg| {
+                        log.debug("{} message timeout {}", .{ msg.in_flight_socket, msg.sequence() });
                         try self.requeue(msg);
                     }
                     self.stat.timeouted += msgs.items.len;
-                    return min_expires_at;
+                    return .{ msgs.items.len, min_expires_at };
                 }
 
                 // Iterates over ready consumers. Returns null when there is no
@@ -694,7 +695,7 @@ test "channel fin req" {
     }
 }
 
-const default_msg_timeout: u64 = 60 * ns_per_s;
+const default_msg_timeout: u64 = 3 * ns_per_s;
 pub const ConsumerOpt = struct {
     hostname: []const u8 = &.{},
     msg_timeout: u64 = default_msg_timeout,
@@ -916,20 +917,18 @@ test "timeout messages" {
         }
     }
     { // expire one message
-        try testing.expectEqual(
-            default_msg_timeout + 2,
-            try channel.inFlightTimeout(default_msg_timeout + 1),
-        );
+        const msgs, const expire_at = try channel.inFlightTimeout(default_msg_timeout + 1);
+        try testing.expectEqual(1, msgs);
+        try testing.expectEqual(default_msg_timeout + 2, expire_at);
         try testing.expectEqual(1, channel.stat.requeued);
         try testing.expectEqual(3, channel.in_flight.count());
         try testing.expectEqual(1, channel.requeued.count());
         try testing.expectEqual(1, channel.stat.timeouted);
     }
     { // expire two more
-        try testing.expectEqual(
-            default_msg_timeout + 4,
-            try channel.inFlightTimeout(default_msg_timeout + 3),
-        );
+        const msgs, const expire_at = try channel.inFlightTimeout(default_msg_timeout + 3);
+        try testing.expectEqual(2, msgs);
+        try testing.expectEqual(default_msg_timeout + 4, expire_at);
         try testing.expectEqual(3, channel.stat.requeued);
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(3, channel.requeued.count());
