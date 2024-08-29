@@ -783,16 +783,22 @@ pub const Timer = struct {
         fire_at: u64, // future timestamp in nanoseconds
         user_data: u64,
     ) !void {
+        const current = if (self.queue.peek()) |op| op.fire_at else std.math.maxInt(u64);
         { // add new op
             const op = try self.allocator.create(TimerOp);
             op.* = TimerOp.init(context, cb, fire_at, user_data);
             try self.queue.add(op);
         }
-        // if timer is not armed
-        if (self.io_op == null) try self.ticked();
+        if (fire_at < current) {
+            if (self.io_op) |io_op| {
+                try io_op.cancel();
+                io_op.unsubscribe(self);
+            }
+            try self.ticked();
+        }
     }
 
-    // Fire expired callbacks and arm next timer
+    /// Success event handler. Fire expired callbacks and arm next timer.
     fn ticked(self: *Self) Error!void {
         const ts = self.now();
         var at: u64 = 0;
@@ -815,6 +821,7 @@ pub const Timer = struct {
         self.io_op = try self.io.timer(at - ts, self, Timer.ticked, Timer.failed);
     }
 
+    /// Fail event handler.
     fn failed(self: *Self, err: anyerror) Error!void {
         log.err("timer failed {}", .{err});
         try self.ticked();
@@ -824,7 +831,6 @@ pub const Timer = struct {
     pub fn clear(self: *Self, context: anytype) !void {
         const ctx: usize = @intFromPtr(context);
         outer: while (true) {
-            std.debug.print("outer \n", .{});
             var it = self.queue.iterator();
             var idx: usize = 0;
             while (it.next()) |e| {
@@ -868,18 +874,20 @@ test "Timer set/clear" {
     const ctx1_delay = 1 * ns_per_ms;
     const ctx2_delay = 2 * ns_per_ms;
     const ctx3_delay = 3 * ns_per_ms;
+    try timer.set(&ctx3, Ctx.onTimer, ctx3_delay + timer.now(), 0);
     try timer.set(&ctx1, Ctx.onTimer, ctx1_delay + timer.now(), 0);
     try timer.set(&ctx2, Ctx.onTimer, ctx2_delay + timer.now(), 0);
     try timer.set(&ctx2, Ctx.onTimer, ctx2_delay + timer.now(), 0);
-    try timer.set(&ctx3, Ctx.onTimer, ctx3_delay + timer.now(), 0);
+
     try testing.expectEqual(4, timer.queue.count());
 
-    try io.tick();
+    try io.tick(); // cancel
+    try io.tick(); // timer 1
     try testing.expectEqual(3, timer.queue.count());
     try timer.clear(&ctx2);
     try testing.expectEqual(1, timer.queue.count());
-    try io.tick();
-    try io.tick();
+    try io.tick(); // timer 2, noop
+    try io.tick(); // timer 3
 
     const tolerance = ns_per_ms / 2;
     // std.debug.print("ctx1.delay(): {}\n", .{ctx1.delay()});
