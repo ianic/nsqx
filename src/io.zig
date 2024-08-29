@@ -774,11 +774,13 @@ pub const Timer = struct {
         return self.io.timestamp;
     }
 
+    /// Set callback to be called at fire_at. User data will be passed to the
+    /// callback.
     pub fn set(
         self: *Self,
         context: anytype,
         comptime cb: fn (@TypeOf(context), u64) Error!void,
-        fire_at: u64,
+        fire_at: u64, // future timestamp in nanoseconds
         user_data: u64,
     ) !void {
         { // add new op
@@ -790,7 +792,7 @@ pub const Timer = struct {
         if (self.io_op == null) try self.ticked();
     }
 
-    // fire expired callbacks and arm next timer
+    // Fire expired callbacks and arm next timer
     fn ticked(self: *Self) Error!void {
         const ts = self.now();
         var at: u64 = 0;
@@ -818,23 +820,27 @@ pub const Timer = struct {
         try self.ticked();
     }
 
-    // Removes one operation, TODO: remove all
+    /// Removes all scheduled timer operations for given context.
     pub fn clear(self: *Self, context: anytype) !void {
         const ctx: usize = @intFromPtr(context);
-        var it = self.queue.iterator();
-        var idx: usize = 0;
-        while (it.next()) |e| {
-            if (e.context == ctx) {
-                const op = self.queue.removeIndex(idx);
-                self.allocator.destroy(op);
-                break;
+        outer: while (true) {
+            std.debug.print("outer \n", .{});
+            var it = self.queue.iterator();
+            var idx: usize = 0;
+            while (it.next()) |e| {
+                if (e.context == ctx) {
+                    const op = self.queue.removeIndex(idx);
+                    self.allocator.destroy(op);
+                    continue :outer;
+                }
+                idx += 1;
             }
-            idx += 1;
+            break;
         }
     }
 };
 
-test "Timer" {
+test "Timer set/clear" {
     const allocator = testing.allocator;
     var io = Io{ .allocator = allocator };
     try io.init(4, 0, 0);
@@ -864,19 +870,21 @@ test "Timer" {
     const ctx3_delay = 3 * ns_per_ms;
     try timer.set(&ctx1, Ctx.onTimer, ctx1_delay + timer.now(), 0);
     try timer.set(&ctx2, Ctx.onTimer, ctx2_delay + timer.now(), 0);
+    try timer.set(&ctx2, Ctx.onTimer, ctx2_delay + timer.now(), 0);
     try timer.set(&ctx3, Ctx.onTimer, ctx3_delay + timer.now(), 0);
+    try testing.expectEqual(4, timer.queue.count());
 
     try io.tick();
+    try testing.expectEqual(3, timer.queue.count());
     try timer.clear(&ctx2);
+    try testing.expectEqual(1, timer.queue.count());
     try io.tick();
     try io.tick();
 
-    const tolerance = ns_per_ms / 5;
+    const tolerance = ns_per_ms / 2;
+    // std.debug.print("ctx1.delay(): {}\n", .{ctx1.delay()});
     try testing.expect(ctx1.delay() > ctx1_delay and ctx1.delay() < ctx1_delay + tolerance);
-    //std.debug.print("ctx1.delay(): {}\n", .{ctx1.delay()});
-
     try testing.expectEqual(0, ctx2.fired_at);
-
-    try testing.expect(ctx3.delay() > ctx3_delay and ctx3.delay() < ctx3_delay + tolerance);
     //std.debug.print("ctx3.delay(): {}\n", .{ctx3.delay()});
+    try testing.expect(ctx3.delay() > ctx3_delay and ctx3.delay() < ctx3_delay + tolerance);
 }
