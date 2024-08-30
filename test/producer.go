@@ -25,7 +25,11 @@ func main() {
 	for i := 0; i < 10; i++ {
 		msg := fmt.Sprintf("%d %d iso medo u ducan nije reko dobar dan", i, time.Now().Unix())
 
-		if producer.Publish("topic", []byte(msg)); err != nil {
+		// if producer.Publish("topic", []byte(msg)); err != nil {
+		// 	log.Fatal(err)
+		// }
+
+		if producer.DeferredPublish("topic", time.Second*3, []byte(msg)); err != nil {
 			log.Fatal(err)
 		}
 	}

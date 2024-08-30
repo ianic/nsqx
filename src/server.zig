@@ -8,6 +8,7 @@ const testing = std.testing;
 const socket_t = posix.socket_t;
 
 const ns_per_s = std.time.ns_per_s;
+const ns_per_ms = std.time.ns_per_ms;
 const no_timeout: u64 = std.math.maxInt(u64);
 
 // TODO: rethink this dependency
@@ -19,9 +20,11 @@ pub const max_msgs_send_batch_size = 512;
 
 const TopicMsg = struct {
     sequence: u64,
-    timestamp: u64,
+    created_at: u64,
     body: []const u8,
     next: ?*TopicMsg = null,
+    // Defer message delivery until timestamp is reached.
+    defer_until: u64 = 0,
 
     const frame_type = 2;
 
@@ -29,12 +32,13 @@ const TopicMsg = struct {
         var header: [34]u8 = .{0} ** 34;
         mem.writeInt(u32, header[0..4], @intCast(self.body.len + 30), .big); // size
         mem.writeInt(u32, header[4..8], frame_type, .big); // frame type
-        mem.writeInt(u64, header[8..16], self.timestamp, .big); // timestamp
+        mem.writeInt(u64, header[8..16], self.created_at, .big); // timestamp
         mem.writeInt(u16, header[16..18], 1, .big); // attempts
         mem.writeInt(u64, header[26..34], self.sequence, .big); // message id
         return .{
             .header = header,
             .body = self.body,
+            .timestamp = self.defer_until,
         };
     }
 };
@@ -43,7 +47,10 @@ pub const ChannelMsg = struct {
     header: [34]u8,
     body: []const u8,
     in_flight_socket: socket_t = 0,
-    expires_at: u64 = 0, // timestamp in ns
+    // Timestamp in nanoseconds. When in flight and timestamp is reached message should
+    // be re-queued. If deferred message should not be delivered until timestamp
+    // is reached.
+    timestamp: u64 = 0,
 
     fn incAttempts(self: *ChannelMsg) void {
         const buf = self.header[16..18];
@@ -65,13 +72,15 @@ pub const ChannelMsg = struct {
     }
 
     fn less(_: void, a: *ChannelMsg, b: *ChannelMsg) math.Order {
+        if (a.timestamp != b.timestamp)
+            return math.order(a.timestamp, b.timestamp);
         return math.order(a.sequence(), b.sequence());
     }
 
     test incAttempts {
         const t = TopicMsg{
             .sequence = 0x01020304050607,
-            .timestamp = 0x08090a0b0c0d0e0f,
+            .created_at = 0x08090a0b0c0d0e0f,
             .body = &.{ 0xaa, 0xbb, 0xcc, 0xcc },
         };
         var c = t.asChannelMsg();
@@ -113,8 +122,7 @@ fn timestamp() u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-fn lessU64(context: void, a: u64, b: u64) math.Order {
-    _ = context;
+fn lessU64(_: void, a: u64, b: u64) math.Order {
     return math.order(a, b);
 }
 
@@ -167,6 +175,11 @@ pub fn ServerType(Consumer: type, Timer: type) type {
         pub fn multiPublish(self: *Server, topic_name: []const u8, msgs: u32, data: []const u8) !void {
             const topic = try self.getTopic(topic_name);
             try topic.multiPublish(msgs, data);
+        }
+
+        pub fn deferredPublish(self: *Server, topic_name: []const u8, data: []const u8, delay: u32) !void {
+            const topic = try self.getTopic(topic_name);
+            try topic.deferredPublish(data, delay);
         }
 
         pub fn deinit(self: *Server) void {
@@ -235,7 +248,13 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                 }
 
                 pub fn publish(self: *Topic, data: []const u8) !void {
-                    try self.append(data);
+                    _ = try self.append(data);
+                    try self.notifyChannels();
+                }
+
+                pub fn deferredPublish(self: *Topic, data: []const u8, delay: u32) !void {
+                    var msg = try self.append(data);
+                    msg.defer_until = self.server.timer.now() + delay * ns_per_ms;
                     try self.notifyChannels();
                 }
 
@@ -244,23 +263,24 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     for (0..msgs) |_| {
                         const len = mem.readInt(u32, data[pos..][0..4], .big);
                         pos += 4;
-                        try self.append(data[pos..][0..len]);
+                        _ = try self.append(data[pos..][0..len]);
                         pos += len;
                     }
                     try self.notifyChannels();
                 }
 
-                fn append(self: *Topic, data: []const u8) !void {
+                fn append(self: *Topic, data: []const u8) !*TopicMsg {
                     const msg = try self.allocator.create(TopicMsg);
                     const body = try self.allocator.dupe(u8, data);
                     self.sequence += 1;
                     msg.* = .{
                         .sequence = self.sequence,
-                        .timestamp = timestamp(),
+                        .created_at = self.server.timer.now(),
                         .body = body,
                     };
                     self.messages.append(msg);
                     if (self.next == null) self.next = msg;
+                    return msg;
                 }
 
                 // Notify all channels that there is pending message
@@ -369,7 +389,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     consumer.sendMsgs(msgs[0..n]) catch |err| {
                         log.err("failed to send msg {}, re-queuing", .{err});
                         for (msgs[0..n]) |msg|
-                            assert(self.req(msg.id()) catch false);
+                            assert(self.req(msg.id(), 0) catch false);
                         return false;
                     };
                     return n == msgs.len;
@@ -377,8 +397,8 @@ pub fn ServerType(Consumer: type, Timer: type) type {
 
                 fn inFlightAppend(self: *Channel, msg: *ChannelMsg, msg_timeout: u64) !void {
                     self.stat.send += 1;
-                    msg.expires_at = self.timer.now() + msg_timeout;
-                    try self.setTimeout(msg.expires_at);
+                    msg.timestamp = self.timer.now() + msg_timeout;
+                    try self.setTimeout(msg.timestamp);
                     try self.in_flight.put(msg.sequence(), msg);
                 }
 
@@ -390,29 +410,30 @@ pub fn ServerType(Consumer: type, Timer: type) type {
 
                 fn timerTimeout(self: *Channel, user_data: u64) Error!void {
                     self.timeout = user_data;
-                    const msgs, const expires_at = try self.inFlightTimeout(self.timer.now());
+                    const expires_at = try self.inFlightTimeout(self.timer.now());
                     try self.setTimeout(expires_at);
-                    if (msgs > 0) try self.wakeup();
+                    if (self.deferred.count() > 0)
+                        try self.wakeup();
                 }
 
-                fn inFlightTimeout(self: *Channel, ts: u64) !struct { usize, u64 } {
+                fn inFlightTimeout(self: *Channel, ts: u64) !u64 {
                     var msgs = std.ArrayList(*ChannelMsg).init(self.allocator);
                     defer msgs.deinit();
                     var min_expires_at: u64 = no_timeout;
                     for (self.in_flight.values()) |msg| {
-                        if (msg.expires_at <= ts) {
+                        if (msg.timestamp <= ts) {
                             try msgs.append(msg);
                         } else {
-                            if (min_expires_at > msg.expires_at)
-                                min_expires_at = msg.expires_at;
+                            if (min_expires_at > msg.timestamp)
+                                min_expires_at = msg.timestamp;
                         }
                     }
                     for (msgs.items) |msg| {
                         log.debug("{} message timeout {}", .{ msg.in_flight_socket, msg.sequence() });
-                        try self.requeue(msg);
+                        try self.requeue(msg, 0);
                     }
                     self.stat.timeout += msgs.items.len;
-                    return .{ msgs.items.len, min_expires_at };
+                    return min_expires_at;
                 }
 
                 // Iterates over ready consumers. Returns null when there is no
@@ -476,19 +497,22 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     return false;
                 }
 
-                pub fn req(self: *Channel, msg_id: [16]u8) !bool {
+                pub fn req(self: *Channel, msg_id: [16]u8, delay: u32) !bool {
                     const seq = ChannelMsg.seqFromId(msg_id);
                     if (self.in_flight.get(seq)) |msg| {
-                        try self.requeue(msg);
+                        try self.requeue(msg, delay);
                         self.stat.requeue += 1;
                         return true;
                     }
                     return false;
                 }
 
-                fn requeue(self: *Channel, msg: *ChannelMsg) !void {
+                fn requeue(self: *Channel, msg: *ChannelMsg, delay: u32) !void {
                     msg.in_flight_socket = 0;
                     msg.incAttempts();
+                    msg.timestamp = if (delay == 0) 0 else self.timer.now() + delay * ns_per_ms;
+                    if (msg.timestamp > 0)
+                        try self.setTimeout(msg.timestamp);
                     try self.deferred.add(msg);
                     assert(self.in_flight.swapRemove(msg.sequence()));
                 }
@@ -502,7 +526,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     outer: while (true) {
                         for (self.in_flight.values()) |msg| {
                             if (msg.in_flight_socket == consumer.socket) {
-                                _ = try self.req(msg.id());
+                                _ = try self.req(msg.id(), 0);
                                 continue :outer; // restart on delete from in_flight
                             }
                         }
@@ -523,14 +547,25 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                 }
 
                 fn getMsg(self: *Channel) !?*ChannelMsg {
-                    // First look into re-queued messages
-                    if (self.deferred.removeOrNull()) |msg| return msg;
+                    const now = self.timer.now();
+
+                    // First look into deferred messages
+                    if (self.deferred.peek()) |msg| {
+                        if (msg.timestamp <= now) {
+                            return self.deferred.remove();
+                        }
+                    }
 
                     // Then try to find next message in topic
-                    if (self.nextTopicMsg()) |topic_msg| {
+                    while (self.nextTopicMsg()) |topic_msg| {
                         const msg = try self.allocator.create(ChannelMsg);
                         msg.* = topic_msg.asChannelMsg();
                         self.stat.pull += 1;
+                        if (msg.timestamp > now) {
+                            try self.deferred.add(msg);
+                            try self.setTimeout(msg.timestamp);
+                            continue;
+                        }
                         return msg;
                     }
                     return null;
@@ -663,7 +698,7 @@ test "channel fin req" {
         try testing.expect(channel.next == null);
     }
     { // 2 is re-queued
-        try testing.expect(try channel.req(ChannelMsg.idFromSeq(2))); // req 2
+        try testing.expect(try channel.req(ChannelMsg.idFromSeq(2), 0)); // req 2
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
         try testing.expectEqual(1, channel.offset);
@@ -724,10 +759,10 @@ const TestConsumer = struct {
     }
 
     fn sendMsgs(self: *Self, msgs: []*ChannelMsg) !void {
-        assert(msgs.len == 1);
-        const msg = msgs[0];
-        try self.sequences.append(msg.sequence());
-        self.ready_count -= 1;
+        for (msgs) |msg| {
+            try self.sequences.append(msg.sequence());
+            self.ready_count -= 1;
+        }
     }
 
     // send fin for the last received message
@@ -887,7 +922,7 @@ test "first channel gets all messages accumulated in topic" {
 test "timeout messages" {
     const allocator = testing.allocator;
     const topic_name = "topic";
-    const channel_name = "channel1";
+    const channel_name = "channel";
     const no = 4;
 
     var timer = TestTimer{};
@@ -913,8 +948,8 @@ test "timeout messages" {
     { // check expire_at for in flight messages
         for (channel.in_flight.values()) |msg| {
             try testing.expectEqual(1, msg.attempts());
-            try testing.expect(msg.expires_at > default_msg_timeout and
-                msg.expires_at <= default_msg_timeout + no);
+            try testing.expect(msg.timestamp > default_msg_timeout and
+                msg.timestamp <= default_msg_timeout + no);
         }
     }
     { // expire one message
@@ -953,6 +988,50 @@ test "timeout messages" {
     }
     try testing.expectEqual(default_msg_timeout + 1, timer.fire_at);
     try testing.expectEqual(no_timeout, timer.user_data);
+}
+
+test "deferred messages" {
+    const allocator = testing.allocator;
+    const topic_name = "topic";
+    const channel_name = "channel";
+
+    var timer = TestTimer{};
+    var server = TestServer.init(allocator, &timer);
+    defer server.deinit();
+
+    var consumer = TestConsumer.init(allocator);
+    defer consumer.deinit();
+    const channel = try server.sub(&consumer, topic_name, channel_name);
+    consumer.channel = channel;
+
+    { // publish two deferred messages, channel puts them into deferred queue
+        try server.deferredPublish(topic_name, "message body", 2);
+        try server.deferredPublish(topic_name, "message body", 1);
+        const topic = try server.getTopic(topic_name);
+        try testing.expectEqual(2, topic.messages.count());
+        try testing.expectEqual(0, channel.in_flight.count());
+        try testing.expectEqual(2, channel.deferred.count());
+    }
+
+    { // move now, one is in flight after wakeup
+        timer.timestamp = ns_per_ms;
+        try channel.wakeup();
+        try testing.expectEqual(1, channel.in_flight.count());
+        try testing.expectEqual(1, channel.deferred.count());
+    }
+    { // re-queue
+        assert(try channel.req(ChannelMsg.idFromSeq(2), 2));
+        try testing.expectEqual(0, channel.in_flight.count());
+        try testing.expectEqual(2, channel.deferred.count());
+    }
+
+    { // move now to deliver both
+        timer.timestamp = 3 * ns_per_ms;
+        consumer.ready_count = 2;
+        try channel.wakeup();
+        try testing.expectEqual(2, channel.in_flight.count());
+        try testing.expectEqual(0, channel.deferred.count());
+    }
 }
 
 // Linked list of topic messages
@@ -1020,10 +1099,10 @@ const TopicMsgList = struct {
         const m2 = try allocator.create(TopicMsg);
         const m3 = try allocator.create(TopicMsg);
         const m4 = try allocator.create(TopicMsg);
-        m1.* = TopicMsg{ .sequence = 1, .timestamp = 0, .body = try allocator.dupe(u8, body) };
-        m2.* = TopicMsg{ .sequence = 2, .timestamp = 0, .body = try allocator.dupe(u8, body) };
-        m3.* = TopicMsg{ .sequence = 3, .timestamp = 0, .body = try allocator.dupe(u8, body) };
-        m4.* = TopicMsg{ .sequence = 4, .timestamp = 0, .body = try allocator.dupe(u8, body) };
+        m1.* = TopicMsg{ .sequence = 1, .created_at = 0, .body = try allocator.dupe(u8, body) };
+        m2.* = TopicMsg{ .sequence = 2, .created_at = 0, .body = try allocator.dupe(u8, body) };
+        m3.* = TopicMsg{ .sequence = 3, .created_at = 0, .body = try allocator.dupe(u8, body) };
+        m4.* = TopicMsg{ .sequence = 4, .created_at = 0, .body = try allocator.dupe(u8, body) };
 
         list.append(m1);
         list.append(m2);

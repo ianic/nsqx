@@ -300,6 +300,11 @@ const Conn = struct {
                     try server.multiPublish(mpub.topic, mpub.msgs, mpub.data);
                     try self.respond(.ok);
                 },
+                .dpub => |dpub| {
+                    log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, dpub.topic, dpub.delay });
+                    try server.deferredPublish(dpub.topic, dpub.data, dpub.delay);
+                    try self.respond(.ok);
+                },
                 .rdy => |count| {
                     log.debug("{} ready: {}", .{ self.socket, count });
                     self.ready_count = count;
@@ -318,7 +323,7 @@ const Conn = struct {
                 .req => |req| {
                     if (self.channel) |channel| {
                         self.in_flight -|= 1;
-                        const res = try channel.req(req.msg_id); // TODO handle res
+                        const res = try channel.req(req.msg_id, req.delay); // TODO handle res
                         log.debug("{} req {} {}", .{ self.socket, Msg.seqFromId(req.msg_id), res });
                     } else {
                         try self.close();
