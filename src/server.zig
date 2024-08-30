@@ -254,7 +254,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
 
                 pub fn deferredPublish(self: *Topic, data: []const u8, delay: u32) !void {
                     var msg = try self.append(data);
-                    msg.defer_until = self.server.timer.now() + delay * ns_per_ms;
+                    msg.defer_until = self.server.timer.now() + @as(u64, @intCast(delay)) * ns_per_ms;
                     try self.notifyChannels();
                 }
 
@@ -404,18 +404,28 @@ pub fn ServerType(Consumer: type, Timer: type) type {
 
                 fn setTimeout(self: *Channel, expires_at: u64) !void {
                     if (expires_at >= self.timeout) return;
+                    // log.debug("setTimeout {}ms", .{(expires_at - self.timer.now()) / ns_per_ms});
                     try self.timer.set(self, Channel.timerTimeout, expires_at, self.timeout);
                     self.timeout = expires_at;
                 }
 
-                fn timerTimeout(self: *Channel, user_data: u64) Error!void {
-                    self.timeout = user_data;
-                    const expires_at = try self.inFlightTimeout(self.timer.now());
-                    try self.setTimeout(expires_at);
-                    if (self.deferred.count() > 0)
+                fn timerTimeout(self: *Channel, prev_timeout: u64) Error!void {
+                    self.timeout = prev_timeout;
+                    // min timeout of in flight messages
+                    var timeout = try self.inFlightTimeout(self.timer.now());
+
+                    if (self.deferred.count() > 0) {
                         try self.wakeup();
+                        if (self.deferred.peek()) |msg| {
+                            //min timeout of deferred messages
+                            if (msg.timestamp < timeout) timeout = msg.timestamp;
+                        }
+                    }
+                    try self.setTimeout(timeout);
                 }
 
+                /// Finds time-outed in flight messages and move them to the
+                /// deferred queue.
                 fn inFlightTimeout(self: *Channel, ts: u64) !u64 {
                     var msgs = std.ArrayList(*ChannelMsg).init(self.allocator);
                     defer msgs.deinit();
@@ -510,7 +520,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                 fn requeue(self: *Channel, msg: *ChannelMsg, delay: u32) !void {
                     msg.in_flight_socket = 0;
                     msg.incAttempts();
-                    msg.timestamp = if (delay == 0) 0 else self.timer.now() + delay * ns_per_ms;
+                    msg.timestamp = if (delay == 0) 0 else self.timer.now() + @as(u64, @intCast(delay)) * ns_per_ms;
                     if (msg.timestamp > 0)
                         try self.setTimeout(msg.timestamp);
                     try self.deferred.add(msg);
@@ -731,7 +741,7 @@ test "channel fin req" {
     }
 }
 
-const default_msg_timeout: u64 = 3 * ns_per_s;
+const default_msg_timeout: u64 = 60 * ns_per_s;
 pub const ConsumerOpt = struct {
     hostname: []const u8 = &.{},
     msg_timeout: u64 = default_msg_timeout,
@@ -953,8 +963,7 @@ test "timeout messages" {
         }
     }
     { // expire one message
-        const msgs, const expire_at = try channel.inFlightTimeout(default_msg_timeout + 1);
-        try testing.expectEqual(1, msgs);
+        const expire_at = try channel.inFlightTimeout(default_msg_timeout + 1);
         try testing.expectEqual(default_msg_timeout + 2, expire_at);
         try testing.expectEqual(0, channel.stat.requeue);
         try testing.expectEqual(1, channel.stat.timeout);
@@ -962,8 +971,7 @@ test "timeout messages" {
         try testing.expectEqual(1, channel.deferred.count());
     }
     { // expire two more
-        const msgs, const expire_at = try channel.inFlightTimeout(default_msg_timeout + 3);
-        try testing.expectEqual(2, msgs);
+        const expire_at = try channel.inFlightTimeout(default_msg_timeout + 3);
         try testing.expectEqual(default_msg_timeout + 4, expire_at);
         try testing.expectEqual(0, channel.stat.requeue);
         try testing.expectEqual(3, channel.stat.timeout);

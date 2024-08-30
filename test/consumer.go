@@ -3,11 +3,11 @@ package main
 import (
 	"fmt"
 	"log"
-	"math/rand/v2"
+	//"math/rand/v2"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
+	// "time"
 
 	"github.com/nsqio/go-nsq"
 )
@@ -43,9 +43,9 @@ type Handler struct {
 }
 
 func (th *Handler) HandleMessage(m *nsq.Message) error {
-	sleep := rand.IntN(30)
-	time.Sleep(time.Duration(sleep) * time.Second)
-	fmt.Printf("%s attempts: %d sleep: %d\n", m.Body, m.Attempts, sleep)
+	//sleep := rand.IntN(30)
+	//time.Sleep(time.Duration(sleep) * time.Second)
+	log.Printf("%s attempts: %d", m.Body, m.Attempts)
 	return nil
 }
 
