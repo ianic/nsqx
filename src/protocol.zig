@@ -21,13 +21,13 @@ pub const Message = union(MessageTag) {
     dpub: struct {
         topic: []const u8,
         data: []const u8,
-        defer_time: u32,
+        delay: u32, //  defer publish for delay milliseconds
     },
     rdy: u32,
     fin: [16]u8,
     req: struct {
         msg_id: [16]u8,
-        timeout: u32,
+        delay: u32, //  defer requeue for delay milliseconds
     },
     touch: [16]u8,
     cls: void,
@@ -136,10 +136,10 @@ pub const Parser = struct {
                 // DPUB <topic_name> <defer_time>\n[ 4-byte size in bytes ][ N-byte binary data ]
                 try p.matchString("DPUB ");
                 const topic = try p.readString(' ');
-                const time = try p.readStringInt('\n');
+                const delay = try p.readStringInt('\n');
                 const size = try p.readInt();
                 const data = try p.readBytes(size);
-                return .{ .dpub = .{ .topic = topic, .defer_time = time, .data = data } };
+                return .{ .dpub = .{ .topic = topic, .delay = delay, .data = data } };
             },
             'R' => {
                 switch (p.buf[p.pos + 1]) {
@@ -153,8 +153,8 @@ pub const Parser = struct {
                         // REQ <message_id> <timeout>\n
                         try p.matchString("REQ ");
                         const msg_id = try p.readMessageId(' ');
-                        const timeout = try p.readStringInt('\n');
-                        return .{ .req = .{ .msg_id = msg_id, .timeout = timeout } };
+                        const delay = try p.readStringInt('\n');
+                        return .{ .req = .{ .msg_id = msg_id, .delay = delay } };
                     },
                     else => return error.Invalid,
                 }
@@ -359,7 +359,7 @@ test "dpub" {
         var p = Parser{ .buf = buf };
         const m = try p.parse();
         try testing.expectEqualStrings("pero", m.dpub.topic);
-        try testing.expectEqual(1234, m.dpub.defer_time);
+        try testing.expectEqual(1234, m.dpub.delay);
         try testing.expectEqual(3, m.dpub.data.len);
         try testing.expectEqual(buf.len, p.pos);
     }
@@ -380,5 +380,5 @@ test "rdy,fin.." {
     try testing.expect(m == .nop);
     m = try p.parse();
     try testing.expectEqualStrings("5678956789567890", &m.req.msg_id);
-    try testing.expectEqual(4567, m.req.timeout);
+    try testing.expectEqual(4567, m.req.delay);
 }

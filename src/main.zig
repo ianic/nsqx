@@ -17,7 +17,7 @@ const Timer = @import("io.zig").Timer;
 const Server = @import("server.zig").ServerType(*Conn, *Timer);
 const Channel = Server.Channel;
 const ConsumerOpt = @import("server.zig").ConsumerOpt;
-const ChannelMsg = @import("server.zig").ChannelMsg; // TODO rename to Message
+const Msg = @import("server.zig").ChannelMsg; // TODO rename to Message
 const max_msgs_send_batch_size = @import("server.zig").max_msgs_send_batch_size;
 
 const recv_buffers = 1024;
@@ -121,18 +121,19 @@ fn showStat(listener: *Listener, io: *Io) !void {
         while (ci.next()) |ce| {
             const channel_name = ce.key_ptr.*;
             const channel = ce.value_ptr.*;
-            print("  --{s} consumers: {},  in flight messages: {}, requeued: {}, offset: {}\n", .{
+            print("  --{s} consumers: {},  in flight messages: {}, deferred: {}, offset: {}\n", .{
                 channel_name,
                 channel.consumers.items.len,
                 channel.in_flight.count(),
-                channel.requeued.count(),
+                channel.deferred.count(),
                 channel.offset,
             });
-            print("    sent: {}, finished: {}, timeouted: {}, requeued: {}\n", .{
-                channel.stat.sent,
-                channel.stat.finished,
-                channel.stat.timeouted,
-                channel.stat.requeued,
+            print("    pull: {}, send: {}, finish: {}, timeout: {}, requeue: {}\n", .{
+                channel.stat.pull,
+                channel.stat.send,
+                channel.stat.finish,
+                channel.stat.timeout,
+                channel.stat.requeue,
             });
         }
     }
@@ -308,7 +309,7 @@ const Conn = struct {
                     if (self.channel) |channel| {
                         self.in_flight -|= 1;
                         const res = try channel.fin(msg_id); // TODO handle res
-                        log.debug("{} fin {} {}", .{ self.socket, ChannelMsg.seqFromId(msg_id), res });
+                        log.debug("{} fin {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
                     } else {
                         try self.close();
                     }
@@ -318,7 +319,7 @@ const Conn = struct {
                     if (self.channel) |channel| {
                         self.in_flight -|= 1;
                         const res = try channel.req(req.msg_id); // TODO handle res
-                        log.debug("{} req {} {}", .{ self.socket, ChannelMsg.seqFromId(req.msg_id), res });
+                        log.debug("{} req {} {}", .{ self.socket, Msg.seqFromId(req.msg_id), res });
                     } else {
                         try self.close();
                     }
@@ -389,7 +390,7 @@ const Conn = struct {
         try self.send(1);
     }
 
-    pub fn sendMsgs(self: *Conn, msgs: []*ChannelMsg) !void {
+    pub fn sendMsgs(self: *Conn, msgs: []*Msg) !void {
         assert(msgs.len <= max_msgs_send_batch_size);
         var n: usize = 0;
         for (msgs) |msg| {
@@ -401,7 +402,7 @@ const Conn = struct {
         self.in_flight += @intCast(msgs.len);
     }
 
-    pub fn sendMsg(self: *Conn, msg: *ChannelMsg) !void {
+    pub fn sendMsg(self: *Conn, msg: *Msg) !void {
         self.send_vec[0] = .{ .base = &msg.header, .len = msg.header.len };
         self.send_vec[1] = .{ .base = msg.body.ptr, .len = msg.body.len };
         try self.send(2);

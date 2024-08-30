@@ -296,33 +296,34 @@ pub fn ServerType(Consumer: type, Timer: type) type {
             return struct {
                 allocator: mem.Allocator,
                 topic: *Topic,
+                timer: Timer,
                 consumers: std.ArrayList(Consumer),
-                // Sent but not jet acknowledged (fin) messages
+                // Sent but not jet acknowledged (fin) messages.
                 in_flight: std.AutoArrayHashMap(u64, *ChannelMsg),
-                // Re-queued by consumer or timed out
-                requeued: std.PriorityQueue(*ChannelMsg, void, ChannelMsg.less),
+                // Re-queued by consumer, timed out or defer published messages.
+                deferred: std.PriorityQueue(*ChannelMsg, void, ChannelMsg.less),
                 // Sequences for which we received fin but they are out of order
                 // so we can't move offset
                 finished: std.PriorityQueue(u64, void, lessU64),
-                // Last sequence sent and acknowledged by some consumer
+                // Offset on the topic. All messages before and including this
+                // sequence are processed by the channel.
                 offset: u64 = 0,
                 // Pointer to the next message in the topic, null if we reached
-                // end of the topic
+                // end of the topic.
                 next: ?*TopicMsg = null,
                 // Round robin consumers iterator. Preserves last consumer index
-                // between inits.
+                // between init's.
                 iterator: ConsumersIterator = .{},
-                // Message timeout in nanoseconds, 0 - disabled
-                message_timeout: u64 = 0,
                 stat: struct {
-                    sent: usize = 0,
-                    finished: usize = 0,
-                    timeouted: usize = 0,
-                    requeued: usize = 0,
+                    // number of messages
+                    pull: usize = 0, // pulled from topic
+                    send: usize = 0, // sent to the client
+                    finish: usize = 0, // fin by the client
+                    timeout: usize = 0, // time outed while in flight
+                    requeue: usize = 0, // req by the client
                 } = .{},
-                // Last timeout set on the timer
+                // Last timeout set on the timer.
                 timeout: u64 = no_timeout,
-                timer: Timer,
 
                 pub fn init(allocator: mem.Allocator, topic: *Topic) Channel {
                     return .{
@@ -331,7 +332,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                         .consumers = std.ArrayList(Consumer).init(allocator),
                         .in_flight = std.AutoArrayHashMap(u64, *ChannelMsg).init(allocator),
                         .finished = std.PriorityQueue(u64, void, lessU64).init(allocator, {}),
-                        .requeued = std.PriorityQueue(*ChannelMsg, void, ChannelMsg.less).init(allocator, {}),
+                        .deferred = std.PriorityQueue(*ChannelMsg, void, ChannelMsg.less).init(allocator, {}),
                         // Channel starts at the last topic message at the moment of channel creation
                         .offset = topic.sequence,
                         .next = null,
@@ -353,7 +354,6 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                 }
 
                 // Returns true if there is more messages for next consumer
-                // TODO error handling
                 fn fillConsumer(self: *Channel, consumer: Consumer) !bool {
                     var msgs_buf: [max_msgs_send_batch_size]*ChannelMsg = undefined;
                     var msgs = msgs_buf[0..@min(consumer.ready(), msgs_buf.len)];
@@ -376,7 +376,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                 }
 
                 fn inFlightAppend(self: *Channel, msg: *ChannelMsg, msg_timeout: u64) !void {
-                    self.stat.sent += 1;
+                    self.stat.send += 1;
                     msg.expires_at = self.timer.now() + msg_timeout;
                     try self.setTimeout(msg.expires_at);
                     try self.in_flight.put(msg.sequence(), msg);
@@ -411,7 +411,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                         log.debug("{} message timeout {}", .{ msg.in_flight_socket, msg.sequence() });
                         try self.requeue(msg);
                     }
-                    self.stat.timeouted += msgs.items.len;
+                    self.stat.timeout += msgs.items.len;
                     return .{ msgs.items.len, min_expires_at };
                 }
 
@@ -454,7 +454,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
 
                 pub fn finSeq(self: *Channel, seq: u64) !bool {
                     if (self.in_flight.fetchSwapRemove(seq)) |kv| {
-                        self.stat.finished += 1;
+                        self.stat.finish += 1;
                         self.allocator.destroy(kv.value);
 
                         { // Move self.sequence or add seq to finished
@@ -480,6 +480,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     const seq = ChannelMsg.seqFromId(msg_id);
                     if (self.in_flight.get(seq)) |msg| {
                         try self.requeue(msg);
+                        self.stat.requeue += 1;
                         return true;
                     }
                     return false;
@@ -488,9 +489,8 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                 fn requeue(self: *Channel, msg: *ChannelMsg) !void {
                     msg.in_flight_socket = 0;
                     msg.incAttempts();
-                    try self.requeued.add(msg);
+                    try self.deferred.add(msg);
                     assert(self.in_flight.swapRemove(msg.sequence()));
-                    self.stat.requeued += 1;
                 }
 
                 fn sub(self: *Channel, consumer: Consumer) !void {
@@ -524,12 +524,13 @@ pub fn ServerType(Consumer: type, Timer: type) type {
 
                 fn getMsg(self: *Channel) !?*ChannelMsg {
                     // First look into re-queued messages
-                    if (self.requeued.removeOrNull()) |msg| return msg;
+                    if (self.deferred.removeOrNull()) |msg| return msg;
 
                     // Then try to find next message in topic
                     if (self.nextTopicMsg()) |topic_msg| {
                         const msg = try self.allocator.create(ChannelMsg);
                         msg.* = topic_msg.asChannelMsg();
+                        self.stat.pull += 1;
                         return msg;
                     }
                     return null;
@@ -547,10 +548,10 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     if (self.timeout != no_timeout) self.timer.clear(self) catch {};
                     self.consumers.deinit();
                     for (self.in_flight.values()) |msg| self.allocator.destroy(msg);
-                    while (self.requeued.removeOrNull()) |msg| self.allocator.destroy(msg);
+                    while (self.deferred.removeOrNull()) |msg| self.allocator.destroy(msg);
                     self.in_flight.deinit();
                     self.finished.deinit();
-                    self.requeued.deinit();
+                    self.deferred.deinit();
                 }
             };
         }
@@ -615,12 +616,12 @@ test "channel fin req" {
     { // 3 messages in topic, 0 taken by channel
         try testing.expectEqual(3, topic.messages.count());
         try testing.expectEqual(0, channel.in_flight.count());
-        try testing.expectEqual(0, channel.requeued.count());
+        try testing.expectEqual(0, channel.deferred.count());
     }
     { // wakeup without ready consumers
         try channel.wakeup();
         try testing.expectEqual(0, channel.in_flight.count());
-        try testing.expectEqual(0, channel.requeued.count());
+        try testing.expectEqual(0, channel.deferred.count());
     }
 
     { // consumer is ready
@@ -629,14 +630,14 @@ test "channel fin req" {
         try testing.expectEqual(1, consumer.lastSeq());
         // 1 is in flight
         try testing.expectEqual(1, channel.in_flight.count());
-        try testing.expectEqual(0, channel.requeued.count());
+        try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(0, channel.offset);
         try testing.expectEqual(2, channel.next.?.sequence);
     }
     { // consumer sends fin, 0 in flight after that
         try testing.expect(try channel.fin(consumer.lastId())); // fin 1
         try testing.expectEqual(0, channel.in_flight.count());
-        try testing.expectEqual(0, channel.requeued.count());
+        try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(1, channel.offset);
         try testing.expectEqual(0, channel.finished.count());
         try testing.expectEqual(2, topic.messages.count());
@@ -647,7 +648,7 @@ test "channel fin req" {
         try testing.expectEqual(2, consumer.lastSeq());
 
         try testing.expectEqual(1, channel.in_flight.count());
-        try testing.expectEqual(0, channel.requeued.count());
+        try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(1, channel.offset);
         try testing.expectEqual(3, channel.next.?.sequence);
     }
@@ -657,20 +658,20 @@ test "channel fin req" {
         try testing.expectEqual(3, consumer.lastSeq());
 
         try testing.expectEqual(2, channel.in_flight.count());
-        try testing.expectEqual(0, channel.requeued.count());
+        try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(1, channel.offset);
         try testing.expect(channel.next == null);
     }
     { // 2 is re-queued
         try testing.expect(try channel.req(ChannelMsg.idFromSeq(2))); // req 2
         try testing.expectEqual(1, channel.in_flight.count());
-        try testing.expectEqual(1, channel.requeued.count());
+        try testing.expectEqual(1, channel.deferred.count());
         try testing.expectEqual(1, channel.offset);
     }
     { // out of order fin, fin seq 3 while 2 is still in flight
         try testing.expect(try channel.fin(ChannelMsg.idFromSeq(3))); // fin 3
         try testing.expectEqual(0, channel.in_flight.count());
-        try testing.expectEqual(1, channel.requeued.count());
+        try testing.expectEqual(1, channel.deferred.count());
         try testing.expectEqual(1, channel.offset);
         try testing.expectEqual(1, channel.finished.count());
     }
@@ -680,7 +681,7 @@ test "channel fin req" {
         try testing.expectEqual(2, consumer.lastSeq());
 
         try testing.expectEqual(1, channel.in_flight.count());
-        try testing.expectEqual(0, channel.requeued.count());
+        try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(1, channel.offset);
         try testing.expectEqual(1, channel.finished.count());
     }
@@ -688,7 +689,7 @@ test "channel fin req" {
         try testing.expectEqual(2, topic.messages.count());
         try testing.expect(try channel.fin(ChannelMsg.idFromSeq(2))); // fin 2
         try testing.expectEqual(0, channel.in_flight.count());
-        try testing.expectEqual(0, channel.requeued.count());
+        try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(3, channel.offset);
         try testing.expectEqual(0, channel.finished.count());
         try testing.expectEqual(0, topic.messages.count());
@@ -905,7 +906,7 @@ test "timeout messages" {
         try consumer.pull();
     }
     try testing.expectEqual(4, channel.in_flight.count());
-    try testing.expectEqual(4, channel.stat.sent);
+    try testing.expectEqual(4, channel.stat.send);
     try testing.expectEqual(default_msg_timeout + 1, timer.fire_at);
     try testing.expectEqual(no_timeout, timer.user_data);
 
@@ -920,32 +921,32 @@ test "timeout messages" {
         const msgs, const expire_at = try channel.inFlightTimeout(default_msg_timeout + 1);
         try testing.expectEqual(1, msgs);
         try testing.expectEqual(default_msg_timeout + 2, expire_at);
-        try testing.expectEqual(1, channel.stat.requeued);
+        try testing.expectEqual(0, channel.stat.requeue);
+        try testing.expectEqual(1, channel.stat.timeout);
         try testing.expectEqual(3, channel.in_flight.count());
-        try testing.expectEqual(1, channel.requeued.count());
-        try testing.expectEqual(1, channel.stat.timeouted);
+        try testing.expectEqual(1, channel.deferred.count());
     }
     { // expire two more
         const msgs, const expire_at = try channel.inFlightTimeout(default_msg_timeout + 3);
         try testing.expectEqual(2, msgs);
         try testing.expectEqual(default_msg_timeout + 4, expire_at);
-        try testing.expectEqual(3, channel.stat.requeued);
+        try testing.expectEqual(0, channel.stat.requeue);
+        try testing.expectEqual(3, channel.stat.timeout);
         try testing.expectEqual(1, channel.in_flight.count());
-        try testing.expectEqual(3, channel.requeued.count());
-        try testing.expectEqual(3, channel.stat.timeouted);
-        try testing.expectEqual(0, channel.stat.finished);
+        try testing.expectEqual(3, channel.deferred.count());
+        try testing.expectEqual(0, channel.stat.finish);
     }
     { // fin last one
         try consumer.fin();
-        try testing.expectEqual(1, channel.stat.finished);
+        try testing.expectEqual(1, channel.stat.finish);
         try testing.expectEqual(0, channel.in_flight.count());
     }
     { // resend two
         try consumer.pull();
         try consumer.pull();
-        try testing.expectEqual(6, channel.stat.sent);
+        try testing.expectEqual(6, channel.stat.send);
         try testing.expectEqual(2, channel.in_flight.count());
-        try testing.expectEqual(1, channel.requeued.count());
+        try testing.expectEqual(1, channel.deferred.count());
         for (channel.in_flight.values()) |msg| {
             try testing.expectEqual(2, msg.attempts());
         }
