@@ -421,6 +421,18 @@ pub const Identify = struct {
         allocator.free(self.client_id);
         allocator.free(self.hostname);
     }
+
+    pub fn format(
+        self: Identify,
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        try writer.print(
+            "client_id: {s}, hostname: {s}, heartbeat_interval: {}ms, msg_timeout: {}ms",
+            .{ self.client_id, self.hostname, self.heartbeat_interval, self.msg_timeout },
+        );
+    }
 };
 
 test "identify parse json" {

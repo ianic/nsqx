@@ -381,7 +381,8 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     while (n < msgs.len) : (n += 1) {
                         if (self.getMsg() catch null) |msg| {
                             msg.in_flight_socket = consumer.socket;
-                            try self.inFlightAppend(msg, consumer.opt.msg_timeout);
+                            const msg_timeout: u64 = @as(u64, @intCast(consumer.msgTimeout())) * ns_per_ms;
+                            try self.inFlightAppend(msg, msg_timeout);
                             msgs[n] = msg;
                         } else break;
                     }

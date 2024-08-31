@@ -253,6 +253,10 @@ const Conn = struct {
         self.ticker_op = try self.io.ticker(msec, self, tick, tickerFailed);
     }
 
+    pub fn msgTimeout(self: *Conn) u32 {
+        return self.identify.msg_timeout;
+    }
+
     pub fn ready(self: Conn) u32 {
         if (self.send_op != null) return 0;
         if (self.in_flight > self.ready_count) return 0;
@@ -292,7 +296,7 @@ const Conn = struct {
         }) |msg| {
             self.outstanding_heartbeats = 0;
             switch (msg) {
-                .identify => |data| {
+                .identify => {
                     self.identify = msg.parseIdentify(self.allocator, options) catch |err| {
                         log.err("{} failed to parse identify {}", .{ self.socket, err });
                         return try self.close();
@@ -300,7 +304,7 @@ const Conn = struct {
                     if (self.identify.heartbeat_interval != options.heartbeat_interval)
                         try self.initTicker(self.identify.heartbeat_interval);
                     try self.respond(.ok);
-                    log.debug("{} identify: {s}", .{ self.socket, data });
+                    log.debug("{} identify {}", .{ self.socket, self.identify });
                 },
                 .sub => |sub| {
                     self.channel = try server.sub(self, sub.topic, sub.channel);
