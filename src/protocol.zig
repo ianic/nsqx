@@ -40,6 +40,17 @@ pub const Message = union(MessageTag) {
             else => false,
         };
     }
+
+    pub fn parseIdentify(self: @This(), allocator: std.mem.Allocator, opt: Options) !Identify {
+        return try Identify.parse(self.identify, allocator, opt);
+    }
+};
+
+pub const Options = struct {
+    /// Duration to wait before auto-requeing a message
+    msg_timeout: u32 = 60000, // milliseconds
+    /// Duration of time between client heartbeats
+    heartbeat_interval: u32 = 60000, // milliseconds
 };
 
 const MessageTag = enum {
@@ -381,4 +392,64 @@ test "rdy,fin.." {
     m = try p.parse();
     try testing.expectEqualStrings("5678956789567890", &m.req.msg_id);
     try testing.expectEqual(4567, m.req.delay);
+}
+
+pub const Identify = struct {
+    client_id: []const u8 = &.{},
+    hostname: []const u8 = &.{},
+    heartbeat_interval: u32 = 0, // in milliseconds
+    msg_timeout: u32 = 0, // in milliseconds
+
+    pub fn parse(data: []const u8, allocator: std.mem.Allocator, opt: Options) !Identify {
+        const parsed = try std.json.parseFromSlice(
+            Identify,
+            allocator,
+            data,
+            .{ .ignore_unknown_fields = true },
+        );
+        defer parsed.deinit();
+        const v = parsed.value;
+        return .{
+            .client_id = try allocator.dupe(u8, v.client_id),
+            .hostname = try allocator.dupe(u8, v.hostname),
+            .heartbeat_interval = if (v.heartbeat_interval == 0) opt.heartbeat_interval else v.heartbeat_interval,
+            .msg_timeout = if (v.msg_timeout == 0) opt.msg_timeout else v.msg_timeout,
+        };
+    }
+
+    pub fn deinit(self: *Identify, allocator: std.mem.Allocator) void {
+        allocator.free(self.client_id);
+        allocator.free(self.hostname);
+    }
+};
+
+test "identify parse json" {
+    {
+        const opt = Options{};
+        const data =
+            \\ {"client_id":"io","deflate":false,"deflate_level":6,"feature_negotiation":true,"heartbeat_interval":34567,"hostname":"io.local","long_id":"io","msg_timeout":12345,"output_buffer_size":16384,"output_buffer_timeout":250,"sample_rate":0,"short_id":"io","snappy":false,"tls_v1":false,"user_agent":"go-nsq/1.1.0"}
+        ;
+        var idf = try Identify.parse(data, testing.allocator, opt);
+        defer idf.deinit(testing.allocator);
+
+        try testing.expectEqualStrings("io", idf.client_id);
+        try testing.expectEqualStrings("io.local", idf.hostname);
+        try testing.expectEqual(34567, idf.heartbeat_interval);
+        try testing.expectEqual(12345, idf.msg_timeout);
+    }
+    {
+        const opt = Options{
+            .msg_timeout = 111,
+            .heartbeat_interval = 222,
+        };
+        const data =
+            \\ {"client_id":"client_id","heartbeat_interval":0}
+        ;
+        var idf = try Identify.parse(data, testing.allocator, opt);
+        defer idf.deinit(testing.allocator);
+
+        try testing.expectEqualStrings("client_id", idf.client_id);
+        try testing.expectEqual(opt.heartbeat_interval, idf.heartbeat_interval);
+        try testing.expectEqual(opt.msg_timeout, idf.msg_timeout);
+    }
 }

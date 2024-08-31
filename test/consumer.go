@@ -7,7 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	// "time"
+	"time"
 
 	"github.com/nsqio/go-nsq"
 )
@@ -15,6 +15,7 @@ import (
 func main() {
 	cfg := nsq.NewConfig()
 	cfg.MaxInFlight = 16
+	cfg.HeartbeatInterval = 5 * time.Second
 
 	consumer, err := nsq.NewConsumer("topic", "channel", cfg)
 	if err != nil {

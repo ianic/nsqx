@@ -26,6 +26,7 @@ const port = 4150;
 const ring_entries: u16 = 16 * 1024;
 
 var server: Server = undefined;
+var options: protocol.Options = .{};
 
 // pub const std_options = std.Options{
 //     .log_level = .info,
@@ -199,8 +200,6 @@ const Listener = struct {
     }
 };
 
-const heartbeat_interval = 15; // seconds, set to 1/2 of what client asks
-
 const Conn = struct {
     allocator: mem.Allocator,
     io: *Io,
@@ -230,6 +229,7 @@ const Conn = struct {
     },
     channel: ?*Channel = null,
     opt: ConsumerOpt = .{},
+    identify: protocol.Identify = .{},
 
     const Response = enum {
         ok,
@@ -239,7 +239,18 @@ const Conn = struct {
 
     fn init(self: *Conn) !void {
         self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
-        self.ticker_op = try self.io.ticker(15, self, tick, tickerFailed);
+        try self.initTicker(options.heartbeat_interval);
+    }
+
+    fn initTicker(self: *Conn, heartbeat_interval: i64) !void {
+        log.debug("{} heartbeat interval: {}", .{ self.socket, heartbeat_interval });
+        if (self.ticker_op) |op| {
+            try op.cancel();
+            op.unsubscribe(self);
+        }
+        if (heartbeat_interval == 0) return;
+        const msec: i64 = @divTrunc(heartbeat_interval, 2);
+        self.ticker_op = try self.io.ticker(msec, self, tick, tickerFailed);
     }
 
     pub fn ready(self: Conn) u32 {
@@ -282,65 +293,80 @@ const Conn = struct {
             self.outstanding_heartbeats = 0;
             switch (msg) {
                 .identify => |data| {
-                    log.debug("{} identify: {s}", .{ self.socket, data });
+                    self.identify = msg.parseIdentify(self.allocator, options) catch |err| {
+                        log.err("{} failed to parse identify {}", .{ self.socket, err });
+                        return try self.close();
+                    };
+                    if (self.identify.heartbeat_interval != options.heartbeat_interval)
+                        try self.initTicker(self.identify.heartbeat_interval);
                     try self.respond(.ok);
+                    log.debug("{} identify: {s}", .{ self.socket, data });
                 },
                 .sub => |sub| {
-                    log.debug("{} subscribe: {s} {s}", .{ self.socket, sub.topic, sub.channel });
                     self.channel = try server.sub(self, sub.topic, sub.channel);
                     try self.respond(.ok);
+                    log.debug("{} subscribe: {s} {s}", .{ self.socket, sub.topic, sub.channel });
                 },
                 .spub => |spub| {
-                    log.debug("{} publish: {s}", .{ self.socket, spub.topic });
                     try server.publish(spub.topic, spub.data);
                     try self.respond(.ok);
+                    log.debug("{} publish: {s}", .{ self.socket, spub.topic });
                 },
                 .mpub => |mpub| {
-                    log.debug("{} multi publish: {s} messages: {}", .{ self.socket, mpub.topic, mpub.msgs });
                     try server.multiPublish(mpub.topic, mpub.msgs, mpub.data);
                     try self.respond(.ok);
+                    log.debug("{} multi publish: {s} messages: {}", .{ self.socket, mpub.topic, mpub.msgs });
                 },
                 .dpub => |dpub| {
-                    log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, dpub.topic, dpub.delay });
                     try server.deferredPublish(dpub.topic, dpub.data, dpub.delay);
                     try self.respond(.ok);
+                    log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, dpub.topic, dpub.delay });
                 },
                 .rdy => |count| {
-                    log.debug("{} ready: {}", .{ self.socket, count });
                     self.ready_count = count;
                     ready_changed = true;
+                    log.debug("{} ready: {}", .{ self.socket, count });
                 },
                 .fin => |msg_id| {
                     if (self.channel) |channel| {
                         self.in_flight -|= 1;
-                        const res = try channel.fin(msg_id); // TODO handle res
+                        const res = try channel.fin(msg_id);
                         log.debug("{} fin {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
+                        ready_changed = true;
                     } else {
-                        try self.close();
+                        return try self.close();
                     }
-                    ready_changed = true;
                 },
                 .req => |req| {
                     if (self.channel) |channel| {
                         self.in_flight -|= 1;
-                        const res = try channel.req(req.msg_id, req.delay); // TODO handle res
+                        const res = try channel.req(req.msg_id, req.delay);
                         log.debug("{} req {} {}", .{ self.socket, Msg.seqFromId(req.msg_id), res });
                     } else {
-                        try self.close();
+                        return try self.close();
+                    }
+                },
+                .touch => |msg_id| {
+                    if (self.channel) |channel| {
+                        self.in_flight -|= 1;
+                        const res = try channel.touch(msg_id, self.opt.msg_timeout);
+                        log.debug("{} touch {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
+                    } else {
+                        return try self.close();
                     }
                 },
                 .cls => {
                     self.ready_count = 0;
-                    log.debug("{} cls", .{self.socket});
                     try self.respond(.cls);
+                    log.debug("{} cls", .{self.socket});
                 },
                 .nop => {
                     log.debug("{} nop", .{self.socket});
                 },
-                else => {
-                    std.debug.print("{}\n", .{msg});
-                    unreachable;
+                .auth => {
+                    log.err("{} `auth` is not supported operation", .{self.socket});
                 },
+                .version => unreachable, // handled in the parser
             }
         }
 

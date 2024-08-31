@@ -206,13 +206,13 @@ pub const Io = struct {
 
     pub fn ticker(
         self: *Io,
-        sec: i64,
+        msec: i64, // miliseconds
         context: anytype,
         comptime ticked: fn (@TypeOf(context)) Error!void,
         comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
         const op = try self.acquire();
-        op.* = Op.ticker(self, sec, context, ticked, failed);
+        op.* = Op.ticker(self, msec, context, ticked, failed);
         try op.prep();
         return op;
     }
@@ -553,7 +553,7 @@ pub const Op = struct {
 
     fn ticker(
         io: *Io,
-        sec: i64,
+        msec: i64, // milliseconds
         context: anytype,
         comptime ticked: fn (@TypeOf(context)) Error!void,
         comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
@@ -573,17 +573,19 @@ pub const Op = struct {
                 return .restart;
             }
         };
+        const sec: i64 = @divTrunc(msec, 1000);
+        const nsec: i64 = (msec - sec * 1000) * ns_per_ms;
         return .{
             .io = io,
             .context = @intFromPtr(context),
             .callback = wrapper.complete,
-            .args = .{ .ticker = .{ .sec = sec, .nsec = 0 } },
+            .args = .{ .ticker = .{ .sec = sec, .nsec = nsec } },
         };
     }
 
     fn timer(
         io: *Io,
-        nsec: u64, // milliseconds
+        nsec: u64,
         context: anytype,
         comptime ticked: fn (@TypeOf(context)) Error!void,
         comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
@@ -678,10 +680,15 @@ test "ticker" {
     };
     var ctx = Ctx{};
 
-    const op = try io.ticker(1, &ctx, Ctx.ticked, null);
+    const delay = 123;
+    const op = try io.ticker(delay, &ctx, Ctx.ticked, null);
     defer allocator.destroy(op);
+    const start = unixMilli();
     try io.tick();
+    const elapsed = unixMilli() - start;
     try testing.expectEqual(1, ctx.count);
+    try testing.expect(elapsed >= delay);
+    // std.debug.print("elapsed: {}, delay: {}\n", .{ elapsed, delay });
 }
 
 test "timer" {
@@ -713,6 +720,14 @@ fn timestamp() u64 {
         error.UnsupportedClock, error.Unexpected => return 0, // "Precision of timing depends on hardware and OS".
     };
     return @as(u64, @intCast(ts.sec)) * ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn unixMilli() i64 {
+    var ts: posix.timespec = undefined;
+    posix.clock_gettime(.REALTIME, &ts) catch |err| switch (err) {
+        error.UnsupportedClock, error.Unexpected => return 0, // "Precision of timing depends on hardware and OS".
+    };
+    return ts.sec * 1000 + @divTrunc(ts.nsec, ns_per_ms);
 }
 
 const TimerOp = struct {

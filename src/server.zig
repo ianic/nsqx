@@ -507,6 +507,16 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     return false;
                 }
 
+                /// Extend message timeout for interval (nanoseconds).
+                pub fn touch(self: *Channel, msg_id: [16]u8, interval: u64) !bool {
+                    const seq = ChannelMsg.seqFromId(msg_id);
+                    if (self.in_flight.get(seq)) |msg| {
+                        msg.timestamp += interval;
+                        return true;
+                    }
+                    return false;
+                }
+
                 pub fn req(self: *Channel, msg_id: [16]u8, delay: u32) !bool {
                     const seq = ChannelMsg.seqFromId(msg_id);
                     if (self.in_flight.get(seq)) |msg| {
