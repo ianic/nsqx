@@ -10,6 +10,7 @@ const fd_t = std.posix.fd_t;
 const Atomic = std.atomic.Value;
 
 const protocol = @import("protocol.zig");
+const Options = protocol.Options;
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
@@ -20,14 +21,6 @@ const ConsumerOpt = @import("server.zig").ConsumerOpt;
 const Msg = @import("server.zig").ChannelMsg; // TODO rename to Message
 const max_msgs_send_batch_size = @import("server.zig").max_msgs_send_batch_size;
 
-const recv_buffers = 1024;
-const recv_buffer_len = 64 * 1024;
-const port = 4150;
-const ring_entries: u16 = 16 * 1024;
-
-var server: Server = undefined;
-var options: protocol.Options = .{};
-
 // pub const std_options = std.Options{
 //     .log_level = .info,
 // };
@@ -37,20 +30,25 @@ pub fn main() !void {
     // defer _ = gpa.deinit();
     // const allocator = gpa.allocator();
     const allocator = std.heap.c_allocator;
+    const options: Options = .{};
 
-    const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, port);
+    const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.tcp_port);
     const socket = (try addr.listen(.{ .reuse_address = true })).stream.handle;
 
     var io = Io{ .allocator = allocator };
-    try io.init(ring_entries, recv_buffers, recv_buffer_len);
+    try io.init(
+        options.ring.entries,
+        options.ring.recv_buffers,
+        options.ring.recv_buffer_len,
+    );
     defer io.deinit();
     var timer = Timer.init(allocator, &io);
     defer timer.deinit();
 
-    server = Server.init(allocator, &timer);
+    var server = Server.init(allocator, &timer);
     defer server.deinit();
 
-    var listener = try Listener.init(allocator, &io);
+    var listener = try Listener.init(allocator, &io, &server, options);
     defer listener.deinit();
     try listener.accept(socket);
 
@@ -62,7 +60,7 @@ pub fn main() !void {
         if (sig != 0) {
             signal.store(0, .release);
             switch (sig) {
-                posix.SIG.USR1 => try showStat(&listener, &io),
+                posix.SIG.USR1 => try showStat(&listener, &io, &server),
                 posix.SIG.USR2 => mallocTrim(),
                 posix.SIG.TERM, posix.SIG.INT => break,
                 else => {},
@@ -81,7 +79,7 @@ fn mallocTrim() void {
     c.malloc_stats();
 }
 
-fn showStat(listener: *Listener, io: *Io) !void {
+fn showStat(listener: *Listener, io: *Io, server: *Server) !void {
     const print = std.debug.print;
     print("listener connections:\n", .{});
     print("  active {}, accepted: {}, completed: {}\n", .{ listener.accepted - listener.completed, listener.accepted, listener.completed });
@@ -163,13 +161,17 @@ fn catchSignals() void {
 
 const Listener = struct {
     allocator: mem.Allocator,
+    server: *Server,
+    options: Options,
     io: *Io,
     accepted: usize = 0,
     completed: usize = 0,
 
-    fn init(allocator: mem.Allocator, io: *Io) !Listener {
+    fn init(allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !Listener {
         return .{
             .allocator = allocator,
+            .server = server,
+            .options = options,
             .io = io,
         };
     }
@@ -184,7 +186,12 @@ const Listener = struct {
 
     fn accepted(self: *Listener, socket: socket_t) Error!void {
         var conn = try self.allocator.create(Conn);
-        conn.* = Conn{ .allocator = self.allocator, .socket = socket, .listener = self, .io = self.io };
+        conn.* = Conn{
+            .allocator = self.allocator,
+            .socket = socket,
+            .listener = self,
+            .io = self.io,
+        };
         try conn.init();
         self.accepted +%= 1;
     }
@@ -239,7 +246,7 @@ const Conn = struct {
 
     fn init(self: *Conn) !void {
         self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
-        try self.initTicker(options.heartbeat_interval);
+        try self.initTicker(self.listener.options.heartbeat_interval);
     }
 
     fn initTicker(self: *Conn, heartbeat_interval: i64) !void {
@@ -287,6 +294,8 @@ const Conn = struct {
     }
 
     fn received(self: *Conn, bytes: []const u8) Error!void {
+        const server = self.listener.server;
+        const options = self.listener.options;
         var ready_changed: bool = false;
 
         var parser = protocol.Parser{ .buf = try self.appendRecvBuf(bytes) };

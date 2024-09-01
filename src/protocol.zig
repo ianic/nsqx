@@ -51,6 +51,19 @@ pub const Options = struct {
     msg_timeout: u32 = 60000, // milliseconds
     /// Duration of time between client heartbeats
     heartbeat_interval: u32 = 60000, // milliseconds
+
+    tcp_port: u16 = 4150,
+    http_port: u16 = 4151,
+
+    /// io_uring configuration
+    ring: struct {
+        /// Number of io_uring sqe entries
+        entries: u16 = 16 * 1024,
+        /// Number of receive buffers
+        recv_buffers: u16 = 1024,
+        /// Length of each receive buffer in bytes
+        recv_buffer_len: u32 = 64 * 1024,
+    } = .{},
 };
 
 const MessageTag = enum {
