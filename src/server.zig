@@ -26,7 +26,7 @@ const TopicMsg = struct {
     // Defer message delivery until timestamp is reached.
     defer_until: u64 = 0,
 
-    const frame_type = 2;
+    const frame_type = @intFromEnum(@import("protocol.zig").FrameType.message);
 
     fn asChannelMsg(self: TopicMsg) ChannelMsg {
         var header: [34]u8 = .{0} ** 34;

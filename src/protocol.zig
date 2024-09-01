@@ -82,6 +82,12 @@ const MessageTag = enum {
     auth,
 };
 
+pub const FrameType = enum(u32) {
+    response = 0,
+    err = 1,
+    message = 2,
+};
+
 const Error = error{
     Invalid,
 };
@@ -137,8 +143,8 @@ pub const Parser = struct {
                 return .{ .spub = .{ .topic = topic, .data = data } };
             },
             'M' => {
-                //MPUB <topic_name>\n[ 4-byte body size ][ 4-byte num messages ]
-                //[ 4-byte message #1 size ][ N-byte binary data ]
+                // MPUB <topic_name>\n[ 4-byte body size ][ 4-byte num messages ]
+                // [ 4-byte message #1 size ][ N-byte binary data ]
                 try p.matchString("MPUB ");
                 const topic = try p.readString('\n');
                 const size = try p.readInt();
@@ -157,7 +163,8 @@ pub const Parser = struct {
                 return .{ .mpub = .{ .topic = topic, .msgs = msgs, .data = data } };
             },
             'D' => {
-                // DPUB <topic_name> <defer_time>\n[ 4-byte size in bytes ][ N-byte binary data ]
+                // DPUB <topic_name> <defer_time>\n
+                // [ 4-byte size in bytes ][ N-byte binary data ]
                 try p.matchString("DPUB ");
                 const topic = try p.readString(' ');
                 const delay = try p.readStringInt('\n');
