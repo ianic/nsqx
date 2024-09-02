@@ -152,15 +152,14 @@ pub const Io = struct {
 
     pub fn accept(
         self: *Io,
+        op: *Op,
         socket: socket_t,
         context: anytype,
         comptime accepted: fn (@TypeOf(context), socket_t) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
-    ) !*Op {
-        const op = try self.acquire();
+    ) !void {
         op.* = Op.accept(self, socket, context, accepted, failed);
         try op.prep();
-        return op;
     }
 
     pub fn recv(

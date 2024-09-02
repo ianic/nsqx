@@ -7,20 +7,24 @@ const Options = @import("protocol.zig").Options;
 const Io = @import("io.zig").Io;
 const Timer = @import("io.zig").Timer;
 const tcp = @import("tcp.zig");
+const http = @import("http.zig");
 
 // pub const std_options = std.Options{
 //     .log_level = .info,
 // };
 
 pub fn main() !void {
-    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer _ = gpa.deinit();
-    // const allocator = gpa.allocator();
-    const allocator = std.heap.c_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    //const allocator = std.heap.c_allocator;
     const options: Options = .{};
 
-    const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.tcp_port);
-    const socket = (try addr.listen(.{ .reuse_address = true })).stream.handle;
+    const tcp_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.tcp_port);
+    const tcp_socket = (try tcp_addr.listen(.{ .reuse_address = true })).stream.handle;
+
+    const http_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.http_port);
+    const http_socket = (try http_addr.listen(.{ .reuse_address = true })).stream.handle;
 
     var io = Io{ .allocator = allocator };
     try io.init(
@@ -35,9 +39,13 @@ pub fn main() !void {
     var server = tcp.Server.init(allocator, &timer);
     defer server.deinit();
 
-    var listener = try tcp.Listener.init(allocator, &io, &server, options);
-    defer listener.deinit();
-    try listener.accept(socket);
+    var tcp_listener = try tcp.Listener.init(allocator, &io, &server, options);
+    defer tcp_listener.deinit();
+    try tcp_listener.accept(tcp_socket);
+
+    var http_listener = try http.Listener.init(allocator, &io, &server, options);
+    defer http_listener.deinit();
+    try http_listener.accept(http_socket);
 
     catchSignals();
     while (true) {
@@ -47,7 +55,7 @@ pub fn main() !void {
         if (sig != 0) {
             signal.store(0, .release);
             switch (sig) {
-                posix.SIG.USR1 => try showStat(&listener, &io, &server),
+                posix.SIG.USR1 => try showStat(&tcp_listener, &io, &server),
                 posix.SIG.USR2 => mallocTrim(),
                 posix.SIG.TERM, posix.SIG.INT => break,
                 else => {},

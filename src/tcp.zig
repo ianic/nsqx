@@ -22,6 +22,7 @@ pub const Listener = struct {
     server: *Server,
     options: Options,
     io: *Io,
+    op: Op = undefined,
     accepted: usize = 0,
     completed: usize = 0,
 
@@ -39,7 +40,7 @@ pub const Listener = struct {
     }
 
     pub fn accept(self: *Listener, socket: socket_t) !void {
-        _ = try self.io.accept(socket, self, accepted, failed);
+        try self.io.accept(&self.op, socket, self, accepted, failed);
     }
 
     fn accepted(self: *Listener, socket: socket_t) Error!void {
@@ -363,6 +364,7 @@ pub const Conn = struct {
         try self.io.close(self.socket);
 
         self.deinitRecvBuf();
+        self.identify.deinit(self.allocator);
         self.listener.release(self);
     }
 };
