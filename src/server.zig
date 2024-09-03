@@ -140,12 +140,14 @@ pub fn ServerType(Consumer: type, Timer: type) type {
         allocator: mem.Allocator,
         topics: std.StringHashMap(*Topic),
         timer: Timer,
+        started_at: u64,
 
         pub fn init(allocator: mem.Allocator, timer: Timer) Server {
             return .{
                 .allocator = allocator,
                 .topics = std.StringHashMap(*Topic).init(allocator),
                 .timer = timer,
+                .started_at = timer.now(),
             };
         }
 

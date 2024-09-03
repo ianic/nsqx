@@ -32,6 +32,7 @@ func main() {
 		if producer.DeferredPublish("topic", time.Second*time.Duration(i), []byte(msg)); err != nil {
 			log.Fatal(err)
 		}
+		//time.Sleep(10 * time.Second)
 	}
 
 	// sigChan := make(chan os.Signal, 1)

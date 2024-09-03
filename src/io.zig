@@ -155,7 +155,7 @@ pub const Io = struct {
         op: *Op,
         socket: socket_t,
         context: anytype,
-        comptime accepted: fn (@TypeOf(context), socket_t) Error!void,
+        comptime accepted: fn (@TypeOf(context), socket_t, std.net.Address) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) !void {
         op.* = Op.accept(self, socket, context, accepted, failed);
@@ -324,7 +324,11 @@ pub const Op = struct {
     };
 
     const Args = union(Kind) {
-        accept: socket_t,
+        accept: struct {
+            socket: socket_t,
+            addr: posix.sockaddr align(4) = undefined,
+            addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
+        },
         close: socket_t,
         recv: socket_t,
         writev: struct {
@@ -365,7 +369,7 @@ pub const Op = struct {
         op.io.stat.submit(op);
         const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
         switch (op.args) {
-            .accept => |socket| _ = try op.io.ring.accept_multishot(@intFromPtr(op), socket, null, null, 0),
+            .accept => |*arg| _ = try op.io.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),
             .close => |socket| _ = try op.io.ring.close(@intFromPtr(op), socket),
             .recv => |socket| _ = try op.io.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
             .writev => |*arg| _ = try op.io.ring.writev(@intFromPtr(op), arg.socket, arg.vec, 0),
@@ -379,15 +383,25 @@ pub const Op = struct {
         io: *Io,
         socket: socket_t,
         context: anytype,
-        comptime accepted: fn (@TypeOf(context), socket_t) Error!void,
+        comptime accepted: fn (@TypeOf(context), socket_t, std.net.Address) Error!void,
         comptime fail: fn (@TypeOf(context), anyerror) Error!void,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
             fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
                 const ctx: Context = @ptrFromInt(op.context);
+
+                // Note that for the multishot variants, setting addr and
+                // addrlen may not make a lot of sense, as the same value would
+                // be used for every accepted connection. This means that the
+                // data written to addr may be overwritten by a new connection
+                // before the application has had time to process a past
+                // connection.
+                // Ref: https://man7.org/linux/man-pages/man3/io_uring_prep_multishot_accept.3.html
+                const addr = std.net.Address.initPosix(&op.args.accept.addr);
+
                 switch (cqe.err()) {
-                    .SUCCESS => try accepted(ctx, @intCast(cqe.res)),
+                    .SUCCESS => try accepted(ctx, @intCast(cqe.res), addr),
                     .CONNABORTED, .INTR => {}, // continue
                     else => |errno| {
                         try fail(ctx, errFromErrno(errno));
@@ -401,7 +415,7 @@ pub const Op = struct {
             .io = io,
             .context = @intFromPtr(context),
             .callback = wrapper.complete,
-            .args = .{ .accept = socket },
+            .args = .{ .accept = .{ .socket = socket } },
         };
     }
 

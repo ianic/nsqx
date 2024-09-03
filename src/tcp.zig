@@ -43,13 +43,15 @@ pub const Listener = struct {
         try self.io.accept(&self.op, socket, self, accepted, failed);
     }
 
-    fn accepted(self: *Listener, socket: socket_t) Error!void {
+    fn accepted(self: *Listener, socket: socket_t, addr: std.net.Address) Error!void {
         var conn = try self.allocator.create(Conn);
         conn.* = Conn{
             .allocator = self.allocator,
             .socket = socket,
             .listener = self,
             .io = self.io,
+            .connected_at = self.io.timestamp,
+            .addr = addr,
         };
         try conn.init();
         self.accepted +%= 1;
@@ -70,6 +72,7 @@ pub const Conn = struct {
     allocator: mem.Allocator,
     io: *Io,
     socket: socket_t = 0,
+    addr: std.net.Address,
     listener: *Listener,
 
     recv_op: ?*Op = null,
@@ -95,6 +98,7 @@ pub const Conn = struct {
     },
     channel: ?*Channel = null,
     identify: protocol.Identify = .{},
+    connected_at: u64,
 
     const Response = enum {
         ok,

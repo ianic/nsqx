@@ -417,6 +417,7 @@ test "rdy,fin.." {
 pub const Identify = struct {
     client_id: []const u8 = &.{},
     hostname: []const u8 = &.{},
+    user_agent: []const u8 = &.{},
     heartbeat_interval: u32 = 0, // in milliseconds
     msg_timeout: u32 = 0, // in milliseconds
 
@@ -432,6 +433,7 @@ pub const Identify = struct {
         return .{
             .client_id = try allocator.dupe(u8, v.client_id),
             .hostname = try allocator.dupe(u8, v.hostname),
+            .user_agent = try allocator.dupe(u8, v.user_agent),
             .heartbeat_interval = if (v.heartbeat_interval == 0) opt.heartbeat_interval else v.heartbeat_interval,
             .msg_timeout = if (v.msg_timeout == 0) opt.msg_timeout else v.msg_timeout,
         };
@@ -440,6 +442,7 @@ pub const Identify = struct {
     pub fn deinit(self: *Identify, allocator: std.mem.Allocator) void {
         allocator.free(self.client_id);
         allocator.free(self.hostname);
+        allocator.free(self.user_agent);
     }
 
     pub fn format(

@@ -17,6 +17,7 @@ func main() {
 	cfg.MaxInFlight = 16
 	cfg.HeartbeatInterval = 5 * time.Second
 	cfg.MsgTimeout = 2 * time.Second
+	cfg.LookupdPollInterval = 5 * time.Second
 
 	consumer, err := nsq.NewConsumer("topic", "channel", cfg)
 	if err != nil {

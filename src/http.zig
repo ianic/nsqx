@@ -41,11 +41,12 @@ pub const Listener = struct {
         try self.io.accept(&self.op, socket, self, accepted, failed);
     }
 
-    fn accepted(self: *Listener, socket: socket_t) Error!void {
+    fn accepted(self: *Listener, socket: socket_t, addr: std.net.Address) Error!void {
         var conn = try self.allocator.create(Conn);
         conn.* = Conn{
             .allocator = self.allocator,
             .socket = socket,
+            .addr = addr,
             .listener = self,
             .io = self.io,
         };
@@ -68,6 +69,7 @@ pub const Conn = struct {
     allocator: mem.Allocator,
     io: *Io,
     socket: socket_t = 0,
+    addr: std.net.Address,
     listener: *Listener,
 
     recv_op: ?*Op = null,
@@ -123,10 +125,11 @@ pub const Conn = struct {
             return error.BadRequest;
         }
 
-        if (std.mem.startsWith(u8, head.target, "/stat"))
-            return try self.statResponse();
-
         log.debug("{} method: {}, target: {s}, content length: {}", .{ self.socket, head.method, head.target, content_length });
+        if (std.mem.startsWith(u8, head.target, "/stats"))
+            return try self.statResponse();
+        if (std.mem.startsWith(u8, head.target, "/info"))
+            return try self.infoResponse();
         return error.NotFound;
     }
 
@@ -181,11 +184,28 @@ pub const Conn = struct {
     }
 
     fn statResponse(self: *Conn) ![]u8 {
-        var al = std.ArrayList(u8).init(self.allocator);
-        try dumpStat(al.writer().any(), self.listener.server);
-        return al.toOwnedSlice();
-        //return try self.allocator.dupe(u8, "Hello world!");
+        var list = std.ArrayList(u8).init(self.allocator);
+        defer list.deinit();
+        try jsonStat(self.allocator, list.writer().any(), self.listener.server);
+        return list.toOwnedSlice();
     }
+
+    fn infoResponse(self: *Conn) ![]u8 {
+        var list = std.ArrayList(u8).init(self.allocator);
+        defer list.deinit();
+        try jsonInfo(list.writer().any(), self.listener.server, self.listener.options);
+        return list.toOwnedSlice();
+    }
+};
+
+const Info = struct {
+    version: []const u8 = "V2",
+    broadcast_address: []const u8,
+    hostname: []const u8,
+    http_port: u16,
+    tcp_port: u16,
+    start_time: u64,
+    max_heartbeat_interval: u32,
 };
 
 const header_template =
@@ -205,60 +225,147 @@ const bad_request =
     "content-type: text/plain\r\n\r\n" ++
     "Bad Request";
 
-fn dumpStat(w: anytype, server: *Server) !void {
-    //const print = writer.print;
-    // const print = std.debug.print;
-    // print("listener connections:\n", .{});
-    // print("  active {}, accepted: {}, completed: {}\n", .{ listener.accepted - listener.completed, listener.accepted, listener.completed });
-    // print("io operations: loops: {}, cqes: {}, cqes/loop {}\n", .{
-    //     io.stat.loops,
-    //     io.stat.cqes,
-    //     if (io.stat.loops > 0) io.stat.cqes / io.stat.loops else 0,
-    // });
-    // print("  all    {}\n", .{io.stat.all});
-    // print("  recv   {}\n", .{io.stat.recv});
-    // print("  sendv  {}\n", .{io.stat.sendv});
-    // print("  ticker {}\n", .{io.stat.ticker});
-    // print("  close  {}\n", .{io.stat.close});
-    // print("  accept {}\n", .{io.stat.accept});
-    // print(
-    //     "  receive buffers group:\n    success: {}, no-buffs: {} {d:5.2}%\n",
-    //     .{ io.recv_buf_grp_stat.success, io.recv_buf_grp_stat.no_bufs, io.recv_buf_grp_stat.noBufs() },
-    // );
+fn jsonInfo(writer: anytype, server: *Server, options: Options) !void {
+    var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const hostname = try std.posix.gethostname(&hostname_buf);
+    const start_time = server.started_at / std.time.ns_per_s;
 
-    try w.print("server topics: {}\n", .{server.topics.count()});
-    var ti = server.topics.iterator();
-    while (ti.next()) |te| {
-        const topic_name = te.key_ptr.*;
-        const topic = te.value_ptr.*;
-        const size = topic.messages.size();
-        try w.print("  {s} messages: {d} bytes: {} {}Mb {}Gb, sequence: {}\n", .{
-            topic_name,
-            topic.messages.count(),
-            size,
-            size / 1024 / 1024,
-            size / 1024 / 1024 / 1024,
-            topic.sequence,
-        });
+    const info = Info{
+        .broadcast_address = "",
+        .hostname = hostname,
+        .http_port = options.http_port,
+        .tcp_port = options.tcp_port,
+        .start_time = start_time,
+        .max_heartbeat_interval = options.heartbeat_interval,
+    };
 
-        var ci = topic.channels.iterator();
-        while (ci.next()) |ce| {
-            const channel_name = ce.key_ptr.*;
-            const channel = ce.value_ptr.*;
-            try w.print("  --{s} consumers: {},  in flight messages: {}, deferred: {}, offset: {}\n", .{
-                channel_name,
-                channel.consumers.items.len,
-                channel.in_flight.count(),
-                channel.deferred.count(),
-                channel.offset,
-            });
-            try w.print("    pull: {}, send: {}, finish: {}, timeout: {}, requeue: {}\n", .{
-                channel.stat.pull,
-                channel.stat.send,
-                channel.stat.finish,
-                channel.stat.timeout,
-                channel.stat.requeue,
-            });
-        }
-    }
+    try std.json.stringify(info, .{}, writer);
 }
+
+fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var topics = try allocator.alloc(Stat.Topic, server.topics.count());
+    var topics_iter = server.topics.iterator();
+    var topic_idx: usize = 0;
+    while (topics_iter.next()) |topic_elem| : (topic_idx += 1) {
+        const topic_name = topic_elem.key_ptr.*;
+        const topic = topic_elem.value_ptr.*;
+
+        var channels = try allocator.alloc(Stat.Channel, topic.channels.count());
+        var channels_iter = topic.channels.iterator();
+        var channel_idx: usize = 0;
+        while (channels_iter.next()) |channel_elem| : (channel_idx += 1) {
+            const channel_name = channel_elem.key_ptr.*;
+            const channel = channel_elem.value_ptr.*;
+
+            const client_count = channel.consumers.items.len;
+            const addr_bufs = try allocator.alloc(u8, 64 * client_count);
+            var clients = try allocator.alloc(Stat.Client, client_count);
+
+            for (channel.consumers.items, 0..) |consumer, i| {
+                const addr_buf = addr_bufs[64 * i ..][0..64];
+                const remote_address = try std.fmt.bufPrint(addr_buf, "{}", .{consumer.addr});
+
+                clients[i] = Stat.Client{
+                    .client_id = consumer.identify.client_id,
+                    .hostname = consumer.identify.hostname,
+                    .user_agent = consumer.identify.user_agent,
+                    .remote_address = remote_address,
+                    .ready_count = consumer.ready_count,
+                    .in_flight_count = consumer.in_flight,
+                    // TODO
+                    .message_count = 0,
+                    .finish_count = 0,
+                    .requeue_count = 0,
+                    .connect_ts = consumer.connected_at / std.time.ns_per_s,
+                    .msg_timeout = consumer.identify.msg_timeout,
+                };
+            }
+
+            channels[channel_idx] = Stat.Channel{
+                .channel_name = channel_name,
+                .depth = channel.in_flight.count() + channel.deferred.count(),
+                .in_flight_count = channel.in_flight.count(),
+                .deferred_count = channel.deferred.count(),
+                .message_count = channel.stat.pull,
+                .requeue_count = channel.stat.requeue,
+                .timeout_count = channel.stat.timeout,
+                .client_count = client_count,
+                .clients = clients,
+                .paused = false,
+            };
+        }
+
+        topics[topic_idx] = Stat.Topic{
+            .topic_name = topic_name,
+            .depth = topic.messages.count(),
+            .message_count = topic.sequence,
+            .message_bytes = 0, // TODO
+            .paused = false,
+            .channels = channels,
+        };
+    }
+
+    const stat = Stat{
+        .start_time = server.started_at / std.time.ns_per_s,
+        .topics = topics,
+        .producers = &.{},
+    };
+
+    try std.json.stringify(stat, .{}, writer);
+    return;
+}
+
+const Stat = struct {
+    const Topic = struct {
+        topic_name: []const u8,
+        depth: u64 = 0,
+        message_count: u64 = 0,
+        message_bytes: u64 = 0,
+        paused: bool,
+        channels: []Channel,
+        e2e_processing_latency: struct { count: u64 = 0 } = .{},
+    };
+    const Channel = struct {
+        channel_name: []const u8,
+        depth: u64,
+        in_flight_count: u64,
+        deferred_count: u64,
+        message_count: u64,
+        requeue_count: u64,
+        timeout_count: u64,
+        client_count: u64,
+        clients: []Client,
+        paused: bool = false,
+        e2e_processing_latency: struct { count: u64 = 0 } = .{},
+    };
+    const Client = struct {
+        client_id: []const u8,
+        hostname: []const u8,
+        user_agent: []const u8,
+        version: []const u8 = "V2",
+        remote_address: []const u8,
+        state: u8 = 3,
+        ready_count: u64,
+        in_flight_count: u64,
+        message_count: u64,
+        finish_count: u64,
+        requeue_count: u64,
+        connect_ts: u64,
+        msg_timeout: u64,
+        pub_counts: []PubCount = &.{},
+    };
+    const PubCount = struct {
+        topic: []const u8,
+        count: u64,
+    };
+
+    version: []const u8 = "0.1.0",
+    health: []const u8 = "OK",
+    start_time: u64,
+    topics: []Topic,
+    producers: []Client,
+};
