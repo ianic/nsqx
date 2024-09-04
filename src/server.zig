@@ -2,7 +2,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
 const posix = std.posix;
-const log = std.log;
 const math = std.math;
 const testing = std.testing;
 const socket_t = posix.socket_t;
@@ -10,6 +9,8 @@ const socket_t = posix.socket_t;
 const ns_per_s = std.time.ns_per_s;
 const ns_per_ms = std.time.ns_per_ms;
 const no_timeout: u64 = std.math.maxInt(u64);
+
+const log = std.log.scoped(.server);
 
 // TODO: rethink this dependency
 const Error = @import("io.zig").Error;
@@ -421,7 +422,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                         try self.wakeup();
                         if (self.deferred.peek()) |msg| {
                             //min timeout of deferred messages
-                            if (msg.timestamp < timeout) timeout = msg.timestamp;
+                            if (msg.timestamp > 0 and msg.timestamp < timeout) timeout = msg.timestamp;
                         }
                     }
                     try self.setTimeout(timeout);

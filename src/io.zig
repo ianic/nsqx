@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const mem = std.mem;
 
 const posix = std.posix;
@@ -12,7 +13,7 @@ const Atomic = std.atomic.Value;
 const ns_per_ms = std.time.ns_per_ms;
 const ns_per_s = std.time.ns_per_s;
 
-const log = std.log.scoped(.main);
+const log = std.log.scoped(.io);
 
 pub const Io = struct {
     allocator: mem.Allocator,
@@ -364,7 +365,7 @@ pub const Op = struct {
 
     pub fn cancel(op: *Op) !void {
         switch (op.args) {
-            .ticker => _ = try op.io.ring.timeout_remove(0, @intFromPtr(op), 0),
+            .timer, .ticker => _ = try op.io.ring.timeout_remove(0, @intFromPtr(op), 0),
             else => _ = try op.io.ring.cancel(0, @intFromPtr(op), 0),
         }
     }
@@ -619,7 +620,7 @@ pub const Op = struct {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS, .TIME => try ticked(ctx),
-                    .INTR => return .restart,
+                    //.INTR => return .restart,
                     else => |errno| if (failed) |f| try f(ctx, errFromErrno(errno)),
                 }
                 return .done;
@@ -790,6 +791,7 @@ pub const Timer = struct {
     io: *Io,
     io_op: ?*Op = null,
     queue: std.PriorityQueue(*TimerOp, void, TimerOp.less),
+    closing: bool = false,
 
     const Self = @This();
 
@@ -821,48 +823,64 @@ pub const Timer = struct {
         fire_at: u64, // future timestamp in nanoseconds
         user_data: u64,
     ) !void {
+        assert(fire_at > 0);
+        if (self.closing) return;
+
         const current = if (self.queue.peek()) |op| op.fire_at else std.math.maxInt(u64);
         { // add new op
             const op = try self.allocator.create(TimerOp);
             op.* = TimerOp.init(context, cb, fire_at, user_data);
             try self.queue.add(op);
         }
-        if (fire_at < current) {
-            if (self.io_op) |io_op| {
-                try io_op.cancel();
-                io_op.unsubscribe(self);
-            }
-            try self.ticked();
-        }
+        if (fire_at < current) try self.arm();
     }
 
-    /// Success event handler. Fire expired callbacks and arm next timer.
+    /// Success event handler.
     fn ticked(self: *Self) Error!void {
+        self.io_op = null;
+        try self.arm();
+    }
+
+    /// Fire expired callbacks and arm next timer.
+    fn arm(self: *Self) Error!void {
+        if (self.closing) return;
+
         const ts = self.now();
-        var at: u64 = 0;
+        var fire_at: u64 = 0;
         while (self.queue.peek()) |op| {
             if (op.fire_at <= ts) {
                 { // fire callback
-                    try op.callback(op);
                     _ = self.queue.remove();
+                    try op.callback(op);
                     self.allocator.destroy(op);
                 }
                 continue;
             }
-            at = op.fire_at;
+            fire_at = op.fire_at;
             break;
         }
-        if (at == 0) {
-            self.io_op = null;
-            return;
+        if (fire_at == 0) return;
+
+        if (self.io_op) |io_op| {
+            try io_op.cancel();
+            io_op.unsubscribe(self);
         }
-        self.io_op = try self.io.timer(at - ts, self, Timer.ticked, Timer.failed);
+        self.io_op = try self.io.timer(fire_at - ts, self, Timer.ticked, Timer.failed);
     }
 
     /// Fail event handler.
     fn failed(self: *Self, err: anyerror) Error!void {
-        log.err("timer failed {}", .{err});
-        try self.ticked();
+        self.io_op = null;
+        switch (err) {
+            error.OperationCanceled => return,
+            else => log.err("timer failed {}", .{err}),
+        }
+        try self.arm();
+    }
+
+    pub fn close(self: *Self) !void {
+        self.closing = true;
+        if (self.io_op) |io_op| try io_op.cancel();
     }
 
     /// Removes all scheduled timer operations for given context.

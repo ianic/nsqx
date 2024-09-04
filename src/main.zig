@@ -65,6 +65,7 @@ pub fn main() !void {
     }
 
     log.info("draining", .{});
+    try timer.close();
     try http_listener.close();
     try tcp_listener.close();
     try io.drain();

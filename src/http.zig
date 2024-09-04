@@ -12,68 +12,9 @@ const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
 const Timer = @import("io.zig").Timer;
 const Server = @import("tcp.zig").Server;
+pub const Listener = @import("tcp.zig").ListenerType(Conn);
 
 const log = std.log.scoped(.http);
-
-pub const Listener = struct {
-    allocator: mem.Allocator,
-    server: *Server,
-    options: Options,
-    io: *Io,
-    op: ?*Op = null,
-    stat: struct {
-        accepted: u64 = 0,
-        completed: u64 = 0,
-    } = .{},
-
-    pub fn init(allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !Listener {
-        return .{
-            .allocator = allocator,
-            .server = server,
-            .options = options,
-            .io = io,
-        };
-    }
-
-    pub fn deinit(self: *Listener) void {
-        _ = self;
-    }
-
-    pub fn accept(self: *Listener, socket: socket_t) !void {
-        self.op = try self.io.accept(socket, self, accepted, failed);
-    }
-
-    fn accepted(self: *Listener, socket: socket_t, addr: std.net.Address) Error!void {
-        var conn = try self.allocator.create(Conn);
-        conn.* = Conn{
-            .gpa = self.allocator,
-            .socket = socket,
-            .addr = addr,
-            .listener = self,
-            .io = self.io,
-        };
-        try conn.init();
-        self.stat.accepted +%= 1;
-    }
-
-    fn failed(self: *Listener, err: anyerror) Error!void {
-        self.op = null;
-        switch (err) {
-            error.OperationCanceled => {},
-            else => log.err("accept failed {}", .{err}),
-        }
-    }
-
-    pub fn close(self: *Listener) !void {
-        if (self.op) |op|
-            try op.cancel();
-    }
-
-    fn release(self: *Listener, conn: *Conn) void {
-        self.allocator.destroy(conn);
-        self.stat.completed +%= 1;
-    }
-};
 
 pub const Conn = struct {
     gpa: mem.Allocator,
@@ -97,7 +38,17 @@ pub const Conn = struct {
         .flags = 0,
     },
 
-    fn init(self: *Conn) !void {
+    pub fn init(listener: *Listener, socket: socket_t, addr: std.net.Address) Conn {
+        return .{
+            .gpa = listener.allocator,
+            .listener = listener,
+            .io = listener.io,
+            .socket = socket,
+            .addr = addr,
+        };
+    }
+
+    pub fn recv(self: *Conn) !void {
         self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
     }
 
@@ -189,7 +140,7 @@ pub const Conn = struct {
         try self.close();
     }
 
-    fn close(self: *Conn) !void {
+    pub fn close(self: *Conn) !void {
         if (self.send_op) |op| {
             try op.cancel();
             return;
@@ -201,7 +152,7 @@ pub const Conn = struct {
         }
 
         try self.io.close(self.socket);
-        self.listener.release(self);
+        self.listener.remove(self);
     }
 };
 

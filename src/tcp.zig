@@ -18,69 +18,75 @@ const max_msgs_send_batch_size = @import("server.zig").max_msgs_send_batch_size;
 
 const log = std.log.scoped(.tcp);
 
-pub const Listener = struct {
-    allocator: mem.Allocator,
-    server: *Server,
-    options: Options,
-    io: *Io,
-    op: ?*Op = null,
-    conns: std.AutoHashMap(socket_t, *Conn),
-    stat: struct {
-        accepted: u64 = 0,
-        completed: u64 = 0,
-    } = .{},
+pub fn ListenerType(comptime ConnType: type) type {
+    return struct {
+        allocator: mem.Allocator,
+        server: *Server,
+        options: Options,
+        io: *Io,
+        op: ?*Op = null,
+        conns: std.AutoHashMap(socket_t, *ConnType),
+        stat: struct {
+            accepted: u64 = 0,
+            completed: u64 = 0,
+        } = .{},
 
-    pub fn init(allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !Listener {
-        return .{
-            .allocator = allocator,
-            .server = server,
-            .options = options,
-            .io = io,
-            .conns = std.AutoHashMap(socket_t, *Conn).init(allocator),
-        };
-    }
+        const Self = @This();
 
-    pub fn deinit(self: *Listener) void {
-        self.conns.deinit();
-    }
-
-    pub fn accept(self: *Listener, socket: socket_t) !void {
-        self.op = try self.io.accept(socket, self, accepted, failed);
-    }
-
-    fn accepted(self: *Listener, socket: socket_t, addr: std.net.Address) Error!void {
-        var conn = try self.allocator.create(Conn);
-        errdefer self.allocator.destroy(conn);
-        try self.conns.put(socket, conn);
-        conn.* = Conn.init(self, socket, addr);
-        try conn.recv();
-        self.stat.accepted +%= 1;
-    }
-
-    fn failed(self: *Listener, err: anyerror) Error!void {
-        self.op = null;
-        switch (err) {
-            error.OperationCanceled => {},
-            else => log.err("accept failed {}", .{err}),
+        pub fn init(allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !Self {
+            return .{
+                .allocator = allocator,
+                .server = server,
+                .options = options,
+                .io = io,
+                .conns = std.AutoHashMap(socket_t, *ConnType).init(allocator),
+            };
         }
-    }
 
-    pub fn close(self: *Listener) !void {
-        if (self.op) |op|
-            try op.cancel();
-
-        var iter = self.conns.valueIterator();
-        while (iter.next()) |e| {
-            try e.*.close();
+        pub fn deinit(self: *Self) void {
+            self.conns.deinit();
         }
-    }
 
-    fn release(self: *Listener, conn: *Conn) void {
-        assert(self.conns.remove(conn.socket));
-        self.allocator.destroy(conn);
-        self.stat.completed +%= 1;
-    }
-};
+        pub fn accept(self: *Self, socket: socket_t) !void {
+            self.op = try self.io.accept(socket, self, accepted, failed);
+        }
+
+        fn accepted(self: *Self, socket: socket_t, addr: std.net.Address) Error!void {
+            var conn = try self.allocator.create(ConnType);
+            errdefer self.allocator.destroy(conn);
+            try self.conns.put(socket, conn);
+            conn.* = ConnType.init(self, socket, addr);
+            try conn.recv();
+            self.stat.accepted +%= 1;
+        }
+
+        fn failed(self: *Self, err: anyerror) Error!void {
+            self.op = null;
+            switch (err) {
+                error.OperationCanceled => {},
+                else => log.err("accept failed {}", .{err}),
+            }
+        }
+
+        pub fn close(self: *Self) !void {
+            if (self.op) |op|
+                try op.cancel();
+
+            var iter = self.conns.valueIterator();
+            while (iter.next()) |e| {
+                try e.*.close();
+            }
+        }
+
+        pub fn remove(self: *Self, conn: *ConnType) void {
+            assert(self.conns.remove(conn.socket));
+            self.allocator.destroy(conn);
+            self.stat.completed +%= 1;
+        }
+    };
+}
+
+pub const Listener = ListenerType(Conn);
 
 pub const Conn = struct {
     allocator: mem.Allocator,
@@ -394,6 +400,6 @@ pub const Conn = struct {
 
         self.deinitRecvBuf();
         self.identify.deinit(self.allocator);
-        self.listener.release(self);
+        self.listener.remove(self);
     }
 };
