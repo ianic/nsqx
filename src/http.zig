@@ -28,15 +28,7 @@ pub const Conn = struct {
     arena: ?std.heap.ArenaAllocator = null,
 
     send_vec: [2]posix.iovec_const = undefined, // header and body
-    send_msghdr: posix.msghdr_const = .{
-        .iov = undefined,
-        .iovlen = undefined,
-        .name = null,
-        .namelen = 0,
-        .control = null,
-        .controllen = 0,
-        .flags = 0,
-    },
+    send_msghdr: posix.msghdr_const = .{ .iov = undefined, .iovlen = undefined, .name = null, .namelen = 0, .control = null, .controllen = 0, .flags = 0 },
 
     pub fn init(listener: *Listener, socket: socket_t, addr: std.net.Address) Conn {
         return .{
@@ -189,7 +181,7 @@ fn jsonInfo(writer: anytype, server: *Server, options: Options) !void {
     const start_time = server.started_at / std.time.ns_per_s;
 
     const info = Info{
-        .broadcast_address = "",
+        .broadcast_address = "localhost",
         .hostname = hostname,
         .http_port = options.http_port,
         .tcp_port = options.tcp_port,
@@ -282,11 +274,10 @@ fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
                     .remote_address = remote_address,
                     .ready_count = consumer.ready_count,
                     .in_flight_count = consumer.in_flight,
-                    // TODO
-                    .message_count = 0,
-                    .finish_count = 0,
-                    .requeue_count = 0,
-                    .connect_ts = consumer.connected_at / std.time.ns_per_s,
+                    .message_count = consumer.stat.messages,
+                    .finish_count = consumer.stat.finish,
+                    .requeue_count = consumer.stat.requeue,
+                    .connect_ts = consumer.stat.connected_at / std.time.ns_per_s,
                     .msg_timeout = consumer.identify.msg_timeout,
                 };
             }

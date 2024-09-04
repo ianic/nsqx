@@ -118,7 +118,12 @@ pub const Conn = struct {
     },
     channel: ?*Channel = null,
     identify: protocol.Identify = .{},
-    connected_at: u64 = 0,
+    stat: struct {
+        connected_at: u64 = 0,
+        messages: u64 = 0,
+        finish: u64 = 0,
+        requeue: u64 = 0,
+    } = .{},
 
     const Response = enum {
         ok,
@@ -127,14 +132,15 @@ pub const Conn = struct {
     };
 
     fn init(listener: *Listener, socket: socket_t, addr: std.net.Address) Conn {
-        return .{
+        var conn = Conn{
             .allocator = listener.allocator,
             .listener = listener,
             .io = listener.io,
             .socket = socket,
             .addr = addr,
-            .connected_at = listener.io.timestamp,
         };
+        conn.stat.connected_at = listener.io.timestamp;
+        return conn;
     }
 
     fn recv(self: *Conn) !void {
@@ -208,25 +214,25 @@ pub const Conn = struct {
                     try self.respond(.ok);
                     log.debug("{} identify {}", .{ self.socket, self.identify });
                 },
-                .sub => |sub| {
-                    self.channel = try server.sub(self, sub.topic, sub.channel);
+                .sub => |arg| {
+                    self.channel = try server.sub(self, arg.topic, arg.channel);
                     try self.respond(.ok);
-                    log.debug("{} subscribe: {s} {s}", .{ self.socket, sub.topic, sub.channel });
+                    log.debug("{} subscribe: {s} {s}", .{ self.socket, arg.topic, arg.channel });
                 },
-                .spub => |spub| {
-                    try server.publish(spub.topic, spub.data);
+                .spub => |arg| {
+                    try server.publish(arg.topic, arg.data);
                     try self.respond(.ok);
-                    log.debug("{} publish: {s}", .{ self.socket, spub.topic });
+                    log.debug("{} publish: {s}", .{ self.socket, arg.topic });
                 },
-                .mpub => |mpub| {
-                    try server.multiPublish(mpub.topic, mpub.msgs, mpub.data);
+                .mpub => |arg| {
+                    try server.multiPublish(arg.topic, arg.msgs, arg.data);
                     try self.respond(.ok);
-                    log.debug("{} multi publish: {s} messages: {}", .{ self.socket, mpub.topic, mpub.msgs });
+                    log.debug("{} multi publish: {s} messages: {}", .{ self.socket, arg.topic, arg.msgs });
                 },
-                .dpub => |dpub| {
-                    try server.deferredPublish(dpub.topic, dpub.data, dpub.delay);
+                .dpub => |arg| {
+                    try server.deferredPublish(arg.topic, arg.data, arg.delay);
                     try self.respond(.ok);
-                    log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, dpub.topic, dpub.delay });
+                    log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });
                 },
                 .rdy => |count| {
                     self.ready_count = count;
@@ -237,24 +243,25 @@ pub const Conn = struct {
                     if (self.channel) |channel| {
                         self.in_flight -|= 1;
                         const res = try channel.fin(msg_id);
+                        if (res) self.stat.finish += 1;
                         log.debug("{} fin {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
                         ready_changed = true;
                     } else {
                         return try self.close();
                     }
                 },
-                .req => |req| {
+                .req => |arg| {
                     if (self.channel) |channel| {
                         self.in_flight -|= 1;
-                        const res = try channel.req(req.msg_id, req.delay);
-                        log.debug("{} req {} {}", .{ self.socket, Msg.seqFromId(req.msg_id), res });
+                        const res = try channel.req(arg.msg_id, arg.delay);
+                        if (res) self.stat.requeue += 1;
+                        log.debug("{} req {} {}", .{ self.socket, Msg.seqFromId(arg.msg_id), res });
                     } else {
                         return try self.close();
                     }
                 },
                 .touch => |msg_id| {
                     if (self.channel) |channel| {
-                        self.in_flight -|= 1;
                         const res = try channel.touch(msg_id, self.identify.msg_timeout);
                         log.debug("{} touch {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
                     } else {
@@ -329,6 +336,7 @@ pub const Conn = struct {
 
     pub fn sendMsgs(self: *Conn, msgs: []*Msg) !void {
         assert(msgs.len <= max_msgs_send_batch_size);
+        self.stat.messages += msgs.len;
         var n: usize = 0;
         for (msgs) |msg| {
             self.send_vec[n] = .{ .base = &msg.header, .len = msg.header.len };
@@ -340,6 +348,7 @@ pub const Conn = struct {
     }
 
     pub fn sendMsg(self: *Conn, msg: *Msg) !void {
+        self.stat.messages += 1;
         self.send_vec[0] = .{ .base = &msg.header, .len = msg.header.len };
         self.send_vec[1] = .{ .base = msg.body.ptr, .len = msg.body.len };
         try self.send(2);
@@ -351,7 +360,6 @@ pub const Conn = struct {
         self.send_msghdr.iov = &self.send_vec;
         self.send_msghdr.iovlen = @intCast(vec_len);
         self.send_op = try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed);
-        //self.send_op = try self.io.writev(self.socket, self.send_vec[0..vec_len], self, sent, sendFailed);
     }
 
     fn respond(self: *Conn, rsp: Response) !void {
