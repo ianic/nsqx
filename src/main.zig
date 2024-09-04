@@ -1,5 +1,4 @@
 const std = @import("std");
-const log = std.log;
 const posix = std.posix;
 const Atomic = std.atomic.Value;
 
@@ -12,6 +11,8 @@ const http = @import("http.zig");
 // pub const std_options = std.Options{
 //     .log_level = .info,
 // };
+//
+const log = std.log.scoped(.main);
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -63,7 +64,10 @@ pub fn main() !void {
         }
     }
 
-    log.info("done", .{});
+    log.info("draining", .{});
+    try http_listener.close();
+    try tcp_listener.close();
+    try io.drain();
 }
 
 fn mallocTrim() void {
@@ -77,7 +81,7 @@ fn mallocTrim() void {
 fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
     const print = std.debug.print;
     print("listener connections:\n", .{});
-    print("  active {}, accepted: {}, completed: {}\n", .{ listener.accepted - listener.completed, listener.accepted, listener.completed });
+    print("  active {}, accepted: {}, completed: {}\n", .{ listener.stat.accepted - listener.stat.completed, listener.stat.accepted, listener.stat.completed });
 
     print("io operations: loops: {}, cqes: {}, cqes/loop {}\n", .{
         io.stat.loops,

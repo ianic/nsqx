@@ -1,6 +1,5 @@
 const std = @import("std");
 const mem = std.mem;
-const log = std.log;
 
 const posix = std.posix;
 const linux = std.os.linux;
@@ -12,6 +11,8 @@ const Atomic = std.atomic.Value;
 
 const ns_per_ms = std.time.ns_per_ms;
 const ns_per_s = std.time.ns_per_s;
+
+const log = std.log.scoped(.main);
 
 pub const Io = struct {
     allocator: mem.Allocator,
@@ -152,14 +153,15 @@ pub const Io = struct {
 
     pub fn accept(
         self: *Io,
-        op: *Op,
         socket: socket_t,
         context: anytype,
         comptime accepted: fn (@TypeOf(context), socket_t, std.net.Address) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
-    ) !void {
+    ) !*Op {
+        const op = try self.acquire();
         op.* = Op.accept(self, socket, context, accepted, failed);
         try op.prep();
+        return op;
     }
 
     pub fn recv(
@@ -246,6 +248,13 @@ pub const Io = struct {
         if (n > 0) {
             self.timestamp = timestamp();
             try self.flushCompletions(cqes[0..n]);
+        }
+    }
+
+    pub fn drain(self: *Io) !void {
+        while (self.stat.all.active() > 0) {
+            log.debug("draining active operations: {}\n", .{self.stat.all.active()});
+            try self.tick();
         }
     }
 
@@ -390,18 +399,19 @@ pub const Op = struct {
         const wrapper = struct {
             fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
                 const ctx: Context = @ptrFromInt(op.context);
-
-                // Note that for the multishot variants, setting addr and
-                // addrlen may not make a lot of sense, as the same value would
-                // be used for every accepted connection. This means that the
-                // data written to addr may be overwritten by a new connection
-                // before the application has had time to process a past
-                // connection.
-                // Ref: https://man7.org/linux/man-pages/man3/io_uring_prep_multishot_accept.3.html
-                const addr = std.net.Address.initPosix(&op.args.accept.addr);
-
                 switch (cqe.err()) {
-                    .SUCCESS => try accepted(ctx, @intCast(cqe.res), addr),
+                    .SUCCESS => {
+                        // Note that for the multishot variants, setting addr and
+                        // addrlen may not make a lot of sense, as the same value would
+                        // be used for every accepted connection. This means that the
+                        // data written to addr may be overwritten by a new connection
+                        // before the application has had time to process a past
+                        // connection.
+                        // Ref: https://man7.org/linux/man-pages/man3/io_uring_prep_multishot_accept.3.html
+
+                        const addr = std.net.Address.initPosix(&op.args.accept.addr);
+                        try accepted(ctx, @intCast(cqe.res), addr);
+                    },
                     .CONNABORTED, .INTR => {}, // continue
                     else => |errno| {
                         try fail(ctx, errFromErrno(errno));

@@ -20,9 +20,11 @@ pub const Listener = struct {
     server: *Server,
     options: Options,
     io: *Io,
-    op: Op = undefined,
-    accepted: usize = 0,
-    completed: usize = 0,
+    op: ?*Op = null,
+    stat: struct {
+        accepted: u64 = 0,
+        completed: u64 = 0,
+    } = .{},
 
     pub fn init(allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !Listener {
         return .{
@@ -38,7 +40,7 @@ pub const Listener = struct {
     }
 
     pub fn accept(self: *Listener, socket: socket_t) !void {
-        try self.io.accept(&self.op, socket, self, accepted, failed);
+        self.op = try self.io.accept(socket, self, accepted, failed);
     }
 
     fn accepted(self: *Listener, socket: socket_t, addr: std.net.Address) Error!void {
@@ -51,26 +53,34 @@ pub const Listener = struct {
             .io = self.io,
         };
         try conn.init();
-        self.accepted +%= 1;
+        self.stat.accepted +%= 1;
     }
 
-    fn failed(_: *Listener, err: anyerror) Error!void {
-        log.err("accept failed {}", .{err});
-        // TODO: handle this
+    fn failed(self: *Listener, err: anyerror) Error!void {
+        self.op = null;
+        switch (err) {
+            error.OperationCanceled => {},
+            else => log.err("accept failed {}", .{err}),
+        }
+    }
+
+    pub fn close(self: *Listener) !void {
+        if (self.op) |op|
+            try op.cancel();
     }
 
     fn release(self: *Listener, conn: *Conn) void {
         self.allocator.destroy(conn);
-        self.completed +%= 1;
+        self.stat.completed +%= 1;
     }
 };
 
 pub const Conn = struct {
     gpa: mem.Allocator,
+    listener: *Listener,
     io: *Io,
     socket: socket_t = 0,
     addr: std.net.Address,
-    listener: *Listener,
 
     recv_op: ?*Op = null,
     send_op: ?*Op = null,

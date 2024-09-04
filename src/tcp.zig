@@ -1,7 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
-const log = std.log;
 const posix = std.posix;
 const socket_t = std.posix.socket_t;
 const fd_t = std.posix.fd_t;
@@ -17,14 +16,19 @@ const Channel = Server.Channel;
 const Msg = @import("server.zig").ChannelMsg;
 const max_msgs_send_batch_size = @import("server.zig").max_msgs_send_batch_size;
 
+const log = std.log.scoped(.tcp);
+
 pub const Listener = struct {
     allocator: mem.Allocator,
     server: *Server,
     options: Options,
     io: *Io,
-    op: Op = undefined,
-    accepted: usize = 0,
-    completed: usize = 0,
+    op: ?*Op = null,
+    conns: std.AutoHashMap(socket_t, *Conn),
+    stat: struct {
+        accepted: u64 = 0,
+        completed: u64 = 0,
+    } = .{},
 
     pub fn init(allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !Listener {
         return .{
@@ -32,48 +36,58 @@ pub const Listener = struct {
             .server = server,
             .options = options,
             .io = io,
+            .conns = std.AutoHashMap(socket_t, *Conn).init(allocator),
         };
     }
 
     pub fn deinit(self: *Listener) void {
-        _ = self;
+        self.conns.deinit();
     }
 
     pub fn accept(self: *Listener, socket: socket_t) !void {
-        try self.io.accept(&self.op, socket, self, accepted, failed);
+        self.op = try self.io.accept(socket, self, accepted, failed);
     }
 
     fn accepted(self: *Listener, socket: socket_t, addr: std.net.Address) Error!void {
         var conn = try self.allocator.create(Conn);
-        conn.* = Conn{
-            .allocator = self.allocator,
-            .socket = socket,
-            .listener = self,
-            .io = self.io,
-            .connected_at = self.io.timestamp,
-            .addr = addr,
-        };
-        try conn.init();
-        self.accepted +%= 1;
+        errdefer self.allocator.destroy(conn);
+        try self.conns.put(socket, conn);
+        conn.* = Conn.init(self, socket, addr);
+        try conn.recv();
+        self.stat.accepted +%= 1;
     }
 
-    fn failed(_: *Listener, err: anyerror) Error!void {
-        log.err("accept failed {}", .{err});
-        // TODO: handle this
+    fn failed(self: *Listener, err: anyerror) Error!void {
+        self.op = null;
+        switch (err) {
+            error.OperationCanceled => {},
+            else => log.err("accept failed {}", .{err}),
+        }
+    }
+
+    pub fn close(self: *Listener) !void {
+        if (self.op) |op|
+            try op.cancel();
+
+        var iter = self.conns.valueIterator();
+        while (iter.next()) |e| {
+            try e.*.close();
+        }
     }
 
     fn release(self: *Listener, conn: *Conn) void {
+        assert(self.conns.remove(conn.socket));
         self.allocator.destroy(conn);
-        self.completed +%= 1;
+        self.stat.completed +%= 1;
     }
 };
 
 pub const Conn = struct {
     allocator: mem.Allocator,
+    listener: *Listener,
     io: *Io,
     socket: socket_t = 0,
     addr: std.net.Address,
-    listener: *Listener,
 
     recv_op: ?*Op = null,
     send_op: ?*Op = null,
@@ -98,7 +112,7 @@ pub const Conn = struct {
     },
     channel: ?*Channel = null,
     identify: protocol.Identify = .{},
-    connected_at: u64,
+    connected_at: u64 = 0,
 
     const Response = enum {
         ok,
@@ -106,7 +120,18 @@ pub const Conn = struct {
         heartbeat,
     };
 
-    fn init(self: *Conn) !void {
+    fn init(listener: *Listener, socket: socket_t, addr: std.net.Address) Conn {
+        return .{
+            .allocator = listener.allocator,
+            .listener = listener,
+            .io = listener.io,
+            .socket = socket,
+            .addr = addr,
+            .connected_at = listener.io.timestamp,
+        };
+    }
+
+    fn recv(self: *Conn) !void {
         self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
         try self.initTicker(self.listener.options.heartbeat_interval);
     }
