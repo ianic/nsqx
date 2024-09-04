@@ -44,7 +44,7 @@ pub const Listener = struct {
     fn accepted(self: *Listener, socket: socket_t, addr: std.net.Address) Error!void {
         var conn = try self.allocator.create(Conn);
         conn.* = Conn{
-            .allocator = self.allocator,
+            .gpa = self.allocator,
             .socket = socket,
             .addr = addr,
             .listener = self,
@@ -66,7 +66,7 @@ pub const Listener = struct {
 };
 
 pub const Conn = struct {
-    allocator: mem.Allocator,
+    gpa: mem.Allocator,
     io: *Io,
     socket: socket_t = 0,
     addr: std.net.Address,
@@ -74,6 +74,7 @@ pub const Conn = struct {
 
     recv_op: ?*Op = null,
     send_op: ?*Op = null,
+    arena: ?std.heap.ArenaAllocator = null,
 
     send_vec: [2]posix.iovec_const = undefined, // header and body
     send_msghdr: posix.msghdr_const = .{
@@ -93,28 +94,34 @@ pub const Conn = struct {
     fn received(self: *Conn, bytes: []const u8) Error!void {
         if (self.send_op != null)
             return try self.close();
+        assert(self.arena == null);
 
-        const body = self.handle(bytes) catch |err| {
+        self.arena = std.heap.ArenaAllocator.init(self.gpa);
+        errdefer self.sendDeinit();
+        const allocator = self.arena.?.allocator();
+
+        var body_list = std.ArrayList(u8).init(allocator);
+        defer body_list.deinit();
+        const writer = body_list.writer().any();
+
+        self.handle(writer, bytes) catch |err| {
             const rsp = switch (err) {
                 error.NotFound => not_found,
                 else => bad_request,
             };
             self.send_vec[0] = .{ .base = rsp.ptr, .len = rsp.len };
             self.send_vec[1].len = 0;
-            return self.send(1);
+            return self.send();
         };
 
-        const header = try std.fmt.allocPrint(
-            self.allocator,
-            header_template,
-            .{ body.len, "text/plain" },
-        );
+        const body = try body_list.toOwnedSlice();
+        const header = try std.fmt.allocPrint(allocator, header_template, .{ body.len, "text/plain" });
         self.send_vec[0] = .{ .base = header.ptr, .len = header.len };
         self.send_vec[1] = .{ .base = body.ptr, .len = body.len };
-        try self.send(2);
+        try self.send();
     }
 
-    fn handle(self: *Conn, bytes: []const u8) ![]const u8 {
+    fn handle(self: *Conn, writer: std.io.AnyWriter, bytes: []const u8) !void {
         var hp: std.http.HeadParser = .{};
         const head_end = hp.feed(bytes);
         if (hp.state != .finished) return error.BadRequest;
@@ -126,37 +133,37 @@ pub const Conn = struct {
         }
 
         log.debug("{} method: {}, target: {s}, content length: {}", .{ self.socket, head.method, head.target, content_length });
+
         if (std.mem.startsWith(u8, head.target, "/stats"))
-            return try self.statResponse();
+            return try jsonStat(self.gpa, writer, self.listener.server);
         if (std.mem.startsWith(u8, head.target, "/info"))
-            return try self.infoResponse();
+            return try jsonInfo(writer, self.listener.server, self.listener.options);
         return error.NotFound;
     }
 
-    fn send(self: *Conn, vec_len: usize) !void {
+    fn send(self: *Conn) !void {
         assert(self.send_op == null);
         self.send_msghdr.iov = &self.send_vec;
-        self.send_msghdr.iovlen = @intCast(vec_len);
+        self.send_msghdr.iovlen = if (self.send_vec[1].len > 0) 2 else 1;
         self.send_op = try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed);
     }
 
     fn sent(self: *Conn, _: usize) Error!void {
+        self.sendDeinit();
+    }
+
+    fn sendDeinit(self: *Conn) void {
         self.send_op = null;
-        if (self.send_vec[1].len > 0) {
-            var buf: []const u8 = undefined;
-            buf.ptr = self.send_vec[0].base;
-            buf.len = self.send_vec[0].len;
-            self.allocator.free(buf);
-            buf.ptr = self.send_vec[1].base;
-            buf.len = self.send_vec[1].len;
-            self.allocator.free(buf);
+        if (self.arena) |arena| {
+            arena.deinit();
+            self.arena = null;
         }
     }
 
     fn sendFailed(self: *Conn, err: anyerror) Error!void {
-        self.send_op = null;
+        self.sendDeinit();
         switch (err) {
-            error.BrokenPipe, error.ConnectionResetByPeer => {},
+            error.Canceled, error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.err("{} send failed {}", .{ self.socket, err }),
         }
         try self.close();
@@ -173,39 +180,19 @@ pub const Conn = struct {
     }
 
     fn close(self: *Conn) !void {
+        if (self.send_op) |op| {
+            try op.cancel();
+            return;
+        }
         log.debug("{} close", .{self.socket});
         if (self.recv_op) |op| {
             try op.cancel();
             op.unsubscribe(self);
         }
-        if (self.send_op) |op| op.unsubscribe(self);
+
         try self.io.close(self.socket);
         self.listener.release(self);
     }
-
-    fn statResponse(self: *Conn) ![]u8 {
-        var list = std.ArrayList(u8).init(self.allocator);
-        defer list.deinit();
-        try jsonStat(self.allocator, list.writer().any(), self.listener.server);
-        return list.toOwnedSlice();
-    }
-
-    fn infoResponse(self: *Conn) ![]u8 {
-        var list = std.ArrayList(u8).init(self.allocator);
-        defer list.deinit();
-        try jsonInfo(list.writer().any(), self.listener.server, self.listener.options);
-        return list.toOwnedSlice();
-    }
-};
-
-const Info = struct {
-    version: []const u8 = "V2",
-    broadcast_address: []const u8,
-    hostname: []const u8,
-    http_port: u16,
-    tcp_port: u16,
-    start_time: u64,
-    max_heartbeat_interval: u32,
 };
 
 const header_template =
@@ -225,6 +212,16 @@ const bad_request =
     "content-type: text/plain\r\n\r\n" ++
     "Bad Request";
 
+const Info = struct {
+    version: []const u8 = "V2",
+    broadcast_address: []const u8,
+    hostname: []const u8,
+    http_port: u16,
+    tcp_port: u16,
+    start_time: u64,
+    max_heartbeat_interval: u32,
+};
+
 fn jsonInfo(writer: anytype, server: *Server, options: Options) !void {
     var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const hostname = try std.posix.gethostname(&hostname_buf);
@@ -240,83 +237,6 @@ fn jsonInfo(writer: anytype, server: *Server, options: Options) !void {
     };
 
     try std.json.stringify(info, .{}, writer);
-}
-
-fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var topics = try allocator.alloc(Stat.Topic, server.topics.count());
-    var topics_iter = server.topics.iterator();
-    var topic_idx: usize = 0;
-    while (topics_iter.next()) |topic_elem| : (topic_idx += 1) {
-        const topic_name = topic_elem.key_ptr.*;
-        const topic = topic_elem.value_ptr.*;
-
-        var channels = try allocator.alloc(Stat.Channel, topic.channels.count());
-        var channels_iter = topic.channels.iterator();
-        var channel_idx: usize = 0;
-        while (channels_iter.next()) |channel_elem| : (channel_idx += 1) {
-            const channel_name = channel_elem.key_ptr.*;
-            const channel = channel_elem.value_ptr.*;
-
-            const client_count = channel.consumers.items.len;
-            const addr_bufs = try allocator.alloc(u8, 64 * client_count);
-            var clients = try allocator.alloc(Stat.Client, client_count);
-
-            for (channel.consumers.items, 0..) |consumer, i| {
-                const addr_buf = addr_bufs[64 * i ..][0..64];
-                const remote_address = try std.fmt.bufPrint(addr_buf, "{}", .{consumer.addr});
-
-                clients[i] = Stat.Client{
-                    .client_id = consumer.identify.client_id,
-                    .hostname = consumer.identify.hostname,
-                    .user_agent = consumer.identify.user_agent,
-                    .remote_address = remote_address,
-                    .ready_count = consumer.ready_count,
-                    .in_flight_count = consumer.in_flight,
-                    // TODO
-                    .message_count = 0,
-                    .finish_count = 0,
-                    .requeue_count = 0,
-                    .connect_ts = consumer.connected_at / std.time.ns_per_s,
-                    .msg_timeout = consumer.identify.msg_timeout,
-                };
-            }
-
-            channels[channel_idx] = Stat.Channel{
-                .channel_name = channel_name,
-                .depth = channel.in_flight.count() + channel.deferred.count(),
-                .in_flight_count = channel.in_flight.count(),
-                .deferred_count = channel.deferred.count(),
-                .message_count = channel.stat.pull,
-                .requeue_count = channel.stat.requeue,
-                .timeout_count = channel.stat.timeout,
-                .client_count = client_count,
-                .clients = clients,
-                .paused = false,
-            };
-        }
-
-        topics[topic_idx] = Stat.Topic{
-            .topic_name = topic_name,
-            .depth = topic.messages.count(),
-            .message_count = topic.sequence,
-            .message_bytes = 0, // TODO
-            .paused = false,
-            .channels = channels,
-        };
-    }
-
-    const stat = Stat{
-        .start_time = server.started_at / std.time.ns_per_s,
-        .topics = topics,
-        .producers = &.{},
-    };
-
-    try std.json.stringify(stat, .{}, writer);
-    return;
 }
 
 const Stat = struct {
@@ -369,3 +289,77 @@ const Stat = struct {
     topics: []Topic,
     producers: []Client,
 };
+
+fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var topics = try allocator.alloc(Stat.Topic, server.topics.count());
+    var topics_iter = server.topics.iterator();
+    var topic_idx: usize = 0;
+    while (topics_iter.next()) |topic_elem| : (topic_idx += 1) {
+        const topic_name = topic_elem.key_ptr.*;
+        const topic = topic_elem.value_ptr.*;
+
+        var channels = try allocator.alloc(Stat.Channel, topic.channels.count());
+        var channels_iter = topic.channels.iterator();
+        var channel_idx: usize = 0;
+        while (channels_iter.next()) |channel_elem| : (channel_idx += 1) {
+            const channel_name = channel_elem.key_ptr.*;
+            const channel = channel_elem.value_ptr.*;
+
+            const client_count = channel.consumers.items.len;
+            var clients = try allocator.alloc(Stat.Client, client_count);
+
+            for (channel.consumers.items, 0..) |consumer, i| {
+                const remote_address = try std.fmt.allocPrint(allocator, "{}", .{consumer.addr});
+                clients[i] = Stat.Client{
+                    .client_id = consumer.identify.client_id,
+                    .hostname = consumer.identify.hostname,
+                    .user_agent = consumer.identify.user_agent,
+                    .remote_address = remote_address,
+                    .ready_count = consumer.ready_count,
+                    .in_flight_count = consumer.in_flight,
+                    // TODO
+                    .message_count = 0,
+                    .finish_count = 0,
+                    .requeue_count = 0,
+                    .connect_ts = consumer.connected_at / std.time.ns_per_s,
+                    .msg_timeout = consumer.identify.msg_timeout,
+                };
+            }
+
+            channels[channel_idx] = Stat.Channel{
+                .channel_name = channel_name,
+                .depth = channel.in_flight.count() + channel.deferred.count(),
+                .in_flight_count = channel.in_flight.count(),
+                .deferred_count = channel.deferred.count(),
+                .message_count = channel.stat.pull,
+                .requeue_count = channel.stat.requeue,
+                .timeout_count = channel.stat.timeout,
+                .client_count = client_count,
+                .clients = clients,
+                .paused = false,
+            };
+        }
+
+        topics[topic_idx] = Stat.Topic{
+            .topic_name = topic_name,
+            .depth = topic.messages.count(),
+            .message_count = topic.sequence,
+            .message_bytes = 0, // TODO
+            .paused = false,
+            .channels = channels,
+        };
+    }
+
+    const stat = Stat{
+        .start_time = server.started_at / std.time.ns_per_s,
+        .topics = topics,
+        .producers = &.{},
+    };
+
+    try std.json.stringify(stat, .{}, writer);
+    return;
+}
