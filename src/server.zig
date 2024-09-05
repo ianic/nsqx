@@ -132,7 +132,7 @@ test {
     _ = TopicMsgList;
 }
 
-pub fn ServerType(Consumer: type, Timer: type, Io: type) type {
+pub fn ServerType(Consumer: type, Io: type) type {
     return struct {
         const Server = @This();
         const Topic = TopicType();
@@ -233,7 +233,7 @@ pub fn ServerType(Consumer: type, Timer: type, Io: type) type {
                     const channel = try self.allocator.create(Channel);
                     errdefer self.allocator.destroy(channel);
                     channel.* = Channel.init(self.allocator, self);
-                    channel.timer = self.server.io.newTimer(channel, Channel.timerTimeout);
+                    channel.initTimer(self.server.io);
                     const key = try self.allocator.dupe(u8, channel_name);
                     errdefer self.allocator.free(key);
                     try self.channels.put(key, channel);
@@ -330,7 +330,7 @@ pub fn ServerType(Consumer: type, Timer: type, Io: type) type {
             return struct {
                 allocator: mem.Allocator,
                 topic: *Topic,
-                timer: Timer = undefined,
+                timer: Io.Timer = undefined,
                 consumers: std.ArrayList(*Consumer),
                 // Sent but not jet acknowledged (fin) messages.
                 in_flight: std.AutoArrayHashMap(u64, *ChannelMsg),
@@ -357,7 +357,7 @@ pub fn ServerType(Consumer: type, Timer: type, Io: type) type {
                     requeue: usize = 0, // req by the client
                 } = .{},
 
-                pub fn init(allocator: mem.Allocator, topic: *Topic) Channel {
+                fn init(allocator: mem.Allocator, topic: *Topic) Channel {
                     return .{
                         .allocator = allocator,
                         .topic = topic,
@@ -369,6 +369,10 @@ pub fn ServerType(Consumer: type, Timer: type, Io: type) type {
                         .offset = topic.sequence,
                         .next = null,
                     };
+                }
+
+                fn initTimer(self: *Channel, io: *Io) void {
+                    self.timer = io.initTimer(self, timerTimeout);
                 }
 
                 fn topicAppended(self: *Channel, tmsg: *TopicMsg) !void {

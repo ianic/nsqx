@@ -4,7 +4,6 @@ const Atomic = std.atomic.Value;
 
 const Options = @import("protocol.zig").Options;
 const Io = @import("io.zig").Io;
-const Timer = @import("io.zig").Timer;
 const tcp = @import("tcp.zig");
 const http = @import("http.zig");
 
