@@ -306,6 +306,20 @@ pub const Io = struct {
             }
         }
     }
+
+    pub fn now(self: *Io) u64 {
+        return self.timestamp;
+    }
+
+    pub fn newTimer(
+        self: *Io,
+        context: anytype,
+        comptime cb: fn (@TypeOf(context)) Error!void,
+    ) Timer {
+        return Timer.init(self, context, cb);
+    }
+
+    usingnamespace Timer;
 };
 
 fn flagMore(cqe: linux.io_uring_cqe) bool {
@@ -754,6 +768,80 @@ fn unixMilli() i64 {
     return ts.sec * 1000 + @divTrunc(ts.nsec, ns_per_ms);
 }
 
+pub const Timer = struct {
+    io: *Io,
+    op: ?*Op = null,
+    fire_at: u64 = no_timeout,
+    closed: bool = false,
+
+    context: usize = 0,
+    callback: *const fn (*Self) Error!void = undefined,
+
+    pub const no_timeout: u64 = std.math.maxInt(u64);
+    const Self = @This();
+
+    pub fn init(
+        io: *Io,
+        context: anytype,
+        comptime cb: fn (@TypeOf(context)) Error!void,
+    ) Timer {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(t: *Self) Error!void {
+                const ctx: Context = @ptrFromInt(t.context);
+                try cb(ctx);
+            }
+        };
+        return .{
+            .io = io,
+            .context = @intFromPtr(context),
+            .callback = wrapper.complete,
+        };
+    }
+
+    pub fn now(self: *Self) u64 {
+        return self.io.timestamp;
+    }
+
+    /// Set callback to be called at fire_at.
+    pub fn set(self: *Self, fire_at: u64) !void {
+        if (self.closed) return;
+        if (fire_at == no_timeout) return;
+        const now_ = self.now();
+        if (fire_at <= now_) return;
+        if (self.op != null and self.fire_at <= fire_at) return;
+
+        const delay = fire_at - now_;
+        try self.reset();
+        self.op = try self.io.timer(delay, self, ticked, failed);
+        self.fire_at = fire_at;
+    }
+
+    pub fn reset(self: *Self) !void {
+        if (self.op) |op| {
+            try op.cancel();
+            op.unsubscribe(self);
+            self.op = null;
+        }
+    }
+
+    pub fn close(self: *Self) !void {
+        if (self.closed) return;
+        try self.reset();
+        self.closed = true;
+    }
+
+    fn ticked(self: *Self) Error!void {
+        self.op = null;
+        try self.callback(self);
+    }
+
+    fn failed(self: *Self, err: anyerror) Error!void {
+        self.op = null;
+        log.err("timer failed {}", .{err});
+    }
+};
+
 const TimerOp = struct {
     context: usize,
     fire_at: u64,
@@ -786,7 +874,7 @@ const TimerOp = struct {
     }
 };
 
-pub const Timer = struct {
+pub const GlobalTimer = struct {
     allocator: mem.Allocator,
     io: *Io,
     io_op: ?*Op = null,
@@ -795,7 +883,7 @@ pub const Timer = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: mem.Allocator, io: *Io) Timer {
+    pub fn init(allocator: mem.Allocator, io: *Io) GlobalTimer {
         return .{
             .allocator = allocator,
             .io = io,
@@ -865,7 +953,7 @@ pub const Timer = struct {
             try io_op.cancel();
             io_op.unsubscribe(self);
         }
-        self.io_op = try self.io.timer(fire_at - ts, self, Timer.ticked, Timer.failed);
+        self.io_op = try self.io.timer(fire_at - ts, self, GlobalTimer.ticked, GlobalTimer.failed);
     }
 
     /// Fail event handler.
@@ -921,7 +1009,7 @@ test "Timer set/clear" {
         }
     };
 
-    var timer = Timer.init(testing.allocator, &io);
+    var timer = GlobalTimer.init(testing.allocator, &io);
     var ctx1 = Ctx{ .created_at = timer.now() };
     var ctx2 = Ctx{ .created_at = timer.now() };
     var ctx3 = Ctx{ .created_at = timer.now() };

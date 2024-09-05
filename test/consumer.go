@@ -15,7 +15,7 @@ import (
 func main() {
 	cfg := nsq.NewConfig()
 	cfg.MaxInFlight = 16
-	cfg.HeartbeatInterval = 5 * time.Second
+	// cfg.HeartbeatInterval = 5 * time.Second
 	cfg.MsgTimeout = 2 * time.Second
 	cfg.LookupdPollInterval = 5 * time.Second
 
@@ -47,7 +47,7 @@ type Handler struct {
 
 func (th *Handler) HandleMessage(m *nsq.Message) error {
 	log.Printf("%s attempts: %d", m.Body, m.Attempts)
-	sleep := rand.IntN(5)
+	sleep := rand.IntN(10)
 	time.Sleep(time.Duration(sleep) * time.Second)
 	return nil
 }

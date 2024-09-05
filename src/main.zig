@@ -34,10 +34,8 @@ pub fn main() !void {
         options.ring.recv_buffer_len,
     );
     defer io.deinit();
-    var timer = Timer.init(allocator, &io);
-    defer timer.deinit();
 
-    var server = tcp.Server.init(allocator, &timer);
+    var server = tcp.Server.init(allocator, &io);
     defer server.deinit();
 
     var tcp_listener = try tcp.Listener.init(allocator, &io, &server, options);
@@ -65,7 +63,7 @@ pub fn main() !void {
     }
 
     log.info("draining", .{});
-    try timer.close();
+    try server.stopTimers();
     try http_listener.close();
     try tcp_listener.close();
     try io.drain();

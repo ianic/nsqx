@@ -132,7 +132,7 @@ test {
     _ = TopicMsgList;
 }
 
-pub fn ServerType(Consumer: type, Timer: type) type {
+pub fn ServerType(Consumer: type, Timer: type, Io: type) type {
     return struct {
         const Server = @This();
         const Topic = TopicType();
@@ -140,19 +140,19 @@ pub fn ServerType(Consumer: type, Timer: type) type {
 
         allocator: mem.Allocator,
         topics: std.StringHashMap(*Topic),
-        timer: Timer,
         started_at: u64,
+        io: *Io,
 
-        pub fn init(allocator: mem.Allocator, timer: Timer) Server {
+        pub fn init(allocator: mem.Allocator, io: *Io) Server {
             return .{
                 .allocator = allocator,
                 .topics = std.StringHashMap(*Topic).init(allocator),
-                .timer = timer,
-                .started_at = timer.now(),
+                .started_at = io.now(),
+                .io = io,
             };
         }
 
-        pub fn sub(self: *Server, consumer: Consumer, topic: []const u8, channel: []const u8) !*Channel {
+        pub fn sub(self: *Server, consumer: *Consumer, topic: []const u8, channel: []const u8) !*Channel {
             const t = try self.getTopic(topic);
             return try t.sub(consumer, channel);
         }
@@ -196,6 +196,16 @@ pub fn ServerType(Consumer: type, Timer: type) type {
             self.topics.deinit();
         }
 
+        pub fn stopTimers(self: *Server) !void {
+            var ti = self.topics.valueIterator();
+            while (ti.next()) |topic| {
+                var ci = topic.*.channels.valueIterator();
+                while (ci.next()) |channel| {
+                    try channel.*.timer.close();
+                }
+            }
+        }
+
         fn TopicType() type {
             return struct {
                 allocator: mem.Allocator,
@@ -215,7 +225,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     };
                 }
 
-                fn sub(self: *Topic, consumer: Consumer, channel_name: []const u8) !*Channel {
+                fn sub(self: *Topic, consumer: *Consumer, channel_name: []const u8) !*Channel {
                     if (self.channels.get(channel_name)) |c| {
                         try c.sub(consumer);
                         return c;
@@ -223,6 +233,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     const channel = try self.allocator.create(Channel);
                     errdefer self.allocator.destroy(channel);
                     channel.* = Channel.init(self.allocator, self);
+                    channel.timer = self.server.io.newTimer(channel, Channel.timerTimeout);
                     const key = try self.allocator.dupe(u8, channel_name);
                     errdefer self.allocator.free(key);
                     try self.channels.put(key, channel);
@@ -257,7 +268,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
 
                 pub fn deferredPublish(self: *Topic, data: []const u8, delay: u32) !void {
                     var msg = try self.append(data);
-                    msg.defer_until = self.server.timer.now() + @as(u64, @intCast(delay)) * ns_per_ms;
+                    msg.defer_until = self.server.io.now() + @as(u64, @intCast(delay)) * ns_per_ms;
                     try self.notifyChannels();
                 }
 
@@ -278,7 +289,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     self.sequence += 1;
                     msg.* = .{
                         .sequence = self.sequence,
-                        .created_at = self.server.timer.now(),
+                        .created_at = self.server.io.now(),
                         .body = body,
                     };
                     self.messages.append(msg);
@@ -319,8 +330,8 @@ pub fn ServerType(Consumer: type, Timer: type) type {
             return struct {
                 allocator: mem.Allocator,
                 topic: *Topic,
-                timer: Timer,
-                consumers: std.ArrayList(Consumer),
+                timer: Timer = undefined,
+                consumers: std.ArrayList(*Consumer),
                 // Sent but not jet acknowledged (fin) messages.
                 in_flight: std.AutoArrayHashMap(u64, *ChannelMsg),
                 // Re-queued by consumer, timed out or defer published messages.
@@ -345,21 +356,18 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     timeout: usize = 0, // time outed while in flight
                     requeue: usize = 0, // req by the client
                 } = .{},
-                // Last timeout set on the timer.
-                timeout: u64 = no_timeout,
 
                 pub fn init(allocator: mem.Allocator, topic: *Topic) Channel {
                     return .{
                         .allocator = allocator,
                         .topic = topic,
-                        .consumers = std.ArrayList(Consumer).init(allocator),
+                        .consumers = std.ArrayList(*Consumer).init(allocator),
                         .in_flight = std.AutoArrayHashMap(u64, *ChannelMsg).init(allocator),
                         .finished = std.PriorityQueue(u64, void, lessU64).init(allocator, {}),
                         .deferred = std.PriorityQueue(*ChannelMsg, void, ChannelMsg.less).init(allocator, {}),
                         // Channel starts at the last topic message at the moment of channel creation
                         .offset = topic.sequence,
                         .next = null,
-                        .timer = topic.server.timer,
                     };
                 }
 
@@ -377,7 +385,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                 }
 
                 // Returns true if there is more messages for next consumer
-                fn fillConsumer(self: *Channel, consumer: Consumer) !bool {
+                fn fillConsumer(self: *Channel, consumer: *Consumer) !bool {
                     var msgs_buf: [max_msgs_send_batch_size]*ChannelMsg = undefined;
                     var msgs = msgs_buf[0..@min(consumer.ready(), msgs_buf.len)];
                     var n: usize = 0;
@@ -408,21 +416,17 @@ pub fn ServerType(Consumer: type, Timer: type) type {
 
                 /// Sets next timer timeout
                 fn setTimeout(self: *Channel, next_timeout: u64) !void {
-                    if (next_timeout >= self.timeout) return;
-                    try self.timer.set(self, Channel.timerTimeout, next_timeout, self.timeout);
-                    self.timeout = next_timeout;
+                    try self.timer.set(next_timeout);
                 }
 
                 /// Callback when timer timeout if fired
-                fn timerTimeout(self: *Channel, prev_timeout: u64) Error!void {
-                    self.timeout = prev_timeout;
-
+                fn timerTimeout(self: *Channel) Error!void {
                     const now = self.timer.now();
                     const next_timeout = @min(
                         try self.inFlightTimeout(now),
                         try self.deferredTimeout(now),
                     );
-
+                    log.debug("timerTimeout next: {}", .{next_timeout});
                     try self.setTimeout(next_timeout);
                 }
 
@@ -468,16 +472,16 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                 }
 
                 const ConsumersIterator = struct {
-                    consumers: []Consumer = undefined,
+                    consumers: []*Consumer = undefined,
                     not_ready_count: usize = 0,
                     idx: usize = 0,
 
-                    fn init(self: *ConsumersIterator, consumers: []Consumer) void {
+                    fn init(self: *ConsumersIterator, consumers: []*Consumer) void {
                         self.consumers = consumers;
                         self.not_ready_count = 0;
                     }
 
-                    fn next(self: *ConsumersIterator) ?Consumer {
+                    fn next(self: *ConsumersIterator) ?*Consumer {
                         const count = self.consumers.len;
                         if (count == 0) return null;
                         while (true) {
@@ -551,11 +555,11 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     assert(self.in_flight.swapRemove(msg.sequence()));
                 }
 
-                fn sub(self: *Channel, consumer: Consumer) !void {
+                fn sub(self: *Channel, consumer: *Consumer) !void {
                     try self.consumers.append(consumer);
                 }
 
-                pub fn unsub(self: *Channel, consumer: Consumer) !void {
+                pub fn unsub(self: *Channel, consumer: *Consumer) !void {
                     // Remove in_flight messages of that consumer
                     outer: while (true) {
                         for (self.in_flight.values()) |msg| {
@@ -575,7 +579,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     }
                 }
 
-                pub fn ready(self: *Channel, consumer: Consumer) !void {
+                pub fn ready(self: *Channel, consumer: *Consumer) !void {
                     if (consumer.ready() == 0) return;
                     _ = try self.fillConsumer(consumer);
                 }
@@ -614,7 +618,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                 }
 
                 fn deinit(self: *Channel) void {
-                    if (self.timeout != no_timeout) self.timer.clear(self) catch {};
+                    self.timer.close() catch {};
                     self.consumers.deinit();
                     for (self.in_flight.values()) |msg| self.allocator.destroy(msg);
                     while (self.deferred.removeOrNull()) |msg| self.allocator.destroy(msg);
