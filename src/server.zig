@@ -16,7 +16,10 @@ fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * ns_per_ms;
 }
 
-// TODO: can't set this larger than 512, getting InvalidArgument in send, why?
+// iovlen in msghdr is limited by IOV_MAX in <limits.h>. On modern Linux
+// systems, the limit is 1024.
+// Each message has header and body: 2 iovecs.
+// ref: https://man7.org/linux/man-pages/man2/readv.2.html
 pub const max_msgs_send_batch_size = 512;
 
 const TopicMsg = struct {
