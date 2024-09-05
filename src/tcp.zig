@@ -105,16 +105,8 @@ pub const Conn = struct {
 
     recv_buf: []u8 = &.{}, // holds unprocessed bytes from previous receive
     send_header_buf: [34]u8 = undefined, // message header
-    send_vec: [max_msgs_send_batch_size * 2]posix.iovec_const = undefined, // header and body for each message
-    send_msghdr: posix.msghdr_const = .{
-        .iov = undefined,
-        .iovlen = undefined,
-        .name = null,
-        .namelen = 0,
-        .control = null,
-        .controllen = 0,
-        .flags = 0,
-    },
+    send_vec: []posix.iovec_const = &.{}, // header and body for each message
+    send_msghdr: posix.msghdr_const = .{ .iov = undefined, .iovlen = undefined, .name = null, .namelen = 0, .control = null, .controllen = 0, .flags = 0 },
     channel: ?*Channel = null,
     identify: protocol.Identify = .{},
     stat: struct {
@@ -143,6 +135,7 @@ pub const Conn = struct {
     }
 
     fn recv(self: *Conn) !void {
+        self.send_vec = try self.allocator.alloc(posix.iovec_const, 2);
         self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
         try self.initTicker(self.listener.options.heartbeat_interval);
     }
@@ -167,7 +160,7 @@ pub const Conn = struct {
         if (self.in_flight > self.ready_count) return 0;
         return @min(
             self.ready_count - self.in_flight,
-            max_msgs_send_batch_size,
+            self.send_vec.len / 2,
         );
     }
 
@@ -288,9 +281,8 @@ pub const Conn = struct {
         else
             self.deinitRecvBuf();
 
-        if (ready_changed)
-            if (self.channel) |channel|
-                try channel.ready(self);
+        if (ready_changed and self.send_op == null)
+            if (self.channel) |channel| try channel.ready(self);
     }
 
     fn appendRecvBuf(self: *Conn, bytes: []const u8) ![]const u8 {
@@ -334,7 +326,7 @@ pub const Conn = struct {
     }
 
     pub fn sendMsgs(self: *Conn, msgs: []*Msg) !void {
-        assert(msgs.len <= max_msgs_send_batch_size);
+        assert(msgs.len <= self.send_vec.len / 2);
         self.stat.messages += msgs.len;
         var n: usize = 0;
         for (msgs) |msg| {
@@ -356,7 +348,7 @@ pub const Conn = struct {
 
     fn send(self: *Conn, vec_len: usize) !void {
         assert(self.send_op == null);
-        self.send_msghdr.iov = &self.send_vec;
+        self.send_msghdr.iov = self.send_vec.ptr;
         self.send_msghdr.iovlen = @intCast(vec_len);
         self.send_op = try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed);
     }
@@ -375,11 +367,19 @@ pub const Conn = struct {
 
     fn sent(self: *Conn, _: usize) Error!void {
         self.send_op = null;
+        try self.initSendVec();
         if (self.pending_response) |r| {
             try self.respond(r);
             self.pending_response = null;
         }
         if (self.channel) |channel| try channel.ready(self);
+    }
+
+    fn initSendVec(self: *Conn) !void {
+        const new_len: usize = @as(usize, @intCast(@min(self.ready_count, max_msgs_send_batch_size))) * 2;
+        if (new_len <= self.send_vec.len) return;
+        self.allocator.free(self.send_vec);
+        self.send_vec = try self.allocator.alloc(posix.iovec_const, new_len);
     }
 
     fn sendFailed(self: *Conn, err: anyerror) Error!void {
@@ -407,6 +407,7 @@ pub const Conn = struct {
 
         self.deinitRecvBuf();
         self.identify.deinit(self.allocator);
+        self.allocator.free(self.send_vec);
         self.listener.remove(self);
     }
 };
