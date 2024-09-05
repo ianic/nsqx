@@ -406,40 +406,50 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                     try self.in_flight.put(msg.sequence(), msg);
                 }
 
-                fn setTimeout(self: *Channel, expires_at: u64) !void {
-                    if (expires_at >= self.timeout) return;
-                    // log.debug("setTimeout {}ms", .{(expires_at - self.timer.now()) / ns_per_ms});
-                    try self.timer.set(self, Channel.timerTimeout, expires_at, self.timeout);
-                    self.timeout = expires_at;
+                /// Sets next timer timeout
+                fn setTimeout(self: *Channel, next_timeout: u64) !void {
+                    if (next_timeout >= self.timeout) return;
+                    try self.timer.set(self, Channel.timerTimeout, next_timeout, self.timeout);
+                    self.timeout = next_timeout;
                 }
 
+                /// Callback when timer timeout if fired
                 fn timerTimeout(self: *Channel, prev_timeout: u64) Error!void {
                     self.timeout = prev_timeout;
-                    // min timeout of in flight messages
-                    var timeout = try self.inFlightTimeout(self.timer.now());
 
+                    const now = self.timer.now();
+                    const next_timeout = @min(
+                        try self.inFlightTimeout(now),
+                        try self.deferredTimeout(now),
+                    );
+
+                    try self.setTimeout(next_timeout);
+                }
+
+                /// Returns next timeout of deferred messages
+                fn deferredTimeout(self: *Channel, now: u64) !u64 {
+                    var timeout: u64 = no_timeout;
                     if (self.deferred.count() > 0) {
                         try self.wakeup();
                         if (self.deferred.peek()) |msg| {
-                            //min timeout of deferred messages
-                            if (msg.timestamp > 0 and msg.timestamp < timeout) timeout = msg.timestamp;
+                            if (msg.timestamp > now and msg.timestamp < timeout) timeout = msg.timestamp;
                         }
                     }
-                    try self.setTimeout(timeout);
+                    return timeout;
                 }
 
                 /// Finds time-outed in flight messages and move them to the
                 /// deferred queue.
-                fn inFlightTimeout(self: *Channel, ts: u64) !u64 {
+                /// Returns next timeout for in flight messages.
+                fn inFlightTimeout(self: *Channel, now: u64) !u64 {
                     var msgs = std.ArrayList(*ChannelMsg).init(self.allocator);
                     defer msgs.deinit();
-                    var min_expires_at: u64 = no_timeout;
+                    var timeout: u64 = no_timeout;
                     for (self.in_flight.values()) |msg| {
-                        if (msg.timestamp <= ts) {
+                        if (msg.timestamp <= now) {
                             try msgs.append(msg);
                         } else {
-                            if (min_expires_at > msg.timestamp)
-                                min_expires_at = msg.timestamp;
+                            if (timeout > msg.timestamp) timeout = msg.timestamp;
                         }
                     }
                     for (msgs.items) |msg| {
@@ -447,7 +457,7 @@ pub fn ServerType(Consumer: type, Timer: type) type {
                         try self.requeue(msg, 0);
                     }
                     self.stat.timeout += msgs.items.len;
-                    return min_expires_at;
+                    return timeout;
                 }
 
                 // Iterates over ready consumers. Returns null when there is no
