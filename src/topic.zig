@@ -10,7 +10,6 @@ pub fn CompactedTopic(comptime Data: type, comptime Consumer: type) type {
         pub const Node = struct {
             next: ?*Node = null,
             rc: usize = 0, // reference count
-            sequence: u64, // stream sequence
             key: u64 = 0, // compaction key
             kind: Kind = .upsert, // node kind; used in compaction
             data: *Data,
@@ -37,13 +36,11 @@ pub fn CompactedTopic(comptime Data: type, comptime Consumer: type) type {
             }
 
             fn deinit(self: *Node, allocator: std.mem.Allocator) void {
-                // std.debug.print("deinit node {} {}\n", .{ self.data.*, self.data_owned });
                 if (self.data_owned) allocator.destroy(self.data);
                 allocator.destroy(self);
             }
         };
 
-        sequence: u64 = 0,
         first: ?*Node = null,
         last: ?*Node = null,
 
@@ -53,7 +50,6 @@ pub fn CompactedTopic(comptime Data: type, comptime Consumer: type) type {
         const ConsumerState = struct {
             current: ?*Node = null,
             next: ?*Node = null,
-            sequence: u64 = 0,
 
             fn deinit(self: *ConsumerState, allocator: std.mem.Allocator) void {
                 if (self.current) |n| n.decRc(allocator);
@@ -62,10 +58,7 @@ pub fn CompactedTopic(comptime Data: type, comptime Consumer: type) type {
         };
 
         pub fn subscribe(self: *Self, consumer: *Consumer) !void {
-            try self.consumers.put(consumer, .{
-                .next = self.first,
-                .sequence = 0,
-            });
+            try self.consumers.put(consumer, .{ .next = self.first });
             if (self.first) |n| n.incRc();
         }
 
@@ -98,17 +91,12 @@ pub fn CompactedTopic(comptime Data: type, comptime Consumer: type) type {
         pub fn next(self: *Self, consumer: *Consumer) ?*Data {
             if (self.consumers.getPtr(consumer)) |state| {
                 if (state.current) |node| {
-                    state.sequence = node.sequence;
                     node.decRc(self.allocator);
                     state.current = null;
                 }
                 while (state.next) |node| {
                     state.next = node.next;
                     if (state.next) |n| n.incRc();
-                    if (node.sequence <= state.sequence) {
-                        node.decRc(self.allocator);
-                        continue;
-                    }
                     state.current = node;
                     return node.data;
                 }
@@ -123,11 +111,9 @@ pub fn CompactedTopic(comptime Data: type, comptime Consumer: type) type {
 
         fn push(self: *Self, data: *Data, key: u64, kind: Node.Kind) !*Node {
             const node = try self.allocator.create(Node);
-            self.sequence += 1;
             node.* = Node{
                 .data = data,
                 .rc = 1, // previous node or self.first holds reference
-                .sequence = self.sequence,
                 .key = key,
                 .kind = kind,
             };
@@ -157,43 +143,70 @@ pub fn CompactedTopic(comptime Data: type, comptime Consumer: type) type {
             }
         }
 
-        fn compact(self: *Self) !void {
-            if (self.first == null) return;
+        fn count(self: *Self) !usize {
+            var i: usize = 0;
+            var node = self.first;
+            while (node) |n| : (node = n.next) i += 1;
+            return i;
+        }
+
+        fn compact(self: *Self) !usize {
+            if (self.first == null) return 0;
             assert(self.last != null);
 
-            // key -> last sequence for that key
-            var keys = std.AutoHashMap(u64, u64).init(self.allocator);
+            const first = self.first.?;
+            const last = self.last.?;
+
+            // key -> last node for that key
+            var keys = std.AutoHashMap(u64, *Node).init(self.allocator);
+            var nodes: usize = 0;
             defer keys.deinit();
             { // fill keys map
-                var current = self.first;
-                while (current) |node| : (current = node.next) {
+                var node = first;
+                while (node != last) : ({
+                    node = node.next.?;
+                    nodes += 1;
+                }) {
                     if (node.kind == .delete) {
                         _ = keys.remove(node.key);
                     } else {
-                        try keys.put(node.key, node.sequence);
+                        try keys.put(node.key, node);
                     }
                 }
             }
-            var first: ?*Node = null;
+            // All keys are different, compaction will do nothing
+            if (keys.count() >= nodes) return nodes + 1;
+
+            // Everything deleted. Only the last node is left after compaction.
+            if (keys.count() == 0) {
+                first.decRc(self.allocator);
+                self.first = last;
+                last.incRc();
+                self.last = last;
+                return 1;
+            }
+
+            // start new list
+            self.first = null;
+            self.last = null;
             {
-                var current = self.first;
-                while (current) |node| : (current = node.next) {
-                    if (first) |f| if (f == current) break;
-                    if (keys.get(node.key)) |sequence| {
-                        if (node.sequence == sequence) {
+                var node = first;
+                while (node != last) : (node = node.next.?) {
+                    if (keys.get(node.key)) |last_node| {
+                        if (node == last_node) {
                             node.data_owned = false;
-                            const new_node = try self.push(node.data, node.key, node.kind);
-                            new_node.sequence = sequence;
-                            if (first == null) first = new_node;
+                            _ = try self.push(node.data, node.key, node.kind);
                         }
                     }
                 }
             }
 
-            if (first) |n| n.incRc(); // referenced by first and by previous node
-            if (first == null) self.last = null; // if all deleted
-            self.first.?.decRc(self.allocator);
-            self.first = first;
+            // connect two lists into last node
+            self.last.?.next = last;
+            last.incRc();
+            self.last = last;
+            first.decRc(self.allocator);
+            return keys.count() + 1;
         }
     };
 }
@@ -280,6 +293,9 @@ test "compact" {
         v.* = 45;
         try topic.append(v, 1, .upsert);
 
+        // noop compact
+        try testing.expectEqual(4, try topic.compact());
+
         v = try testing.allocator.create(usize);
         v.* = 46;
         try topic.append(v, 2, .delete);
@@ -291,19 +307,26 @@ test "compact" {
         v = try testing.allocator.create(usize);
         v.* = 48;
         try topic.append(v, 3, .delete);
+
+        v = try testing.allocator.create(usize);
+        v.* = 49;
+        try topic.append(v, 4, .upsert);
     }
 
     var c1 = Consumer{};
     try topic.subscribe(&c1);
     try testing.expectEqual(42, topic.next(&c1).?.*);
 
-    try topic.compact();
+    try testing.expectEqual(8, topic.count());
+    try testing.expectEqual(3, try topic.compact());
+    try testing.expectEqual(3, topic.count());
 
     { // new consumer gets compacted nodes
         var c2 = Consumer{};
         try topic.subscribe(&c2);
         try testing.expectEqual(45, topic.next(&c2).?.*);
         try testing.expectEqual(47, topic.next(&c2).?.*);
+        try testing.expectEqual(49, topic.next(&c2).?.*);
         try testing.expect(topic.next(&c2) == null);
     }
 
@@ -314,5 +337,6 @@ test "compact" {
     try testing.expectEqual(46, topic.next(&c1).?.*);
     try testing.expectEqual(47, topic.next(&c1).?.*);
     try testing.expectEqual(48, topic.next(&c1).?.*);
+    try testing.expectEqual(49, topic.next(&c1).?.*);
     try testing.expect(topic.next(&c1) == null);
 }
