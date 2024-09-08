@@ -17,8 +17,8 @@ fn nsFromMs(ms: u32) u64 {
 }
 
 // iovlen in msghdr is limited by IOV_MAX in <limits.h>. On modern Linux
-// systems, the limit is 1024.
-// Each message has header and body: 2 iovecs.
+// systems, the limit is 1024. Each message has header and body: 2 iovecs that
+// limits number of messages in a batch to 512.
 // ref: https://man7.org/linux/man-pages/man2/readv.2.html
 pub const max_msgs_send_batch_size = 512;
 
