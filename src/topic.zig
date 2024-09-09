@@ -177,7 +177,11 @@ pub fn CompactedTopic(
         // compaction.
         pub fn loadFactor(self: *Self) u32 {
             if (self.nodes_count == 0) return 100;
-            const key_count = self.keys.count();
+            var key_count = self.keys.count();
+            if (key_count == 0) return 0;
+            if (self.last) |last| if (last.kind == .delete) {
+                key_count += 2;
+            };
             return (key_count * 100) / self.nodes_count;
         }
 
@@ -420,10 +424,10 @@ test "compact removes all but one, last is delete" {
     try topic.subscribe(&c1);
 
     try testing.expectEqual(5, topic.nodes_count);
-    try testing.expectEqual(20, topic.loadFactor());
+    try testing.expectEqual(60, topic.loadFactor());
     try topic.compact();
     try testing.expectEqual(3, topic.nodes_count);
-    try testing.expectEqual(33, topic.loadFactor());
+    try testing.expectEqual(100, topic.loadFactor());
 
     var c2 = TestConsumer{};
     try topic.subscribe(&c2);
