@@ -238,29 +238,18 @@ pub fn CompactedTopic(
 }
 
 test "wakeup, state management" {
-    const Consumer = struct {
-        wakeup_count: usize = 0,
-        const Self = @This();
-        fn wakeup(self: *Self) !void {
-            self.wakeup_count += 1;
-        }
-    };
-    var topic = CompactedTopic(usize, Consumer, Consumer.wakeup).init(testing.allocator);
+    var topic = CompactedTopic(usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
     defer topic.deinit();
     { // first consumer, check wakeup call
-        var c1 = Consumer{};
+        var c1 = TestConsumer{};
         try topic.subscribe(&c1);
         try testing.expectEqual(1, topic.consumers.count());
 
-        var v = try testing.allocator.create(usize);
-        v.* = 42;
         try testing.expectEqual(0, c1.wakeup_count);
-        try topic.append(v, 1, .upsert);
+        try addNode(&topic, 42, 1, .upsert);
         try testing.expectEqual(1, c1.wakeup_count);
 
-        v = try testing.allocator.create(usize);
-        v.* = 43;
-        try topic.append(v, 2, .upsert);
+        try addNode(&topic, 43, 2, .upsert);
         try testing.expectEqual(1, c1.wakeup_count);
 
         try testing.expectEqual(42, topic.next(&c1).?.*);
@@ -268,7 +257,7 @@ test "wakeup, state management" {
         try testing.expect(topic.next(&c1) == null);
     }
     { // new consumer, check state
-        var c2 = Consumer{};
+        var c2 = TestConsumer{};
         try topic.subscribe(&c2);
         try testing.expectEqual(2, topic.consumers.count());
 
@@ -291,51 +280,19 @@ test "wakeup, state management" {
 }
 
 test "compact" {
-    const Consumer = struct {
-        dummy_count: usize = 0,
-        fn dummy(self: *@This()) !void {
-            self.dummy_count += 1;
-        }
-    };
-
-    var topic = CompactedTopic(usize, Consumer, Consumer.dummy).init(testing.allocator);
+    var topic = CompactedTopic(usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
     defer topic.deinit();
 
-    { // add nodes
-        var v = try testing.allocator.create(usize);
-        v.* = 42;
-        try topic.append(v, 1, .upsert);
+    try addNode(&topic, 42, 1, .upsert);
+    try addNode(&topic, 43, 2, .upsert);
+    try addNode(&topic, 44, 3, .upsert);
+    try addNode(&topic, 45, 1, .upsert);
+    try addNode(&topic, 46, 2, .delete);
+    try addNode(&topic, 47, 2, .upsert);
+    try addNode(&topic, 48, 3, .delete);
+    try addNode(&topic, 49, 4, .upsert);
 
-        v = try testing.allocator.create(usize);
-        v.* = 43;
-        try topic.append(v, 2, .upsert);
-
-        v = try testing.allocator.create(usize);
-        v.* = 44;
-        try topic.append(v, 3, .upsert);
-
-        v = try testing.allocator.create(usize);
-        v.* = 45;
-        try topic.append(v, 1, .upsert);
-
-        v = try testing.allocator.create(usize);
-        v.* = 46;
-        try topic.append(v, 2, .delete);
-
-        v = try testing.allocator.create(usize);
-        v.* = 47;
-        try topic.append(v, 2, .upsert);
-
-        v = try testing.allocator.create(usize);
-        v.* = 48;
-        try topic.append(v, 3, .delete);
-
-        v = try testing.allocator.create(usize);
-        v.* = 49;
-        try topic.append(v, 4, .upsert);
-    }
-
-    var c1 = Consumer{};
+    var c1 = TestConsumer{};
     try topic.subscribe(&c1);
     try testing.expectEqual(42, topic.next(&c1).?.*);
 
@@ -344,7 +301,7 @@ test "compact" {
     try testing.expectEqual(3, topic.nodes_count);
 
     { // new consumer gets compacted nodes
-        var c2 = Consumer{};
+        var c2 = TestConsumer{};
         try topic.subscribe(&c2);
         try testing.expectEqual(45, topic.next(&c2).?.*);
         try testing.expectEqual(47, topic.next(&c2).?.*);
@@ -364,50 +321,24 @@ test "compact" {
 }
 
 test "compact removes all" {
-    const Consumer = struct {
-        dummy_count: usize = 0,
-        fn dummy(self: *@This()) !void {
-            self.dummy_count += 1;
-        }
-    };
-
-    var topic = CompactedTopic(usize, Consumer, Consumer.dummy).init(testing.allocator);
+    var topic = CompactedTopic(usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
     defer topic.deinit();
 
-    { // add nodes
-        var v = try testing.allocator.create(usize);
-        v.* = 42;
-        try topic.append(v, 1, .upsert);
+    try addNode(&topic, 42, 1, .upsert);
+    try addNode(&topic, 43, 2, .upsert);
+    try addNode(&topic, 44, 3, .upsert);
+    try addNode(&topic, 45, 1, .delete);
+    try addNode(&topic, 46, 2, .delete);
+    try addNode(&topic, 47, 3, .delete);
 
-        v = try testing.allocator.create(usize);
-        v.* = 43;
-        try topic.append(v, 2, .upsert);
-
-        v = try testing.allocator.create(usize);
-        v.* = 44;
-        try topic.append(v, 3, .upsert);
-
-        v = try testing.allocator.create(usize);
-        v.* = 45;
-        try topic.append(v, 1, .delete);
-
-        v = try testing.allocator.create(usize);
-        v.* = 46;
-        try topic.append(v, 2, .delete);
-
-        v = try testing.allocator.create(usize);
-        v.* = 47;
-        try topic.append(v, 3, .delete);
-    }
-
-    var c1 = Consumer{};
+    var c1 = TestConsumer{};
     try topic.subscribe(&c1);
 
     try testing.expectEqual(6, topic.nodes_count);
     try topic.compact();
     try testing.expectEqual(0, topic.nodes_count);
 
-    var c2 = Consumer{};
+    var c2 = TestConsumer{};
     try topic.subscribe(&c2);
     try testing.expect(topic.next(&c2) == null);
 
