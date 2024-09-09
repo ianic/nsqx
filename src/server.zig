@@ -152,16 +152,19 @@ pub fn ServerType(Consumer: type, Io: type) type {
             return try t.sub(consumer, channel);
         }
 
-        fn getTopic(self: *Server, topic_name: []const u8) !*Topic {
-            if (self.topics.get(topic_name)) |t| return t;
+        fn getTopic(self: *Server, name: []const u8) !*Topic {
+            if (self.topics.get(name)) |t| return t;
+            return try self.createTopic(name);
+        }
 
+        fn createTopic(self: *Server, name: []const u8) !*Topic {
             const topic = try self.allocator.create(Topic);
             errdefer self.allocator.destroy(topic);
             topic.* = Topic.init(self.allocator, self);
-            const key = try self.allocator.dupe(u8, topic_name);
+            const key = try self.allocator.dupe(u8, name);
             errdefer self.allocator.free(key);
             try self.topics.put(key, topic);
-            log.debug("created topic {s}", .{topic_name});
+            log.debug("created topic {s}", .{name});
             return topic;
         }
 
@@ -220,25 +223,31 @@ pub fn ServerType(Consumer: type, Io: type) type {
                     };
                 }
 
-                fn sub(self: *Topic, consumer: *Consumer, channel_name: []const u8) !*Channel {
-                    if (self.channels.get(channel_name)) |c| {
-                        try c.sub(consumer);
-                        return c;
+                fn sub(self: *Topic, consumer: *Consumer, name: []const u8) !*Channel {
+                    if (self.channels.get(name)) |channel| {
+                        try channel.sub(consumer);
+                        return channel;
                     }
-                    const channel = try self.allocator.create(Channel);
-                    errdefer self.allocator.destroy(channel);
-                    channel.* = Channel.init(self.allocator, self);
-                    channel.initTimer(self.server.io);
-                    const key = try self.allocator.dupe(u8, channel_name);
-                    errdefer self.allocator.free(key);
-                    try self.channels.put(key, channel);
+                    var channel = try self.createChannel(name);
                     try channel.sub(consumer);
-                    log.debug("created channel {s}", .{channel_name});
                     // First channel gets all messages from the topic
                     if (self.channels.count() == 1) {
                         channel.next = self.messages.first;
                         if (self.messages.first) |msg| channel.offset = msg.sequence - 1;
                     }
+                    return channel;
+                }
+
+                fn createChannel(self: *Topic, name: []const u8) !*Channel {
+                    const channel = try self.allocator.create(Channel);
+                    errdefer self.allocator.destroy(channel);
+                    channel.* = Channel.init(self.allocator, self);
+                    channel.initTimer(self.server.io);
+                    const key = try self.allocator.dupe(u8, name);
+                    errdefer self.allocator.free(key);
+                    try self.channels.put(key, channel);
+
+                    log.debug("created channel {s}", .{name});
                     return channel;
                 }
 
