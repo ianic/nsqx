@@ -206,6 +206,7 @@ pub fn CompactedTopic(
             { // Create new list
                 self.first = null;
                 self.last = null;
+                var last_upsert: ?*Node = null; // last upsert for the last.key
                 var node = first;
                 while (node != last) : (node = node.next.?) {
                     if (self.keys.get(node.key)) |last_node| {
@@ -214,20 +215,28 @@ pub fn CompactedTopic(
                             _ = try self.create(node.data, node.key, node.kind);
                         }
                     }
+                    if (last.key == node.key and node.kind == .upsert)
+                        last_upsert = node;
+                }
+                // If the last is delete we need to preserve previous upsert also.
+                // Last must be always preserve so we can connect two list at some node.
+                if (last.kind == .delete) {
+                    if (last_upsert) |n| {
+                        n.data_owned = false;
+                        _ = try self.create(n.data, n.key, n.kind);
+                    }
                 }
             }
-            { // Update keys
+            { // Update keys for the new list
                 try self.keysInit();
-                {
-                    var node = self.first;
-                    while (node) |n| : (node = n.next) {
-                        try self.keysPut(n);
-                    }
+                var node = self.first;
+                while (node) |n| : (node = n.next) {
+                    try self.keysPut(n);
                 }
                 try self.keysPut(last);
             }
 
-            // connect two lists into last node
+            // Connect two lists into last node
             if (self.last) |new_last| {
                 new_last.next = Node.acquire(last);
                 new_last.release(self.allocator);
@@ -385,6 +394,41 @@ test "compact removes all but one" {
 
     var c2 = TestConsumer{};
     try topic.subscribe(&c2);
+    try testing.expectEqual(46, topic.next(&c2).?.*);
+    try testing.expect(topic.next(&c2) == null);
+
+    try testing.expect(topic.last != null);
+    try testing.expectEqual(42, topic.next(&c1).?.*);
+    try testing.expectEqual(43, topic.next(&c1).?.*);
+    try testing.expectEqual(44, topic.next(&c1).?.*);
+    try testing.expectEqual(45, topic.next(&c1).?.*);
+    try testing.expectEqual(46, topic.next(&c1).?.*);
+    try testing.expect(topic.next(&c1) == null);
+}
+
+test "compact removes all but one, last is delete" {
+    var topic = CompactedTopic(usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
+    defer topic.deinit();
+
+    try addNode(&topic, 42, 1, .upsert);
+    try addNode(&topic, 43, 1, .delete);
+    try addNode(&topic, 44, 1, .upsert);
+    try addNode(&topic, 45, 2, .upsert);
+    try addNode(&topic, 46, 2, .delete);
+
+    var c1 = TestConsumer{};
+    try topic.subscribe(&c1);
+
+    try testing.expectEqual(5, topic.nodes_count);
+    try testing.expectEqual(20, topic.loadFactor());
+    try topic.compact();
+    try testing.expectEqual(3, topic.nodes_count);
+    try testing.expectEqual(33, topic.loadFactor());
+
+    var c2 = TestConsumer{};
+    try topic.subscribe(&c2);
+    try testing.expectEqual(44, topic.next(&c2).?.*);
+    try testing.expectEqual(45, topic.next(&c2).?.*);
     try testing.expectEqual(46, topic.next(&c2).?.*);
     try testing.expect(topic.next(&c2) == null);
 
