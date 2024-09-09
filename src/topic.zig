@@ -55,7 +55,7 @@ pub fn CompactedTopic(
         first: ?*Node = null,
         last: ?*Node = null,
         keys: std.AutoHashMap(u64, *Node),
-        nodes_count: u64 = 0,
+        nodes_count: u32 = 0,
 
         allocator: std.mem.Allocator,
         consumers: std.AutoHashMap(*Consumer, ConsumerState),
@@ -172,14 +172,16 @@ pub fn CompactedTopic(
             }
         }
 
-        fn count(self: *Self) !usize {
-            var i: usize = 0;
-            var node = self.first;
-            while (node) |n| : (node = n.next) i += 1;
-            return i;
+        // Percent of the nodes which will persist after compact. Client can use
+        // node_count and load factor to decide is it a good time for
+        // compaction.
+        pub fn loadFactor(self: *Self) u32 {
+            if (self.nodes_count == 0) return 100;
+            const key_count = self.keys.count();
+            return (key_count * 100) / self.nodes_count;
         }
 
-        fn compact(self: *Self) !void {
+        pub fn compact(self: *Self) !void {
             if (self.first == null) return;
             assert(self.last != null);
 
@@ -297,6 +299,7 @@ test "compact" {
     try testing.expectEqual(42, topic.next(&c1).?.*);
 
     try testing.expectEqual(8, topic.nodes_count);
+    try testing.expectEqual(37, topic.loadFactor());
     try topic.compact();
     try testing.expectEqual(3, topic.nodes_count);
 
@@ -335,8 +338,10 @@ test "compact removes all" {
     try topic.subscribe(&c1);
 
     try testing.expectEqual(6, topic.nodes_count);
+    try testing.expectEqual(0, topic.loadFactor());
     try topic.compact();
     try testing.expectEqual(0, topic.nodes_count);
+    try testing.expectEqual(100, topic.loadFactor());
 
     var c2 = TestConsumer{};
     try topic.subscribe(&c2);
@@ -373,8 +378,10 @@ test "compact removes all but one" {
     try topic.subscribe(&c1);
 
     try testing.expectEqual(5, topic.nodes_count);
+    try testing.expectEqual(20, topic.loadFactor());
     try topic.compact();
     try testing.expectEqual(1, topic.nodes_count);
+    try testing.expectEqual(100, topic.loadFactor());
 
     var c2 = TestConsumer{};
     try topic.subscribe(&c2);
