@@ -3,6 +3,11 @@ const debug = std.debug;
 const assert = debug.assert;
 const testing = std.testing;
 
+const NodeKind = enum {
+    upsert,
+    delete,
+};
+
 pub fn CompactedTopic(
     comptime Data: type,
     comptime Consumer: type,
@@ -20,28 +25,30 @@ pub fn CompactedTopic(
             // If the data is owned by this node it will be destroyed on node destroy.
             data_owned: bool = true,
 
-            const Kind = enum {
-                upsert,
-                delete,
-            };
+            const Kind = NodeKind;
 
             fn incRc(self: *Node) void {
                 self.rc += 1;
             }
 
-            fn decRc(self: *Node, allocator: std.mem.Allocator) void {
+            fn release(self: *Node, allocator: std.mem.Allocator) void {
                 assert(self.rc > 0);
                 const nn = self.next;
                 self.rc -= 1;
                 if (self.rc == 0) {
                     self.deinit(allocator);
-                    if (nn) |n| n.decRc(allocator);
+                    if (nn) |n| n.release(allocator);
                 }
             }
 
             fn deinit(self: *Node, allocator: std.mem.Allocator) void {
                 if (self.data_owned) allocator.destroy(self.data);
                 allocator.destroy(self);
+            }
+
+            fn acquire(node: ?*Node) ?*Node {
+                if (node) |n| n.incRc();
+                return node;
             }
         };
 
@@ -58,14 +65,13 @@ pub fn CompactedTopic(
             next: ?*Node = null,
 
             fn deinit(self: *ConsumerState, allocator: std.mem.Allocator) void {
-                if (self.current) |n| n.decRc(allocator);
-                if (self.next) |n| n.decRc(allocator);
+                if (self.current) |n| n.release(allocator);
+                if (self.next) |n| n.release(allocator);
             }
         };
 
         pub fn subscribe(self: *Self, consumer: *Consumer) !void {
-            try self.consumers.put(consumer, .{ .next = self.first });
-            if (self.first) |n| n.incRc();
+            try self.consumers.put(consumer, .{ .next = Node.acquire(self.first) });
         }
 
         pub fn unsubscribe(self: *Self, consumer: *Consumer) void {
@@ -90,7 +96,8 @@ pub fn CompactedTopic(
             }
             self.consumers.deinit();
             { // Remove first node reference, will trigger deinit on all childs
-                if (self.first) |n| n.decRc(self.allocator);
+                if (self.last) |n| n.release(self.allocator);
+                if (self.first) |n| n.release(self.allocator);
                 self.first = null;
             }
             self.keys.deinit();
@@ -99,12 +106,15 @@ pub fn CompactedTopic(
         pub fn next(self: *Self, consumer: *Consumer) ?*Data {
             if (self.consumers.getPtr(consumer)) |state| {
                 if (state.current) |node| {
-                    node.decRc(self.allocator);
+                    node.release(self.allocator);
+                    if (self.last) |last| if (node == last and node.rc == 1) {
+                        self.last = null;
+                        node.release(self.allocator);
+                    };
                     state.current = null;
                 }
                 while (state.next) |node| {
-                    state.next = node.next;
-                    if (state.next) |n| n.incRc();
+                    state.next = Node.acquire(node.next);
                     state.current = node;
                     return node.data;
                 }
@@ -126,24 +136,27 @@ pub fn CompactedTopic(
             self.nodes_count += 1;
         }
 
+        fn keysInit(self: *Self) !void {
+            self.keys.deinit();
+            self.keys = std.AutoHashMap(u64, *Node).init(self.allocator);
+            self.nodes_count = 0;
+        }
+
         fn create(self: *Self, data: *Data, key: u64, kind: Node.Kind) !*Node {
             const node = try self.allocator.create(Node);
             node.* = Node{
                 .data = data,
-                .rc = 1, // previous node or self.first holds reference
+                .rc = 2, // self.last and previous node (or self.first) has references
                 .key = key,
                 .kind = kind,
             };
 
-            if (self.last == null) {
-                assert(self.first == null);
-                self.first = node;
-                self.last = node;
-            } else {
-                assert(self.first != null);
-                self.last.?.next = node;
-                self.last = node;
+            if (self.last) |last| {
+                last.release(self.allocator);
+                last.next = node;
             }
+            self.last = node;
+            if (self.first == null) self.first = node;
             return node;
         }
 
@@ -153,8 +166,7 @@ pub fn CompactedTopic(
                 const consumer = e.key_ptr.*;
                 const state = e.value_ptr;
                 if (state.next == null) {
-                    node.incRc();
-                    state.next = node;
+                    state.next = Node.acquire(node);
                     try wakeupCallback(consumer);
                 }
             }
@@ -177,26 +189,21 @@ pub fn CompactedTopic(
             const first = self.first.?;
             const last = self.last.?;
 
-            // Everything deleted. Only the last node is left after compaction.
+            // Everything deleted
             if (self.keys.count() == 0) {
-                last.incRc();
-                self.last = last;
-                first.decRc(self.allocator);
-                self.first = last;
-
-                self.keys.deinit();
-                self.keys = std.AutoHashMap(u64, *Node).init(self.allocator);
-                self.nodes_count = 0;
-                try self.keysPut(last);
+                first.release(self.allocator);
+                self.first = null;
+                if (last.rc == 1) {
+                    last.release(self.allocator);
+                    self.last = null;
+                }
+                try self.keysInit();
                 return;
             }
 
-            // start new list
-            self.first = null;
-            self.last = null;
-
-            self.nodes_count = 0;
-            {
+            { // Create new list
+                self.first = null;
+                self.last = null;
                 var node = first;
                 while (node != last) : (node = node.next.?) {
                     if (self.keys.get(node.key)) |last_node| {
@@ -207,22 +214,25 @@ pub fn CompactedTopic(
                     }
                 }
             }
-
-            self.keys.deinit();
-            self.keys = std.AutoHashMap(u64, *Node).init(self.allocator);
-            {
-                var node = self.first;
-                while (node) |n| : (node = n.next) {
-                    try self.keysPut(n);
+            { // Update keys
+                try self.keysInit();
+                {
+                    var node = self.first;
+                    while (node) |n| : (node = n.next) {
+                        try self.keysPut(n);
+                    }
                 }
+                try self.keysPut(last);
             }
 
             // connect two lists into last node
-            self.last.?.next = last;
-            last.incRc();
+            if (self.last) |new_last| {
+                new_last.next = Node.acquire(last);
+                new_last.release(self.allocator);
+            }
+            if (self.first == null) self.first = Node.acquire(last);
             self.last = last;
-            first.decRc(self.allocator);
-            try self.keysPut(last);
+            first.release(self.allocator);
         }
     };
 }
@@ -353,7 +363,7 @@ test "compact" {
     try testing.expect(topic.next(&c1) == null);
 }
 
-test "compact deletes all" {
+test "compact removes all" {
     const Consumer = struct {
         dummy_count: usize = 0,
         fn dummy(self: *@This()) !void {
@@ -390,12 +400,61 @@ test "compact deletes all" {
         try topic.append(v, 3, .delete);
     }
 
+    var c1 = Consumer{};
+    try topic.subscribe(&c1);
+
     try testing.expectEqual(6, topic.nodes_count);
+    try topic.compact();
+    try testing.expectEqual(0, topic.nodes_count);
+
+    var c2 = Consumer{};
+    try topic.subscribe(&c2);
+    try testing.expect(topic.next(&c2) == null);
+
+    try testing.expect(topic.last != null);
+    try testing.expectEqual(42, topic.next(&c1).?.*);
+}
+
+fn addNode(topic: anytype, value: usize, key: u64, kind: NodeKind) !void {
+    const v = try testing.allocator.create(usize);
+    v.* = value;
+    try topic.append(v, key, kind);
+}
+
+const TestConsumer = struct {
+    wakeup_count: usize = 0,
+    fn wakeup(self: *@This()) !void {
+        self.wakeup_count += 1;
+    }
+};
+
+test "compact removes all but one" {
+    var topic = CompactedTopic(usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
+    defer topic.deinit();
+
+    try addNode(&topic, 42, 1, .upsert);
+    try addNode(&topic, 43, 1, .upsert);
+    try addNode(&topic, 44, 1, .upsert);
+    try addNode(&topic, 45, 1, .delete);
+    try addNode(&topic, 46, 1, .upsert);
+
+    var c1 = TestConsumer{};
+    try topic.subscribe(&c1);
+
+    try testing.expectEqual(5, topic.nodes_count);
     try topic.compact();
     try testing.expectEqual(1, topic.nodes_count);
 
-    var c1 = Consumer{};
-    try topic.subscribe(&c1);
-    try testing.expectEqual(47, topic.next(&c1).?.*);
+    var c2 = TestConsumer{};
+    try topic.subscribe(&c2);
+    try testing.expectEqual(46, topic.next(&c2).?.*);
+    try testing.expect(topic.next(&c2) == null);
+
+    try testing.expect(topic.last != null);
+    try testing.expectEqual(42, topic.next(&c1).?.*);
+    try testing.expectEqual(43, topic.next(&c1).?.*);
+    try testing.expectEqual(44, topic.next(&c1).?.*);
+    try testing.expectEqual(45, topic.next(&c1).?.*);
+    try testing.expectEqual(46, topic.next(&c1).?.*);
     try testing.expect(topic.next(&c1) == null);
 }
