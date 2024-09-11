@@ -27,17 +27,13 @@ pub fn CompactedTopic(
 
             const Kind = NodeKind;
 
-            fn incRc(self: *Node) void {
-                self.rc += 1;
-            }
-
-            fn release(self: *Node, allocator: std.mem.Allocator) void {
+            fn unbox(self: *Node, allocator: std.mem.Allocator) void {
                 assert(self.rc > 0);
                 const nn = self.next;
                 self.rc -= 1;
                 if (self.rc == 0) {
                     self.deinit(allocator);
-                    if (nn) |n| n.release(allocator);
+                    if (nn) |n| n.unbox(allocator);
                 }
             }
 
@@ -46,8 +42,8 @@ pub fn CompactedTopic(
                 allocator.destroy(self);
             }
 
-            fn acquire(node: ?*Node) ?*Node {
-                if (node) |n| n.incRc();
+            fn box(node: ?*Node) ?*Node {
+                if (node) |n| n.rc += 1;
                 return node;
             }
         };
@@ -65,13 +61,13 @@ pub fn CompactedTopic(
             next: ?*Node = null,
 
             fn deinit(self: *ConsumerState, allocator: std.mem.Allocator) void {
-                if (self.current) |n| n.release(allocator);
-                if (self.next) |n| n.release(allocator);
+                if (self.current) |n| n.unbox(allocator);
+                if (self.next) |n| n.unbox(allocator);
             }
         };
 
         pub fn subscribe(self: *Self, consumer: *Consumer) !void {
-            try self.consumers.put(consumer, .{ .next = Node.acquire(self.first) });
+            try self.consumers.put(consumer, .{ .next = Node.box(self.first) });
         }
 
         pub fn unsubscribe(self: *Self, consumer: *Consumer) void {
@@ -96,8 +92,8 @@ pub fn CompactedTopic(
             }
             self.consumers.deinit();
             { // Remove first node reference, will trigger deinit on all childs
-                if (self.last) |n| n.release(self.allocator);
-                if (self.first) |n| n.release(self.allocator);
+                if (self.last) |n| n.unbox(self.allocator);
+                if (self.first) |n| n.unbox(self.allocator);
                 self.first = null;
             }
             self.keys.deinit();
@@ -106,15 +102,15 @@ pub fn CompactedTopic(
         pub fn next(self: *Self, consumer: *Consumer) ?*Data {
             if (self.consumers.getPtr(consumer)) |state| {
                 if (state.current) |node| {
-                    node.release(self.allocator);
+                    node.unbox(self.allocator);
                     if (self.last) |last| if (node == last and node.rc == 1) {
                         self.last = null;
-                        node.release(self.allocator);
+                        node.unbox(self.allocator);
                     };
                     state.current = null;
                 }
-                while (state.next) |node| {
-                    state.next = Node.acquire(node.next);
+                if (state.next) |node| {
+                    state.next = Node.box(node.next);
                     state.current = node;
                     return node.data;
                 }
@@ -152,7 +148,7 @@ pub fn CompactedTopic(
             };
 
             if (self.last) |last| {
-                last.release(self.allocator);
+                last.unbox(self.allocator);
                 last.next = node;
             }
             self.last = node;
@@ -166,7 +162,7 @@ pub fn CompactedTopic(
                 const consumer = e.key_ptr.*;
                 const state = e.value_ptr;
                 if (state.next == null) {
-                    state.next = Node.acquire(node);
+                    state.next = Node.box(node);
                     try wakeupCallback(consumer);
                 }
             }
@@ -197,10 +193,10 @@ pub fn CompactedTopic(
 
             // Everything deleted
             if (self.keys.count() == 0) {
-                first.release(self.allocator);
+                first.unbox(self.allocator);
                 self.first = null;
                 if (last.rc == 1) {
-                    last.release(self.allocator);
+                    last.unbox(self.allocator);
                     self.last = null;
                 }
                 try self.keysInit();
@@ -242,12 +238,12 @@ pub fn CompactedTopic(
 
             // Connect two lists into last node
             if (self.last) |new_last| {
-                new_last.next = Node.acquire(last);
-                new_last.release(self.allocator);
+                new_last.next = Node.box(last);
+                new_last.unbox(self.allocator);
             }
-            if (self.first == null) self.first = Node.acquire(last);
+            if (self.first == null) self.first = Node.box(last);
             self.last = last;
-            first.release(self.allocator);
+            first.unbox(self.allocator);
         }
     };
 }
