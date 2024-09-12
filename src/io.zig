@@ -93,6 +93,7 @@ pub const Io = struct {
                 .writev => self.writev.submit(),
                 .send, .sendv => self.sendv.submit(),
                 .ticker, .timer => self.ticker.submit(),
+                .socket => {},
             }
         }
 
@@ -106,6 +107,7 @@ pub const Io = struct {
                 .writev => self.writev.complete(),
                 .send, .sendv => self.sendv.complete(),
                 .ticker, .timer => self.ticker.complete(),
+                .socket => {},
             }
         }
 
@@ -119,6 +121,7 @@ pub const Io = struct {
                 .writev => self.writev.restart(),
                 .send, .sendv => self.sendv.restart(),
                 .ticker, .timer => self.ticker.restart(),
+                .socket => {},
             }
         }
     };
@@ -260,6 +263,21 @@ pub const Io = struct {
     ) !*Op {
         const op = try self.acquire();
         op.* = Op.timer(self, nsec, context, ticked, failed);
+        try op.prep();
+        return op;
+    }
+
+    pub fn socketCreate(
+        self: *Io,
+        domain: u32,
+        socket_type: u32,
+        protocol: u32,
+        context: anytype,
+        comptime success: fn (@TypeOf(context), socket_t) Error!void,
+        comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
+    ) !*Op {
+        const op = try self.acquire();
+        op.* = Op.socketCreate(self, domain, socket_type, protocol, context, success, failed);
         try op.prep();
         return op;
     }
@@ -477,6 +495,11 @@ pub const Op = struct {
         },
         ticker: linux.kernel_timespec,
         timer: linux.kernel_timespec,
+        socket: struct {
+            domain: u32,
+            socket_type: u32,
+            protocol: u32,
+        },
     };
 
     const Kind = enum {
@@ -489,6 +512,7 @@ pub const Op = struct {
         send,
         ticker,
         timer,
+        socket,
     };
 
     pub fn cancel(op: *Op) !void {
@@ -516,6 +540,7 @@ pub const Op = struct {
             .send => |*arg| _ = try op.io.ring.send(@intFromPtr(op), arg.socket, arg.buf, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
             .ticker => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, IORING_TIMEOUT_MULTISHOT),
             .timer => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, 0),
+            .socket => |*arg| _ = try op.io.ring.socket(@intFromPtr(op), arg.domain, arg.socket_type, arg.protocol, 0),
         }
     }
 
@@ -832,6 +857,34 @@ pub const Op = struct {
         };
     }
 
+    fn socketCreate(
+        io: *Io,
+        domain: u32,
+        socket_type: u32,
+        protocol: u32,
+        context: anytype,
+        comptime success: fn (@TypeOf(context), socket_t) Error!void,
+        comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
+    ) Op {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
+                const ctx: Context = @ptrFromInt(op.context);
+                switch (cqe.err()) {
+                    .SUCCESS => try success(ctx, @intCast(cqe.res)),
+                    else => |errno| if (failed) |f| try f(ctx, errFromErrno(errno)),
+                }
+                return .done;
+            }
+        };
+        return .{
+            .io = io,
+            .context = @intFromPtr(context),
+            .callback = wrapper.complete,
+            .args = .{ .socket = .{ .domain = domain, .socket_type = socket_type, .protocol = protocol } },
+        };
+    }
+
     fn close(
         io: *Io,
         socket: socket_t,
@@ -986,21 +1039,37 @@ const RecvBuf = struct {
 const LookupConn = struct {
     allocator: mem.Allocator,
     recv_buf: RecvBuf,
-    count: usize = 0,
     err: ?anyerror = null,
-    socket: socket_t,
-    //address: std.net.Address,
+    socket: socket_t = 0,
+    address: std.net.Address,
     io: *Io,
     send_op: ?*Op = null,
     recv_op: ?*Op = null,
+    state: State = .init,
+    ticker_op: ?*Op = null,
+    identify_msg: []const u8,
+
+    const ping_msg = "PING\n";
+    const ping_interval = 5 * 1000; // in milliseconds
+
+    const State = enum {
+        init,
+        connecting,
+        connected,
+        disconnected,
+        closing,
+        closed,
+    };
+
     const Self = @This();
 
-    fn init(allocator: std.mem.Allocator, io: *Io, socket: socket_t) Self {
+    pub fn init(allocator: std.mem.Allocator, io: *Io, address: std.net.Address, identify_msg: []const u8) Self {
         return .{
             .allocator = allocator,
             .io = io,
-            .socket = socket,
+            .address = address,
             .recv_buf = RecvBuf.init(allocator),
+            .identify_msg = identify_msg,
         };
     }
 
@@ -1008,33 +1077,79 @@ const LookupConn = struct {
         self.recv_buf.free();
     }
 
-    pub fn connect(self: *Self, address: std.net.Address) !void {
-        _ = try self.io.connect(self.socket, address, self, connected, connectFailed);
+    pub fn connect(self: *Self) !void {
+        self.ticker_op = try self.io.ticker(ping_interval, self, tick, tickerFailed);
+        try self.reconnect();
+    }
+
+    fn reconnect(self: *Self) Error!void {
+        self.state = .connecting;
+        _ = try self.io.socketCreate(self.address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, self, socketCreated, socketFailed);
+    }
+
+    fn tick(self: *Self) Error!void {
+        switch (self.state) {
+            .disconnected => {
+                try self.io.close(self.socket);
+                self.socket = 0;
+                try self.reconnect();
+            },
+            .connected => try self.ping(),
+            else => {},
+        }
+    }
+
+    fn tickerFailed(self: *Self, err: anyerror) Error!void {
+        self.ticker_op = null;
+        switch (err) {
+            error.Canceled => {},
+            else => log.err("{} ticker failed {}", .{ self.socket, err }),
+        }
+    }
+
+    fn socketCreated(self: *Self, socket: socket_t) Error!void {
+        self.socket = socket;
+        self.state = .connecting;
+        _ = try self.io.connect(self.socket, self.address, self, connected, connectFailed);
+    }
+
+    fn socketFailed(self: *Self, err: anyerror) Error!void {
+        log.err("socket create failed {}", .{err});
+        self.state = .disconnected;
     }
 
     fn connectFailed(self: *Self, err: anyerror) Error!void {
-        self.err = err;
+        log.warn("lookupd {} connect failed {}", .{ self.address, err });
+        self.state = .disconnected;
     }
 
     fn connected(self: *Self) Error!void {
-        std.debug.print("connected\n", .{});
-        self.count += 1;
+        self.state = .connected;
+        try self.send(self.identify_msg);
         try self.recv();
+        log.debug("lookupd {} connected", .{self.address});
     }
 
     fn send(self: *Self, buf: []const u8) !void {
+        assert(self.send_op == null);
         self.send_op = try self.io.send(self.socket, buf, self, sent, sendFailed);
+    }
+
+    fn ping(self: *Self) Error!void {
+        if (self.send_op == null) try self.send(ping_msg);
     }
 
     fn sent(self: *Self, _: usize) Error!void {
         self.send_op = null;
-        self.count += 1;
     }
 
     fn sendFailed(self: *Self, err: anyerror) Error!void {
         self.send_op = null;
-        self.err = err;
-        try self.close();
+        switch (err) {
+            error.BrokenPipe, error.ConnectionResetByPeer => {},
+            else => log.err("{} send failed {}", .{ self.socket, err }),
+        }
+        if (self.state == .connected) self.state = .disconnected;
     }
 
     fn recv(self: *Self) !void {
@@ -1078,10 +1193,11 @@ const LookupConn = struct {
             error.ConnectionResetByPeer => {},
             else => log.err("{} recv failed {}", .{ self.socket, err }),
         }
-        try self.close();
+        if (self.state == .connected) self.state = .disconnected;
     }
 
     pub fn close(self: *Self) !void {
+        self.state = .closing;
         if (self.send_op) |op| {
             try op.cancel();
             return;
@@ -1090,8 +1206,14 @@ const LookupConn = struct {
             try op.cancel();
             op.unsubscribe(self);
         }
-        try self.io.close(self.socket);
+        if (self.ticker_op) |op| {
+            try op.cancel();
+            op.unsubscribe(self);
+        }
+        if (self.socket > 0)
+            try self.io.close(self.socket);
         log.debug("{} close", .{self.socket});
+        self.state = .closed;
     }
 };
 
@@ -1104,36 +1226,32 @@ test "lookup connect" {
     defer io.deinit();
 
     const address = try std.net.Address.parseIp4("127.0.0.1", 4160);
-    const socket = try posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
 
-    var conn = LookupConn.init(testing.allocator, &io, socket);
-    try conn.connect(address);
+    const identify = "  V1IDENTIFY\n\x00\x00\x00\x63{\"broadcast_address\":\"hydra\",\"hostname\":\"hydra\",\"http_port\":4151,\"tcp_port\":4150,\"version\":\"1.3.0\"}";
+
+    var conn = LookupConn.init(testing.allocator, &io, address, identify);
+    try conn.connect();
     defer conn.deinit();
+    try testing.expectEqual(.connecting, conn.state);
+    try io.tick();
+    try io.tick();
+    try testing.expectEqual(.connected, conn.state);
 
     try io.tick();
-    try testing.expect(conn.err == null);
-    try testing.expectEqual(1, conn.count);
-
-    var buf: []const u8 = "  V1";
-    try conn.send(buf);
     try io.tick();
-    try testing.expectEqual(2, conn.count);
 
-    buf = "IDENTIFY\n\x00\x00\x00\x63{\"broadcast_address\":\"hydra\",\"hostname\":\"hydra\",\"http_port\":4151,\"tcp_port\":4150,\"version\":\"1.3.0\"}";
-    try conn.send(buf);
-    try io.tick();
-    try testing.expectEqual(3, conn.count);
-
-    buf = "REGISTER pero zdero\n";
-    try conn.send(buf);
-    try io.tick();
-    try testing.expectEqual(4, conn.count);
-
-    buf = "REGISTER jozo bozomiste---!riozo\n";
+    var buf: []const u8 = "REGISTER pero zdero\n";
     try conn.send(buf);
     try io.tick();
     try io.tick();
-    try testing.expectEqual(5, conn.count);
+
+    buf = "REGISTER jozo bozomisteriozo\n";
+    try conn.send(buf);
+    try io.tick();
+    try io.tick();
+
+    // try conn.close();
+    // try testing.expectEqual(.closed, conn.state);
 
     try io.drain();
 }
