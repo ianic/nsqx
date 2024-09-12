@@ -56,7 +56,14 @@ pub fn SimpleTopic(
                 state.deinit(self.allocator);
                 _ = self.consumers.remove(consumer);
             }
-            if (self.consumers.count() == 0) self.last = null;
+            self.checkLast();
+        }
+
+        fn checkLast(self: *Self) void {
+            if (self.last) |last| if (last.rc == 1) {
+                last.unbox(self.allocator);
+                self.last = null;
+            };
         }
 
         pub fn init(allocator: std.mem.Allocator) Self {
@@ -72,16 +79,15 @@ pub fn SimpleTopic(
                 while (iter.next()) |e| e.value_ptr.deinit(self.allocator);
             }
             self.consumers.deinit();
+            if (self.last) |last| last.unbox(self.allocator);
         }
 
         pub fn next(self: *Self, consumer: *Consumer) ?*Data {
             if (self.consumers.getPtr(consumer)) |state| {
                 if (state.current) |node| {
-                    if (self.last) |last| if (node == last and node.rc == 1) {
-                        self.last = null;
-                    };
                     node.unbox(self.allocator);
                     state.current = null;
+                    self.checkLast();
                 }
                 if (state.next) |node| {
                     state.next = Node.box(node.next);
@@ -100,8 +106,11 @@ pub fn SimpleTopic(
             const node = try self.allocator.create(Node);
             node.* = Node{ .data = data, .rc = 0 };
 
-            if (self.last) |last| last.next = Node.box(node);
-            self.last = node;
+            if (self.last) |last| {
+                last.unbox(self.allocator);
+                last.next = Node.box(node);
+            }
+            self.last = Node.box(node);
             try self.notify(node);
         }
 
@@ -201,4 +210,41 @@ test SimpleTopic {
     // topic.deinit should deallocate nodes and data
     try addNode(&topic, 48);
     try addNode(&topic, 49);
+}
+
+test "unsubscribe nulls last" {
+    var topic = SimpleTopic(usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
+    defer topic.deinit();
+
+    var c1 = TestConsumer{};
+    try topic.subscribe(&c1);
+
+    var c2 = TestConsumer{};
+    try topic.subscribe(&c2);
+
+    try addNode(&topic, 42);
+    try addNode(&topic, 43);
+    try addNode(&topic, 44);
+    {
+        try testing.expectEqual(42, topic.next(&c1).?.*);
+        try testing.expectEqual(43, topic.next(&c1).?.*);
+        try testing.expectEqual(44, topic.next(&c1).?.*);
+        try testing.expect(topic.next(&c1) == null);
+    }
+    try testing.expectEqual(42, topic.next(&c2).?.*);
+    {
+        // Unsubscribe of the last consumer which holds references releases all
+        // nodes, and nulls last.
+        try testing.expectEqual(44, topic.last.?.data.*);
+        topic.unsubscribe(&c2);
+        try testing.expect(topic.last == null);
+    }
+
+    { // Next of last consumer also nulls last
+        try addNode(&topic, 45);
+        try testing.expectEqual(45, topic.next(&c1).?.*);
+        try testing.expectEqual(45, topic.last.?.data.*);
+        try testing.expect(topic.next(&c1) == null);
+        try testing.expect(topic.last == null);
+    }
 }
