@@ -6,6 +6,7 @@ const Options = @import("protocol.zig").Options;
 const Io = @import("io.zig").Io;
 const tcp = @import("tcp.zig");
 const http = @import("http.zig");
+const lookup = @import("lookup.zig");
 
 // pub const std_options = std.Options{
 //     .log_level = .info,
@@ -34,7 +35,10 @@ pub fn main() !void {
     );
     defer io.deinit();
 
-    var server = tcp.Server.init(allocator, &io);
+    var lookup_connector = lookup.Connector.init(allocator);
+    defer lookup_connector.deinit();
+
+    var server = tcp.Server.init(allocator, &io, &lookup_connector);
     defer server.deinit();
 
     var tcp_listener = try tcp.Listener.init(allocator, &io, &server, options);

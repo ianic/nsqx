@@ -127,7 +127,7 @@ test {
     _ = TopicMsgList;
 }
 
-pub fn ServerType(Consumer: type, Io: type) type {
+pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
     return struct {
         const Server = @This();
         const Topic = TopicType();
@@ -137,13 +137,15 @@ pub fn ServerType(Consumer: type, Io: type) type {
         topics: std.StringHashMap(*Topic),
         started_at: u64,
         io: *Io,
+        notifier: *Notifier,
 
-        pub fn init(allocator: mem.Allocator, io: *Io) Server {
+        pub fn init(allocator: mem.Allocator, io: *Io, notifier: *Notifier) Server {
             return .{
                 .allocator = allocator,
                 .topics = std.StringHashMap(*Topic).init(allocator),
                 .started_at = io.now(),
                 .io = io,
+                .notifier = notifier,
             };
         }
 
@@ -160,11 +162,13 @@ pub fn ServerType(Consumer: type, Io: type) type {
         fn createTopic(self: *Server, name: []const u8) !*Topic {
             const topic = try self.allocator.create(Topic);
             errdefer self.allocator.destroy(topic);
-            topic.* = Topic.init(self.allocator, self);
             const key = try self.allocator.dupe(u8, name);
             errdefer self.allocator.free(key);
+
+            topic.* = Topic.init(self.allocator, self, key);
             try self.topics.put(key, topic);
             log.debug("created topic {s}", .{name});
+            try self.notifier.topicCreated(key);
             return topic;
         }
 
@@ -186,7 +190,9 @@ pub fn ServerType(Consumer: type, Io: type) type {
         pub fn deinit(self: *Server) void {
             var iter = self.topics.iterator();
             while (iter.next()) |e| {
+                const key = e.key_ptr.*;
                 const topic = e.value_ptr.*;
+                self.notifier.topicDeleted(key) catch {};
                 topic.deinit();
                 self.allocator.destroy(topic);
                 self.allocator.free(e.key_ptr.*);
@@ -207,6 +213,7 @@ pub fn ServerType(Consumer: type, Io: type) type {
         fn TopicType() type {
             return struct {
                 allocator: mem.Allocator,
+                name: []const u8,
                 server: *Server,
                 messages: TopicMsgList,
                 channels: std.StringHashMap(*Channel),
@@ -214,9 +221,10 @@ pub fn ServerType(Consumer: type, Io: type) type {
                 next: ?*TopicMsg = null,
                 fin_count: usize = 0, // fin's in channels
 
-                pub fn init(allocator: mem.Allocator, server: *Server) Topic {
+                pub fn init(allocator: mem.Allocator, server: *Server, name: []const u8) Topic {
                     return .{
                         .allocator = allocator,
+                        .name = name,
                         .channels = std.StringHashMap(*Channel).init(allocator),
                         .messages = .{},
                         .server = server,
@@ -241,13 +249,15 @@ pub fn ServerType(Consumer: type, Io: type) type {
                 fn createChannel(self: *Topic, name: []const u8) !*Channel {
                     const channel = try self.allocator.create(Channel);
                     errdefer self.allocator.destroy(channel);
-                    channel.* = Channel.init(self.allocator, self);
-                    channel.initTimer(self.server.io);
                     const key = try self.allocator.dupe(u8, name);
                     errdefer self.allocator.free(key);
+
+                    channel.* = Channel.init(self.allocator, self);
+                    channel.initTimer(self.server.io);
                     try self.channels.put(key, channel);
 
-                    log.debug("created channel {s}", .{name});
+                    log.debug("created topic {s} channel {s}", .{ self.name, key });
+                    try self.server.notifier.channelCreated(self.name, key);
                     return channel;
                 }
 
@@ -255,7 +265,9 @@ pub fn ServerType(Consumer: type, Io: type) type {
                     {
                         var iter = self.channels.iterator();
                         while (iter.next()) |e| {
+                            const key = e.key_ptr.*;
                             const channel = e.value_ptr.*;
+                            self.server.notifier.channelDeleted(self.name, key) catch {};
                             channel.deinit();
                             self.allocator.destroy(channel);
                             self.allocator.free(e.key_ptr.*);
@@ -642,7 +654,8 @@ test "channel consumers iterator" {
     const allocator = testing.allocator;
 
     var io = TestIo{};
-    var server = TestServer.init(allocator, &io);
+    var notifier = NoopNotifier{};
+    var server = TestServer.init(allocator, &io, &notifier);
     defer server.deinit();
 
     var consumer1 = TestConsumer.init(allocator);
@@ -680,7 +693,8 @@ test "channel fin req" {
     const channel_name = "channel";
 
     var io = TestIo{};
-    var server = TestServer.init(allocator, &io);
+    var notifier = NoopNotifier{};
+    var server = TestServer.init(allocator, &io, &notifier);
     defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -869,7 +883,15 @@ const TestTimer = struct {
     const no_timeout: u64 = @import("io.zig").Io.Timer.no_timeout;
 };
 
-const TestServer = ServerType(TestConsumer, TestIo);
+const NoopNotifier = struct {
+    const Self = @This();
+    fn topicCreated(_: *Self, _: []const u8) !void {}
+    fn channelCreated(_: *Self, _: []const u8, _: []const u8) !void {}
+    fn topicDeleted(_: *Self, _: []const u8) !void {}
+    fn channelDeleted(_: *Self, _: []const u8, _: []const u8) !void {}
+};
+
+const TestServer = ServerType(TestConsumer, TestIo, NoopNotifier);
 
 test "multiple channels" {
     const allocator = testing.allocator;
@@ -879,7 +901,8 @@ test "multiple channels" {
     const no = 1024;
 
     var io = TestIo{};
-    var server = TestServer.init(allocator, &io);
+    var notifier = NoopNotifier{};
+    var server = TestServer.init(allocator, &io, &notifier);
     defer server.deinit();
 
     var c1 = TestConsumer.init(allocator);
@@ -948,7 +971,8 @@ test "first channel gets all messages accumulated in topic" {
     const no = 16;
 
     var io = TestIo{};
-    var server = TestServer.init(allocator, &io);
+    var notifier = NoopNotifier{};
+    var server = TestServer.init(allocator, &io, &notifier);
     defer server.deinit();
     // publish messages to the topic which don't have channels created
     for (0..no) |_|
@@ -983,7 +1007,8 @@ test "timeout messages" {
     const no = 4;
 
     var io = TestIo{};
-    var server = TestServer.init(allocator, &io);
+    var notifier = NoopNotifier{};
+    var server = TestServer.init(allocator, &io, &notifier);
     defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1047,7 +1072,8 @@ test "deferred messages" {
     const channel_name = "channel";
 
     var io = TestIo{};
-    var server = TestServer.init(allocator, &io);
+    var notifier = NoopNotifier{};
+    var server = TestServer.init(allocator, &io, &notifier);
     defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1083,6 +1109,77 @@ test "deferred messages" {
         try testing.expectEqual(2, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
     }
+}
+
+const TestNotifier = struct {
+    const Self = @This();
+    const Registration = union(enum) { topic: []const u8, channel: struct {
+        topic_name: []const u8,
+        name: []const u8,
+    } };
+
+    registrations: std.ArrayList(Registration),
+    fn init(allocator: std.mem.Allocator) Self {
+        return .{
+            .registrations = std.ArrayList(Registration).init(allocator),
+        };
+    }
+    fn deinit(self: *Self) void {
+        self.registrations.deinit();
+    }
+    fn topicCreated(self: *Self, name: []const u8) !void {
+        try self.registrations.append(.{ .topic = name });
+    }
+    fn channelCreated(self: *Self, topic_name: []const u8, name: []const u8) !void {
+        try self.registrations.append(.{ .channel = .{ .topic_name = topic_name, .name = name } });
+    }
+    fn topicDeleted(self: *Self, name: []const u8) !void {
+        for (self.registrations.items, 0..) |reg, i| {
+            if (reg == .topic) {
+                if (reg.topic.ptr == name.ptr) {
+                    _ = self.registrations.swapRemove(i);
+                    return;
+                }
+            }
+        }
+    }
+    fn channelDeleted(self: *Self, topic_name: []const u8, name: []const u8) !void {
+        for (self.registrations.items, 0..) |reg, i| {
+            if (reg == .channel) {
+                if (reg.channel.topic_name.ptr == topic_name.ptr and
+                    reg.channel.name.ptr == name.ptr)
+                {
+                    _ = self.registrations.swapRemove(i);
+                    return;
+                }
+            }
+        }
+    }
+};
+
+test "notifier" {
+    const allocator = testing.allocator;
+
+    var io = TestIo{};
+    var notifier = TestNotifier.init(allocator);
+    defer notifier.deinit();
+    const Server = ServerType(TestConsumer, TestIo, TestNotifier);
+    var server = Server.init(allocator, &io, &notifier);
+
+    var consumer = TestConsumer.init(allocator);
+    defer consumer.deinit();
+    _ = try server.sub(&consumer, "topic1", "channel1");
+    try testing.expectEqual(2, notifier.registrations.items.len);
+
+    _ = try server.sub(&consumer, "topic1", "channel2");
+    try testing.expectEqual(3, notifier.registrations.items.len);
+
+    _ = try server.sub(&consumer, "topic2", "channel2");
+    try testing.expectEqual(5, notifier.registrations.items.len);
+
+    // test deletes
+    server.deinit();
+    try testing.expectEqual(0, notifier.registrations.items.len);
 }
 
 // Linked list of topic messages
