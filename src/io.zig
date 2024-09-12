@@ -38,6 +38,7 @@ pub const Io = struct {
 
         all: Counter = .{},
         accept: Counter = .{},
+        connect: Counter = .{},
         close: Counter = .{},
         recv: Counter = .{},
         writev: Counter = .{},
@@ -86,10 +87,11 @@ pub const Io = struct {
             self.all.submit();
             switch (op.args) {
                 .accept => self.accept.submit(),
+                .connect => self.connect.submit(),
                 .close => self.close.submit(),
                 .recv => self.recv.submit(),
                 .writev => self.writev.submit(),
-                .sendv => self.sendv.submit(),
+                .send, .sendv => self.sendv.submit(),
                 .ticker, .timer => self.ticker.submit(),
             }
         }
@@ -98,10 +100,11 @@ pub const Io = struct {
             self.all.complete();
             switch (op.args) {
                 .accept => self.accept.complete(),
+                .connect => self.connect.complete(),
                 .close => self.close.complete(),
                 .recv => self.recv.complete(),
                 .writev => self.writev.complete(),
-                .sendv => self.sendv.complete(),
+                .send, .sendv => self.sendv.complete(),
                 .ticker, .timer => self.ticker.complete(),
             }
         }
@@ -110,10 +113,11 @@ pub const Io = struct {
             self.all.restart();
             switch (op.args) {
                 .accept => self.accept.restart(),
+                .connect => self.connect.restart(),
                 .close => self.close.restart(),
                 .recv => self.recv.restart(),
                 .writev => self.writev.restart(),
-                .sendv => self.sendv.restart(),
+                .send, .sendv => self.sendv.restart(),
                 .ticker, .timer => self.ticker.restart(),
             }
         }
@@ -165,6 +169,20 @@ pub const Io = struct {
         return op;
     }
 
+    pub fn connect(
+        self: *Io,
+        socket: socket_t,
+        addr: std.net.Address,
+        context: anytype,
+        comptime connected: fn (@TypeOf(context)) Error!void,
+        comptime failed: fn (@TypeOf(context), anyerror) Error!void,
+    ) !*Op {
+        const op = try self.acquire();
+        op.* = Op.connect(self, socket, addr, context, connected, failed);
+        try op.prep();
+        return op;
+    }
+
     pub fn recv(
         self: *Io,
         socket: socket_t,
@@ -202,6 +220,20 @@ pub const Io = struct {
     ) !*Op {
         const op = try self.acquire();
         op.* = Op.sendv(self, socket, msghdr, context, sent, failed);
+        try op.prep();
+        return op;
+    }
+
+    pub fn send(
+        self: *Io,
+        socket: socket_t,
+        buf: []const u8,
+        context: anytype,
+        comptime sent: fn (@TypeOf(context), usize) Error!void,
+        comptime failed: fn (@TypeOf(context), anyerror) Error!void,
+    ) !*Op {
+        const op = try self.acquire();
+        op.* = Op.send(self, socket, buf, context, sent, failed);
         try op.prep();
         return op;
     }
@@ -425,6 +457,10 @@ pub const Op = struct {
             addr: posix.sockaddr align(4) = undefined,
             addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
         },
+        connect: struct {
+            socket: socket_t,
+            addr: std.net.Address,
+        },
         close: socket_t,
         recv: socket_t,
         writev: struct {
@@ -435,16 +471,22 @@ pub const Op = struct {
             socket: socket_t,
             msghdr: *posix.msghdr_const,
         },
+        send: struct {
+            socket: socket_t,
+            buf: []const u8,
+        },
         ticker: linux.kernel_timespec,
         timer: linux.kernel_timespec,
     };
 
     const Kind = enum {
         accept,
+        connect,
         close,
         recv,
         writev,
         sendv,
+        send,
         ticker,
         timer,
     };
@@ -466,10 +508,12 @@ pub const Op = struct {
         const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
         switch (op.args) {
             .accept => |*arg| _ = try op.io.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),
+            .connect => |*arg| _ = try op.io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen()),
             .close => |socket| _ = try op.io.ring.close(@intFromPtr(op), socket),
             .recv => |socket| _ = try op.io.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
             .writev => |*arg| _ = try op.io.ring.writev(@intFromPtr(op), arg.socket, arg.vec, 0),
             .sendv => |*arg| _ = try op.io.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
+            .send => |*arg| _ = try op.io.ring.send(@intFromPtr(op), arg.socket, arg.buf, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
             .ticker => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, IORING_TIMEOUT_MULTISHOT),
             .timer => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, 0),
         }
@@ -513,6 +557,34 @@ pub const Op = struct {
             .context = @intFromPtr(context),
             .callback = wrapper.complete,
             .args = .{ .accept = .{ .socket = socket } },
+        };
+    }
+
+    fn connect(
+        io: *Io,
+        socket: socket_t,
+        addr: std.net.Address,
+        context: anytype,
+        comptime connected: fn (@TypeOf(context)) Error!void,
+        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
+    ) Op {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
+                const ctx: Context = @ptrFromInt(op.context);
+                switch (cqe.err()) {
+                    .SUCCESS => try connected(ctx),
+                    .INTR => return .restart,
+                    else => |errno| try fail(ctx, errFromErrno(errno)),
+                }
+                return .done;
+            }
+        };
+        return .{
+            .io = io,
+            .context = @intFromPtr(context),
+            .callback = wrapper.complete,
+            .args = .{ .connect = .{ .socket = socket, .addr = addr } },
         };
     }
 
@@ -615,7 +687,7 @@ pub const Op = struct {
                     .SUCCESS => {
                         const n: usize = @intCast(cqe.res);
 
-                        // zero send handling
+                        // zero copy send handling
                         // if (cqe.flags & linux.IORING_CQE_F_MORE > 0) {
                         //     log.debug("{} send_zc f_more {}", .{ op.args.sendv.socket, n });
                         //     return .has_more;
@@ -657,6 +729,44 @@ pub const Op = struct {
             .callback = wrapper.complete,
             .args = .{
                 .sendv = .{ .socket = socket, .msghdr = msghdr },
+            },
+        };
+    }
+
+    fn send(
+        io: *Io,
+        socket: socket_t,
+        buf: []const u8,
+        context: anytype,
+        comptime sent: fn (@TypeOf(context), usize) Error!void,
+        comptime failed: fn (@TypeOf(context), anyerror) Error!void,
+    ) Op {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
+                const ctx: Context = @ptrFromInt(op.context);
+                switch (cqe.err()) {
+                    .SUCCESS => {
+                        const n: usize = @intCast(cqe.res);
+                        const send_buf = op.args.send.buf;
+                        if (n < send_buf.len) {
+                            op.args.send.buf = send_buf[n..];
+                            return .restart;
+                        }
+                        try sent(ctx, n);
+                    },
+                    .INTR => return .restart,
+                    else => |errno| try failed(ctx, errFromErrno(errno)),
+                }
+                return .done;
+            }
+        };
+        return .{
+            .io = io,
+            .context = @intFromPtr(context),
+            .callback = wrapper.complete,
+            .args = .{
+                .send = .{ .socket = socket, .buf = buf },
             },
         };
     }
@@ -842,6 +952,149 @@ fn unixMilli() i64 {
     return ts.sec * 1000 + @divTrunc(ts.nsec, ns_per_ms);
 }
 
+const RecvBuf = struct {
+    allocator: mem.Allocator,
+    buf: []u8 = &.{},
+
+    const Self = @This();
+
+    fn init(allocator: std.mem.Allocator) Self {
+        return .{ .allocator = allocator };
+    }
+
+    fn append(self: *Self, bytes: []const u8) ![]const u8 {
+        if (self.buf.len == 0) return bytes;
+        const old_len = self.buf.len;
+        self.buf = try self.allocator.realloc(self.buf, old_len + bytes.len);
+        @memcpy(self.buf[old_len..], bytes);
+        return self.buf;
+    }
+
+    fn set(self: *Self, bytes: []const u8) !void {
+        if (self.buf.len == bytes.len) return;
+        const new_buf = try self.allocator.dupe(u8, bytes);
+        self.free();
+        self.buf = new_buf;
+    }
+
+    fn free(self: *Self) void {
+        self.allocator.free(self.buf);
+        self.buf = &.{};
+    }
+};
+
+const LookupConn = struct {
+    allocator: mem.Allocator,
+    recv_buf: RecvBuf,
+    count: usize = 0,
+    err: ?anyerror = null,
+    socket: socket_t,
+    //address: std.net.Address,
+    io: *Io,
+    send_op: ?*Op = null,
+    recv_op: ?*Op = null,
+    const Self = @This();
+
+    fn init(allocator: std.mem.Allocator, io: *Io, socket: socket_t) Self {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .socket = socket,
+            .recv_buf = RecvBuf.init(allocator),
+        };
+    }
+
+    fn deinit(self: *Self) void {
+        self.recv_buf.free();
+    }
+
+    pub fn connect(self: *Self, address: std.net.Address) !void {
+        _ = try self.io.connect(self.socket, address, self, connected, connectFailed);
+    }
+
+    fn connectFailed(self: *Self, err: anyerror) Error!void {
+        self.err = err;
+    }
+
+    fn connected(self: *Self) Error!void {
+        std.debug.print("connected\n", .{});
+        self.count += 1;
+        try self.recv();
+    }
+
+    fn send(self: *Self, buf: []const u8) !void {
+        self.send_op = try self.io.send(self.socket, buf, self, sent, sendFailed);
+    }
+
+    fn sent(self: *Self, _: usize) Error!void {
+        self.send_op = null;
+        self.count += 1;
+    }
+
+    fn sendFailed(self: *Self, err: anyerror) Error!void {
+        self.send_op = null;
+        self.err = err;
+        try self.close();
+    }
+
+    fn recv(self: *Self) !void {
+        self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
+    }
+
+    fn received(self: *Self, bytes: []const u8) Error!void {
+        var buf = try self.recv_buf.append(bytes);
+
+        while (true) {
+            if (buf.len < 4) break;
+            const n = mem.readInt(u32, buf[0..4], .big);
+            const msg_buf = buf[4..];
+            if (msg_buf.len < n) break;
+            const msg = msg_buf[0..n];
+            buf = buf[4 + msg.len ..];
+
+            if (msg.len == 2 and msg[0] == 'O' and msg[1] == 'K') {
+                // OK most common case
+                continue;
+            }
+            if (msg[0] == '{' and msg[msg.len - 1] == '}') {
+                // identify response
+                log.debug("{} identify: {s}", .{ self.socket, msg });
+                continue;
+            }
+            // error
+            log.warn("{} {s}", .{ self.socket, msg });
+        }
+
+        if (buf.len > 0)
+            try self.recv_buf.set(buf)
+        else
+            self.recv_buf.free();
+    }
+
+    fn recvFailed(self: *Self, err: anyerror) Error!void {
+        self.recv_op = null;
+        switch (err) {
+            error.EndOfFile => {},
+            error.ConnectionResetByPeer => {},
+            else => log.err("{} recv failed {}", .{ self.socket, err }),
+        }
+        try self.close();
+    }
+
+    pub fn close(self: *Self) !void {
+        if (self.send_op) |op| {
+            try op.cancel();
+            return;
+        }
+        if (self.recv_op) |op| {
+            try op.cancel();
+            op.unsubscribe(self);
+        }
+        try self.io.close(self.socket);
+        log.debug("{} close", .{self.socket});
+    }
+};
+
 test "lookup connect" {
     //if (true) return error.SkipZigTest;
 
@@ -850,105 +1103,37 @@ test "lookup connect" {
     try io.init(4, 2, 1024);
     defer io.deinit();
 
-    const Ctx = struct {
-        count: usize = 0,
-        err: ?anyerror = null,
-        socket: socket_t,
-        io: *Io,
-        send_vec: [2]posix.iovec_const = undefined,
-        send_msghdr: posix.msghdr_const = .{ .iov = undefined, .iovlen = 1, .name = null, .namelen = 0, .control = null, .controllen = 0, .flags = 0 },
-        send_op: ?*Op = null,
-        recv_op: ?*Op = null,
-        const Self = @This();
-        fn connected(self: *Self) Error!void {
-            std.debug.print("connected\n", .{});
-            self.count += 1;
-        }
-        fn send(self: *Self, header: []const u8, body: []const u8) !void {
-            self.send_vec[0] = .{ .base = header.ptr, .len = header.len };
-            self.send_vec[1] = .{ .base = body.ptr, .len = body.len };
-            self.send_msghdr.iov = &self.send_vec;
-            self.send_msghdr.iovlen = 2;
-            self.send_op = try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed);
-        }
-        fn sent(self: *Self, n: usize) Error!void {
-            std.debug.print("sent {}\n", .{n});
-            self.send_op = null;
-            self.count += 1;
-        }
-        fn sendFailed(self: *Self, err: anyerror) Error!void {
-            self.send_op = null;
-            self.err = err;
-            try self.close();
-        }
-        fn connectFailed(self: *Self, err: anyerror) Error!void {
-            self.err = err;
-        }
-        pub fn recv(self: *Self) !void {
-            self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
-        }
-
-        fn received(self: *Self, bytes: []const u8) Error!void {
-            _ = self;
-            std.debug.print("received {s}\n", .{bytes});
-        }
-
-        fn recvFailed(self: *Self, err: anyerror) Error!void {
-            self.recv_op = null;
-            switch (err) {
-                error.EndOfFile => {},
-                error.ConnectionResetByPeer => {},
-                else => log.err("{} recv failed {}", .{ self.socket, err }),
-            }
-            try self.close();
-        }
-
-        pub fn close(self: *Self) !void {
-            if (self.send_op) |op| {
-                try op.cancel();
-                return;
-            }
-            if (self.recv_op) |op| {
-                try op.cancel();
-                op.unsubscribe(self);
-            }
-            try self.io.close(self.socket);
-            log.debug("{} close", .{self.socket});
-        }
-    };
-
     const address = try std.net.Address.parseIp4("127.0.0.1", 4160);
     const socket = try posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
 
-    var ctx = Ctx{ .socket = socket, .io = &io };
-    _ = try io.connect(socket, address, &ctx, Ctx.connected, Ctx.connectFailed);
+    var conn = LookupConn.init(testing.allocator, &io, socket);
+    try conn.connect(address);
+    defer conn.deinit();
 
     try io.tick();
+    try testing.expect(conn.err == null);
+    try testing.expectEqual(1, conn.count);
 
-    try testing.expect(ctx.err == null);
-    try testing.expectEqual(1, ctx.count);
-
-    var header: []const u8 = "  V1";
-    var body: []const u8 = "";
-    try ctx.send(header, body);
-    try ctx.recv();
-
+    var buf: []const u8 = "  V1";
+    try conn.send(buf);
     try io.tick();
-    try testing.expectEqual(2, ctx.count);
+    try testing.expectEqual(2, conn.count);
 
-    header = "IDENTIFY\n";
-    body = "\x00\x00\x00\x63{\"broadcast_address\":\"hydra\",\"hostname\":\"hydra\",\"http_port\":4151,\"tcp_port\":4150,\"version\":\"1.3.0\"}";
-    try ctx.send(header, body);
-
+    buf = "IDENTIFY\n\x00\x00\x00\x63{\"broadcast_address\":\"hydra\",\"hostname\":\"hydra\",\"http_port\":4151,\"tcp_port\":4150,\"version\":\"1.3.0\"}";
+    try conn.send(buf);
     try io.tick();
-    try testing.expectEqual(3, ctx.count);
+    try testing.expectEqual(3, conn.count);
 
-    header = "REGISTER ";
-    body = "pero zdero\n";
-    try ctx.send(header, body);
-
+    buf = "REGISTER pero zdero\n";
+    try conn.send(buf);
     try io.tick();
-    try testing.expectEqual(4, ctx.count);
+    try testing.expectEqual(4, conn.count);
+
+    buf = "REGISTER jozo bozomiste---!riozo\n";
+    try conn.send(buf);
+    try io.tick();
+    try io.tick();
+    try testing.expectEqual(5, conn.count);
 
     try io.drain();
 }
