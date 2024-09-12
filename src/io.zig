@@ -841,3 +841,114 @@ fn unixMilli() i64 {
     };
     return ts.sec * 1000 + @divTrunc(ts.nsec, ns_per_ms);
 }
+
+test "lookup connect" {
+    //if (true) return error.SkipZigTest;
+
+    const allocator = testing.allocator;
+    var io = Io{ .allocator = allocator };
+    try io.init(4, 2, 1024);
+    defer io.deinit();
+
+    const Ctx = struct {
+        count: usize = 0,
+        err: ?anyerror = null,
+        socket: socket_t,
+        io: *Io,
+        send_vec: [2]posix.iovec_const = undefined,
+        send_msghdr: posix.msghdr_const = .{ .iov = undefined, .iovlen = 1, .name = null, .namelen = 0, .control = null, .controllen = 0, .flags = 0 },
+        send_op: ?*Op = null,
+        recv_op: ?*Op = null,
+        const Self = @This();
+        fn connected(self: *Self) Error!void {
+            std.debug.print("connected\n", .{});
+            self.count += 1;
+        }
+        fn send(self: *Self, header: []const u8, body: []const u8) !void {
+            self.send_vec[0] = .{ .base = header.ptr, .len = header.len };
+            self.send_vec[1] = .{ .base = body.ptr, .len = body.len };
+            self.send_msghdr.iov = &self.send_vec;
+            self.send_msghdr.iovlen = 2;
+            self.send_op = try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed);
+        }
+        fn sent(self: *Self, n: usize) Error!void {
+            std.debug.print("sent {}\n", .{n});
+            self.send_op = null;
+            self.count += 1;
+        }
+        fn sendFailed(self: *Self, err: anyerror) Error!void {
+            self.send_op = null;
+            self.err = err;
+            try self.close();
+        }
+        fn connectFailed(self: *Self, err: anyerror) Error!void {
+            self.err = err;
+        }
+        pub fn recv(self: *Self) !void {
+            self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
+        }
+
+        fn received(self: *Self, bytes: []const u8) Error!void {
+            _ = self;
+            std.debug.print("received {s}\n", .{bytes});
+        }
+
+        fn recvFailed(self: *Self, err: anyerror) Error!void {
+            self.recv_op = null;
+            switch (err) {
+                error.EndOfFile => {},
+                error.ConnectionResetByPeer => {},
+                else => log.err("{} recv failed {}", .{ self.socket, err }),
+            }
+            try self.close();
+        }
+
+        pub fn close(self: *Self) !void {
+            if (self.send_op) |op| {
+                try op.cancel();
+                return;
+            }
+            if (self.recv_op) |op| {
+                try op.cancel();
+                op.unsubscribe(self);
+            }
+            try self.io.close(self.socket);
+            log.debug("{} close", .{self.socket});
+        }
+    };
+
+    const address = try std.net.Address.parseIp4("127.0.0.1", 4160);
+    const socket = try posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+
+    var ctx = Ctx{ .socket = socket, .io = &io };
+    _ = try io.connect(socket, address, &ctx, Ctx.connected, Ctx.connectFailed);
+
+    try io.tick();
+
+    try testing.expect(ctx.err == null);
+    try testing.expectEqual(1, ctx.count);
+
+    var header: []const u8 = "  V1";
+    var body: []const u8 = "";
+    try ctx.send(header, body);
+    try ctx.recv();
+
+    try io.tick();
+    try testing.expectEqual(2, ctx.count);
+
+    header = "IDENTIFY\n";
+    body = "\x00\x00\x00\x63{\"broadcast_address\":\"hydra\",\"hostname\":\"hydra\",\"http_port\":4151,\"tcp_port\":4150,\"version\":\"1.3.0\"}";
+    try ctx.send(header, body);
+
+    try io.tick();
+    try testing.expectEqual(3, ctx.count);
+
+    header = "REGISTER ";
+    body = "pero zdero\n";
+    try ctx.send(header, body);
+
+    try io.tick();
+    try testing.expectEqual(4, ctx.count);
+
+    try io.drain();
+}
