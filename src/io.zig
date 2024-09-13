@@ -218,7 +218,7 @@ pub const Io = struct {
         socket: socket_t,
         msghdr: *posix.msghdr_const,
         context: anytype,
-        comptime sent: fn (@TypeOf(context), usize) Error!void,
+        comptime sent: fn (@TypeOf(context)) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
         const op = try self.acquire();
@@ -232,7 +232,7 @@ pub const Io = struct {
         socket: socket_t,
         buf: []const u8,
         context: anytype,
-        comptime sent: fn (@TypeOf(context), usize) Error!void,
+        comptime sent: fn (@TypeOf(context)) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
         const op = try self.acquire();
@@ -701,7 +701,7 @@ pub const Op = struct {
         socket: socket_t,
         msghdr: *posix.msghdr_const,
         context: anytype,
-        comptime sent: fn (@TypeOf(context), usize) Error!void,
+        comptime sent: fn (@TypeOf(context)) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) Op {
         const Context = @TypeOf(context);
@@ -740,7 +740,7 @@ pub const Op = struct {
                             }
                         }
 
-                        try sent(ctx, n);
+                        try sent(ctx);
                     },
                     .INTR => return .restart,
                     else => |errno| try failed(ctx, errFromErrno(errno)),
@@ -763,7 +763,7 @@ pub const Op = struct {
         socket: socket_t,
         buf: []const u8,
         context: anytype,
-        comptime sent: fn (@TypeOf(context), usize) Error!void,
+        comptime sent: fn (@TypeOf(context)) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) Op {
         const Context = @TypeOf(context);
@@ -778,7 +778,7 @@ pub const Op = struct {
                             op.args.send.buf = send_buf[n..];
                             return .restart;
                         }
-                        try sent(ctx, n);
+                        try sent(ctx);
                     },
                     .INTR => return .restart,
                     else => |errno| try failed(ctx, errFromErrno(errno)),

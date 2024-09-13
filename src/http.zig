@@ -101,7 +101,7 @@ pub const Conn = struct {
         self.send_op = try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed);
     }
 
-    fn sent(self: *Conn, _: usize) Error!void {
+    fn sent(self: *Conn) Error!void {
         self.sendDeinit();
     }
 

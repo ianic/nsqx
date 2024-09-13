@@ -347,7 +347,7 @@ pub const Conn = struct {
         }
     }
 
-    fn sent(self: *Conn, _: usize) Error!void {
+    fn sent(self: *Conn) Error!void {
         self.send_op = null;
         try self.initSendVec();
         if (self.pending_response) |r| {

@@ -249,7 +249,7 @@ const Conn = struct {
         if (self.send_op == null) try self.send(ping_msg);
     }
 
-    fn sent(self: *Self, _: usize) Error!void {
+    fn sent(self: *Self) Error!void {
         self.send_op = null;
         try self.pullTopic();
     }
