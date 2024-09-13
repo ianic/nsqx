@@ -10,8 +10,8 @@ zig build
 ~/Code/go/nsq/apps/nsqlookupd/nsqlookupd &
 lookupd_pid=$!
 
-# ~/Code/go/nsq/apps/nsqlookupd/nsqlookupd -http-address localhost:4163 -tcp-address localhost:4162 &
-# lookupd_pid=$!
+# starting another lookupd
+# ~/Code/go/nsq/apps/nsqlookupd/nsqlookupd -http-address localhost:4163 -tcp-address localhost:4162  -broadcast-address localhost
 
 ~/Code/go/nsq/apps/nsqadmin/nsqadmin -lookupd-http-address localhost:4161 -lookupd-http-address localhost:4163 &
 admin_pid=$!

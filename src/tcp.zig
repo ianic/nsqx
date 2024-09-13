@@ -104,7 +104,7 @@ pub const Conn = struct {
     in_flight: u32 = 0,
     outstanding_heartbeats: u8 = 0,
 
-    recv_buf: []u8 = &.{}, // holds unprocessed bytes from previous receive
+    recv_buf: RecvBuf, // holds unprocessed bytes from previous receive
     send_header_buf: [34]u8 = undefined, // message header
     send_vec: []posix.iovec_const = &.{}, // header and body for each message
     send_msghdr: posix.msghdr_const = .{ .iov = undefined, .iovlen = undefined, .name = null, .namelen = 0, .control = null, .controllen = 0, .flags = 0 },
@@ -130,6 +130,7 @@ pub const Conn = struct {
             .io = listener.io,
             .socket = socket,
             .addr = addr,
+            .recv_buf = RecvBuf.init(listener.allocator),
         };
         conn.stat.connected_at = listener.io.timestamp;
         return conn;
@@ -190,7 +191,7 @@ pub const Conn = struct {
         const options = self.listener.options;
         var ready_changed: bool = false;
 
-        var parser = protocol.Parser{ .buf = try self.appendRecvBuf(bytes) };
+        var parser = protocol.Parser{ .buf = try self.recv_buf.append(bytes) };
         while (parser.next() catch |err| {
             log.err("{} protocol parser failed {}, un-parsed: {d}", .{ self.socket, err, parser.unparsed()[0..@min(128, parser.unparsed().len)] });
             return try self.close();
@@ -278,32 +279,12 @@ pub const Conn = struct {
 
         const unparsed = parser.unparsed();
         if (unparsed.len > 0)
-            try self.setRecvBuf(unparsed)
+            try self.recv_buf.set(unparsed)
         else
-            self.deinitRecvBuf();
+            self.recv_buf.free();
 
         if (ready_changed and self.send_op == null)
             if (self.channel) |channel| try channel.ready(self);
-    }
-
-    fn appendRecvBuf(self: *Conn, bytes: []const u8) ![]const u8 {
-        if (self.recv_buf.len == 0) return bytes;
-        const old_len = self.recv_buf.len;
-        self.recv_buf = try self.allocator.realloc(self.recv_buf, old_len + bytes.len);
-        @memcpy(self.recv_buf[old_len..], bytes);
-        return self.recv_buf;
-    }
-
-    fn setRecvBuf(self: *Conn, bytes: []const u8) !void {
-        if (self.recv_buf.len == bytes.len) return;
-        const new_buf = try self.allocator.dupe(u8, bytes);
-        self.deinitRecvBuf();
-        self.recv_buf = new_buf;
-    }
-
-    fn deinitRecvBuf(self: *Conn) void {
-        self.allocator.free(self.recv_buf);
-        self.recv_buf = &.{};
     }
 
     fn recvFailed(self: *Conn, err: anyerror) Error!void {
@@ -406,9 +387,40 @@ pub const Conn = struct {
         if (self.send_op) |op| op.unsubscribe(self);
         try self.io.close(self.socket);
 
-        self.deinitRecvBuf();
+        self.recv_buf.free();
         self.identify.deinit(self.allocator);
         self.allocator.free(self.send_vec);
         self.listener.remove(self);
+    }
+};
+
+pub const RecvBuf = struct {
+    allocator: mem.Allocator,
+    buf: []u8 = &.{},
+
+    const Self = @This();
+
+    pub fn init(allocator: mem.Allocator) Self {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn append(self: *Self, bytes: []const u8) ![]const u8 {
+        if (self.buf.len == 0) return bytes;
+        const old_len = self.buf.len;
+        self.buf = try self.allocator.realloc(self.buf, old_len + bytes.len);
+        @memcpy(self.buf[old_len..], bytes);
+        return self.buf;
+    }
+
+    pub fn set(self: *Self, bytes: []const u8) !void {
+        if (self.buf.len == bytes.len) return;
+        const new_buf = try self.allocator.dupe(u8, bytes);
+        self.free();
+        self.buf = new_buf;
+    }
+
+    pub fn free(self: *Self) void {
+        self.allocator.free(self.buf);
+        self.buf = &.{};
     }
 };

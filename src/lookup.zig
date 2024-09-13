@@ -9,6 +9,7 @@ const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
 const Topic = @import("simple_topic.zig").SimpleTopic([]const u8, Conn, Conn.pullTopic);
+const RecvBuf = @import("tcp.zig").RecvBuf;
 
 const log = std.log.scoped(.lookup);
 
@@ -323,38 +324,6 @@ const Conn = struct {
         if (self.socket > 0)
             try self.io.close(self.socket);
         self.state = .closed;
-    }
-};
-
-// TODO use in tcp also
-const RecvBuf = struct {
-    allocator: mem.Allocator,
-    buf: []u8 = &.{},
-
-    const Self = @This();
-
-    fn init(allocator: mem.Allocator) Self {
-        return .{ .allocator = allocator };
-    }
-
-    fn append(self: *Self, bytes: []const u8) ![]const u8 {
-        if (self.buf.len == 0) return bytes;
-        const old_len = self.buf.len;
-        self.buf = try self.allocator.realloc(self.buf, old_len + bytes.len);
-        @memcpy(self.buf[old_len..], bytes);
-        return self.buf;
-    }
-
-    fn set(self: *Self, bytes: []const u8) !void {
-        if (self.buf.len == bytes.len) return;
-        const new_buf = try self.allocator.dupe(u8, bytes);
-        self.free();
-        self.buf = new_buf;
-    }
-
-    fn free(self: *Self) void {
-        self.allocator.free(self.buf);
-        self.buf = &.{};
     }
 };
 
