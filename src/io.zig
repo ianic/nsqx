@@ -190,7 +190,7 @@ pub const Io = struct {
         self: *Io,
         socket: socket_t,
         context: anytype,
-        comptime received: fn (@TypeOf(context), []const u8) Error!void,
+        comptime received: fn (@TypeOf(context), []const u8) anyerror!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
         const op = try self.acquire();
@@ -461,7 +461,7 @@ const PrepError = error{
 pub const Op = struct {
     io: *Io,
     context: u64 = 0,
-    callback: *const fn (*Op, linux.io_uring_cqe) Error!CallbackResult = undefined,
+    callback: *const fn (*Op, linux.io_uring_cqe) anyerror!CallbackResult = undefined,
     args: Args,
 
     const CallbackResult = enum {
@@ -617,12 +617,12 @@ pub const Op = struct {
         io: *Io,
         socket: socket_t,
         context: anytype,
-        comptime received: fn (@TypeOf(context), []const u8) Error!void,
+        comptime received: fn (@TypeOf(context), []const u8) anyerror!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
+            fn complete(op: *Op, cqe: linux.io_uring_cqe) anyerror!CallbackResult {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {

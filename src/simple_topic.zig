@@ -14,14 +14,14 @@ pub fn SimpleTopic(
         pub const Node = struct {
             next: ?*Node = null,
             rc: usize = 0, // reference count
-            data: *Data,
+            data: Data,
 
             fn unbox(self: *Node, allocator: std.mem.Allocator) void {
                 assert(self.rc > 0);
                 const nn = self.next;
                 self.rc -= 1;
                 if (self.rc == 0) {
-                    allocator.destroy(self.data);
+                    allocator.free(self.data);
                     allocator.destroy(self);
                     if (nn) |n| n.unbox(allocator);
                 }
@@ -60,7 +60,7 @@ pub fn SimpleTopic(
             self.checkLast();
         }
 
-        pub fn setFirst(self: *Self, data: *Data) !void {
+        pub fn setFirst(self: *Self, data: Data) !void {
             self.unsetFrist();
             const node = try self.allocator.create(Node);
             node.* = .{ .data = data, .rc = 0, .next = null };
@@ -102,7 +102,7 @@ pub fn SimpleTopic(
             if (self.last) |n| n.unbox(self.allocator);
         }
 
-        pub fn next(self: *Self, consumer: *Consumer) ?*Data {
+        pub fn next(self: *Self, consumer: *Consumer) ?Data {
             if (self.consumers.getPtr(consumer)) |state| {
                 if (state.current) |node| {
                     node.unbox(self.allocator);
@@ -118,9 +118,9 @@ pub fn SimpleTopic(
             return null;
         }
 
-        pub fn append(self: *Self, data: *Data) !void {
+        pub fn append(self: *Self, data: Data) !void {
             if (self.consumers.count() == 0) {
-                self.allocator.destroy(data);
+                self.allocator.free(data);
                 return;
             }
             const node = try self.allocator.create(Node);

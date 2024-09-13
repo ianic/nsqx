@@ -35,8 +35,12 @@ pub fn main() !void {
     );
     defer io.deinit();
 
-    var lookup_connector = lookup.Connector.init(allocator);
+    var lookup_connector = lookup.Connector.init(allocator, &io);
     defer lookup_connector.deinit();
+    const lookupd1 = try std.net.Address.parseIp4("127.0.0.1", 4160);
+    const lookupd2 = try std.net.Address.parseIp4("127.0.0.1", 4162);
+    try lookup_connector.addLookupd(lookupd1);
+    try lookup_connector.addLookupd(lookupd2);
 
     var server = tcp.Server.init(allocator, &io, &lookup_connector);
     defer server.deinit();
@@ -67,6 +71,7 @@ pub fn main() !void {
 
     log.info("draining", .{});
     try server.stopTimers();
+    try lookup_connector.close();
     try http_listener.close();
     try tcp_listener.close();
     try io.drain();

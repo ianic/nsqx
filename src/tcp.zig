@@ -185,7 +185,7 @@ pub const Conn = struct {
         }
     }
 
-    fn received(self: *Conn, bytes: []const u8) Error!void {
+    fn received(self: *Conn, bytes: []const u8) !void {
         const server = self.listener.server;
         const options = self.listener.options;
         var ready_changed: bool = false;
