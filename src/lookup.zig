@@ -8,7 +8,7 @@ const testing = std.testing;
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
-const Topic = @import("simple_topic.zig").SimpleTopic([]const u8, Conn, Conn.wakeup);
+const Topic = @import("simple_topic.zig").SimpleTopic([]const u8, Conn, Conn.pullTopic);
 
 const log = std.log.scoped(.lookup);
 
@@ -25,21 +25,6 @@ pub const Connector = struct {
             return switch (self) {
                 .topic => |t| try std.fmt.allocPrint(allocator, "REGISTER {s}\n", .{t}),
                 .channel => |c| try std.fmt.allocPrint(allocator, "REGISTER {s} {s}\n", .{ c.topic_name, c.name }),
-            };
-        }
-
-        pub fn format(
-            self: Registration,
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
-            writer: anytype,
-        ) !void {
-            _ = fmt;
-            _ = options;
-
-            return switch (self) {
-                .topic => |t| try writer.print("REGISTER {s}\n", .{t}),
-                .channel => |c| try writer.print("REGISTER {s} {s}\n", .{ c.topic_name, c.name }),
             };
         }
     };
@@ -72,6 +57,7 @@ pub const Connector = struct {
         for (self.connections.items) |conn| conn.deinit();
         self.connections.deinit();
         self.allocator.free(self.identify);
+        self.topic.deinit();
     }
 
     pub fn topicCreated(self: *Self, name: []const u8) !void {
@@ -130,6 +116,7 @@ pub const Connector = struct {
         self.topic.unsubscribe(conn);
     }
 
+    // Current state for newly connected lookupd
     fn state(self: *Self) ![]const u8 {
         if (self.registrations.items.len == 0) return "";
 
@@ -157,7 +144,7 @@ const Conn = struct {
     ticker_op: ?*Op = null,
 
     const ping_msg = "PING\n";
-    const ping_interval = 5 * 1000; // in milliseconds
+    const ping_interval = 15 * 1000; // in milliseconds
 
     const State = enum {
         init,
@@ -185,8 +172,7 @@ const Conn = struct {
         self.recv_buf.free();
     }
 
-    // TODO: rename, wakeup is called after each ping's sent
-    fn wakeup(self: *Self) !void {
+    fn pullTopic(self: *Self) !void {
         if (self.send_op != null) return;
         if (self.connector.topic.next(self)) |buf| {
             try self.send(buf);
@@ -219,7 +205,7 @@ const Conn = struct {
         self.ticker_op = null;
         switch (err) {
             error.Canceled => {},
-            else => log.err("{} ticker failed {}", .{ self.socket, err }),
+            else => log.err("ticker failed {}", .{err}),
         }
     }
 
@@ -236,7 +222,7 @@ const Conn = struct {
 
     fn connectFailed(self: *Self, err: anyerror) Error!void {
         self.disconnected();
-        log.warn("lookupd {} connect failed {}", .{ self.address, err });
+        log.info("{} connect failed {}", .{ self.address, err });
     }
 
     fn connected(self: *Self) Error!void {
@@ -244,12 +230,13 @@ const Conn = struct {
         try self.send(self.connector.identify);
         try self.recv();
         try self.connector.connected(self);
-        log.debug("lookupd {} connected", .{self.address});
+        log.debug("{} connected", .{self.address});
     }
 
     fn disconnected(self: *Self) void {
         self.state = .disconnected;
         self.connector.disconnected(self);
+        log.info("{} disconnected", .{self.address});
     }
 
     fn send(self: *Self, buf: []const u8) !void {
@@ -263,14 +250,14 @@ const Conn = struct {
 
     fn sent(self: *Self, _: usize) Error!void {
         self.send_op = null;
-        try self.wakeup();
+        try self.pullTopic();
     }
 
     fn sendFailed(self: *Self, err: anyerror) Error!void {
         self.send_op = null;
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
-            else => log.err("{} send failed {}", .{ self.socket, err }),
+            else => log.err("{} send failed {}", .{ self.address, err }),
         }
         if (self.state == .connected) self.disconnected();
     }
@@ -314,7 +301,7 @@ const Conn = struct {
         switch (err) {
             error.EndOfFile => {},
             error.ConnectionResetByPeer => {},
-            else => log.err("{} recv failed {}", .{ self.socket, err }),
+            else => log.err("{} recv failed {}", .{ self.address, err }),
         }
         if (self.state == .connected) self.disconnected();
     }
@@ -335,56 +322,9 @@ const Conn = struct {
         }
         if (self.socket > 0)
             try self.io.close(self.socket);
-        log.debug("{} close", .{self.socket});
         self.state = .closed;
     }
 };
-
-test "lookup connect" {
-    //if (true) return error.SkipZigTest;
-
-    const allocator = testing.allocator;
-    var io = Io{ .allocator = allocator };
-    try io.init(4, 2, 1024);
-    defer io.deinit();
-
-    const address = try std.net.Address.parseIp4("127.0.0.1", 4160);
-
-    var connector = Connector.init(allocator, &io);
-    defer connector.deinit();
-    try connector.addLookupd(address);
-
-    try io.tick();
-    try io.tick();
-    try io.tick();
-
-    try connector.topicCreated("topic-pero");
-    try connector.channelCreated("topic-jozo", "channel-bozo");
-
-    // var conn = connector.connections.items[0];
-    // try testing.expectEqual(.connecting, conn.state);
-    // try io.tick();
-    // try io.tick();
-    // try testing.expectEqual(.connected, conn.state);
-
-    // try io.tick();
-    // try io.tick();
-
-    // var buf: []const u8 = "REGISTER pero zdero\n";
-    // try conn.send(buf);
-    // try io.tick();
-    // try io.tick();
-
-    // buf = "REGISTER jozo bozomisteriozo\n";
-    // try conn.send(buf);
-    // try io.tick();
-    // try io.tick();
-
-    // try conn.close();
-    // try testing.expectEqual(.closed, conn.state);
-
-    try io.drain();
-}
 
 // TODO use in tcp also
 const RecvBuf = struct {
@@ -418,6 +358,7 @@ const RecvBuf = struct {
     }
 };
 
+// Create lookupd version and identify message
 fn identifyMessage(
     allocator: mem.Allocator,
     broadcast_address: []const u8,
