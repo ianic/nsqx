@@ -34,6 +34,7 @@ pub fn SimpleTopic(
         };
 
         last: ?*Node = null,
+        first: ?*Node = null,
         allocator: std.mem.Allocator,
         consumers: std.AutoHashMap(*Consumer, ConsumerState),
 
@@ -48,7 +49,7 @@ pub fn SimpleTopic(
         };
 
         pub fn subscribe(self: *Self, consumer: *Consumer) !void {
-            try self.consumers.put(consumer, .{});
+            try self.consumers.put(consumer, .{ .next = Node.box(self.first) });
         }
 
         pub fn unsubscribe(self: *Self, consumer: *Consumer) void {
@@ -57,6 +58,24 @@ pub fn SimpleTopic(
                 _ = self.consumers.remove(consumer);
             }
             self.checkLast();
+        }
+
+        pub fn setFirst(self: *Self, data: *Data) !void {
+            self.unsetFrist();
+            const node = try self.allocator.create(Node);
+            node.* = .{ .data = data, .rc = 0, .next = null };
+            self.first = Node.box(node);
+        }
+
+        pub fn unsetFrist(self: *Self) void {
+            if (self.first) |n| {
+                n.unbox(self.allocator);
+                self.first = null;
+            }
+        }
+
+        pub fn hasFirst(self: *Self) bool {
+            return self.first != null;
         }
 
         fn checkLast(self: *Self) void {
@@ -79,7 +98,8 @@ pub fn SimpleTopic(
                 while (iter.next()) |e| e.value_ptr.deinit(self.allocator);
             }
             self.consumers.deinit();
-            if (self.last) |last| last.unbox(self.allocator);
+            self.unsetFrist();
+            if (self.last) |n| n.unbox(self.allocator);
         }
 
         pub fn next(self: *Self, consumer: *Consumer) ?*Data {
@@ -104,13 +124,16 @@ pub fn SimpleTopic(
                 return;
             }
             const node = try self.allocator.create(Node);
-            node.* = Node{ .data = data, .rc = 0 };
+            node.* = Node{ .data = data, .rc = 0, .next = null };
 
             if (self.last) |last| {
                 last.unbox(self.allocator);
                 last.next = Node.box(node);
             }
             self.last = Node.box(node);
+            if (self.first) |first| if (first.next == null) {
+                first.next = Node.box(node);
+            };
             try self.notify(node);
         }
 
@@ -247,4 +270,30 @@ test "unsubscribe nulls last" {
         try testing.expect(topic.next(&c1) == null);
         try testing.expect(topic.last == null);
     }
+}
+
+test "first message" {
+    var topic = SimpleTopic(usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
+    defer topic.deinit();
+
+    var c1 = TestConsumer{};
+    try topic.subscribe(&c1);
+
+    const f = try testing.allocator.create(usize);
+    f.* = 1;
+    try topic.setFirst(f);
+
+    var c2 = TestConsumer{};
+    try topic.subscribe(&c2);
+
+    try addNode(&topic, 42);
+    try testing.expectEqual(42, topic.next(&c1).?.*);
+
+    try testing.expectEqual(2, topic.first.?.rc);
+    try testing.expectEqual(1, topic.next(&c2).?.*);
+    try testing.expectEqual(42, topic.next(&c2).?.*);
+    try testing.expectEqual(1, topic.first.?.rc);
+
+    topic.unsetFrist();
+    try testing.expect(topic.first == null);
 }
