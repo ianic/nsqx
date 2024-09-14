@@ -15,6 +15,11 @@ const ns_per_s = std.time.ns_per_s;
 
 const log = std.log.scoped(.io);
 
+pub const Error = error{
+    OutOfMemory,
+    SubmissionQueueFull,
+};
+
 pub const Io = struct {
     allocator: mem.Allocator,
     ring: IoUring = undefined,
@@ -190,7 +195,7 @@ pub const Io = struct {
         self: *Io,
         socket: socket_t,
         context: anytype,
-        comptime received: fn (@TypeOf(context), []const u8) anyerror!void,
+        comptime received: fn (@TypeOf(context), []const u8) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
         const op = try self.acquire();
@@ -448,20 +453,10 @@ fn flagMore(cqe: linux.io_uring_cqe) bool {
     return cqe.flags & linux.IORING_CQE_F_MORE > 0;
 }
 
-pub const Error = error{
-    OutOfMemory,
-    SubmissionQueueFull,
-    NoBufferSelected,
-};
-
-const PrepError = error{
-    SubmissionQueueFull,
-};
-
 pub const Op = struct {
     io: *Io,
     context: u64 = 0,
-    callback: *const fn (*Op, linux.io_uring_cqe) anyerror!CallbackResult = undefined,
+    callback: *const fn (*Op, linux.io_uring_cqe) Error!CallbackResult = undefined,
     args: Args,
 
     const CallbackResult = enum {
@@ -527,7 +522,7 @@ pub const Op = struct {
             op.context = 0;
     }
 
-    fn prep(op: *Op) PrepError!void {
+    fn prep(op: *Op) !void {
         op.io.stat.submit(op);
         const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
         switch (op.args) {
@@ -617,12 +612,12 @@ pub const Op = struct {
         io: *Io,
         socket: socket_t,
         context: anytype,
-        comptime received: fn (@TypeOf(context), []const u8) anyerror!void,
+        comptime received: fn (@TypeOf(context), []const u8) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) anyerror!CallbackResult {
+            fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
@@ -632,7 +627,7 @@ pub const Op = struct {
                             return .done;
                         }
 
-                        const buffer_id = try cqe.buffer_id();
+                        const buffer_id = cqe.buffer_id() catch unreachable;
                         const bytes = op.io.recv_buf_grp.get(buffer_id)[0..n];
                         defer op.io.recv_buf_grp.put(buffer_id);
                         try received(ctx, bytes);

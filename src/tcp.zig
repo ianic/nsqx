@@ -186,105 +186,101 @@ pub const Conn = struct {
         }
     }
 
-    fn received(self: *Conn, bytes: []const u8) !void {
-        const server = self.listener.server;
-        const options = self.listener.options;
+    fn received(self: *Conn, bytes: []const u8) Error!void {
         var ready_changed: bool = false;
 
         var parser = protocol.Parser{ .buf = try self.recv_buf.append(bytes) };
         while (parser.next() catch |err| {
-            log.err("{} protocol parser failed {}, un-parsed: {d}", .{ self.socket, err, parser.unparsed()[0..@min(128, parser.unparsed().len)] });
+            log.err(
+                "{} protocol parser failed {}, un-parsed: {d}",
+                .{ self.socket, err, parser.unparsed()[0..@min(128, parser.unparsed().len)] },
+            );
             return try self.close();
-        }) |msg| {
-            self.outstanding_heartbeats = 0;
-            switch (msg) {
-                .identify => {
-                    self.identify = msg.parseIdentify(self.allocator, options) catch |err| {
-                        log.err("{} failed to parse identify {}", .{ self.socket, err });
-                        return try self.close();
-                    };
-                    if (self.identify.heartbeat_interval != options.heartbeat_interval)
-                        try self.initTicker(self.identify.heartbeat_interval);
-                    try self.respond(.ok);
-                    log.debug("{} identify {}", .{ self.socket, self.identify });
+        }) |msg|
+            self.msgRecived(msg, &ready_changed) catch |err| switch (err) {
+                Error.OutOfMemory, Error.SubmissionQueueFull => |e| return e,
+                else => {
+                    log.err("{} message failed {}", .{ self.socket, err });
+                    return try self.close();
                 },
-                .sub => |arg| {
-                    self.channel = try server.sub(self, arg.topic, arg.channel);
-                    try self.respond(.ok);
-                    log.debug("{} subscribe: {s} {s}", .{ self.socket, arg.topic, arg.channel });
-                },
-                .spub => |arg| {
-                    try server.publish(arg.topic, arg.data);
-                    try self.respond(.ok);
-                    log.debug("{} publish: {s}", .{ self.socket, arg.topic });
-                },
-                .mpub => |arg| {
-                    try server.multiPublish(arg.topic, arg.msgs, arg.data);
-                    try self.respond(.ok);
-                    log.debug("{} multi publish: {s} messages: {}", .{ self.socket, arg.topic, arg.msgs });
-                },
-                .dpub => |arg| {
-                    try server.deferredPublish(arg.topic, arg.data, arg.delay);
-                    try self.respond(.ok);
-                    log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });
-                },
-                .rdy => |count| {
-                    self.ready_count = count;
-                    ready_changed = true;
-                    log.debug("{} ready: {}", .{ self.socket, count });
-                },
-                .fin => |msg_id| {
-                    if (self.channel) |channel| {
-                        self.in_flight -|= 1;
-                        const res = try channel.fin(msg_id);
-                        if (res) self.stat.finish += 1;
-                        log.debug("{} fin {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
-                        ready_changed = true;
-                    } else {
-                        return try self.close();
-                    }
-                },
-                .req => |arg| {
-                    if (self.channel) |channel| {
-                        self.in_flight -|= 1;
-                        const res = try channel.req(arg.msg_id, arg.delay);
-                        if (res) self.stat.requeue += 1;
-                        log.debug("{} req {} {}", .{ self.socket, Msg.seqFromId(arg.msg_id), res });
-                    } else {
-                        return try self.close();
-                    }
-                },
-                .touch => |msg_id| {
-                    if (self.channel) |channel| {
-                        const res = try channel.touch(msg_id, self.identify.msg_timeout);
-                        log.debug("{} touch {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
-                    } else {
-                        return try self.close();
-                    }
-                },
-                .cls => {
-                    self.ready_count = 0;
-                    try self.respond(.cls);
-                    log.debug("{} cls", .{self.socket});
-                },
-                .nop => {
-                    log.debug("{} nop", .{self.socket});
-                },
-                .auth => {
-                    log.err("{} `auth` is not supported operation", .{self.socket});
-                },
-                .version => unreachable, // handled in the parser
-            }
-        }
+            };
 
-        const unparsed = parser.unparsed();
-        if (unparsed.len > 0)
-            try self.recv_buf.set(unparsed)
-        else
-            self.recv_buf.free();
-
+        try self.recv_buf.set(parser.unparsed());
         if (ready_changed and self.send_op == null)
             if (self.channel) |channel| try channel.ready(self);
+    }
+
+    fn msgRecived(self: *Conn, msg: protocol.Message, ready_changed: *bool) !void {
+        const server = self.listener.server;
+        const options = self.listener.options;
+        self.outstanding_heartbeats = 0;
+
+        switch (msg) {
+            .identify => {
+                self.identify = try msg.parseIdentify(self.allocator, options);
+                if (self.identify.heartbeat_interval != options.heartbeat_interval)
+                    try self.initTicker(self.identify.heartbeat_interval);
+                try self.respond(.ok);
+                log.debug("{} identify {}", .{ self.socket, self.identify });
+            },
+            .sub => |arg| {
+                self.channel = try server.sub(self, arg.topic, arg.channel);
+                try self.respond(.ok);
+                log.debug("{} subscribe: {s} {s}", .{ self.socket, arg.topic, arg.channel });
+            },
+            .spub => |arg| {
+                try server.publish(arg.topic, arg.data);
+                try self.respond(.ok);
+                log.debug("{} publish: {s}", .{ self.socket, arg.topic });
+            },
+            .mpub => |arg| {
+                try server.multiPublish(arg.topic, arg.msgs, arg.data);
+                try self.respond(.ok);
+                log.debug("{} multi publish: {s} messages: {}", .{ self.socket, arg.topic, arg.msgs });
+            },
+            .dpub => |arg| {
+                try server.deferredPublish(arg.topic, arg.data, arg.delay);
+                try self.respond(.ok);
+                log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });
+            },
+            .rdy => |count| {
+                self.ready_count = count;
+                ready_changed.* = true;
+                log.debug("{} ready: {}", .{ self.socket, count });
+            },
+            .fin => |msg_id| {
+                var channel = self.channel orelse return error.NotSubscribed;
+                self.in_flight -|= 1;
+                const res = try channel.fin(msg_id);
+                if (res) self.stat.finish += 1;
+                ready_changed.* = true;
+                log.debug("{} fin {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
+            },
+            .req => |arg| {
+                var channel = self.channel orelse return error.NotSubscribed;
+                self.in_flight -|= 1;
+                const res = try channel.req(arg.msg_id, arg.delay);
+                if (res) self.stat.requeue += 1;
+                log.debug("{} req {} {}", .{ self.socket, Msg.seqFromId(arg.msg_id), res });
+            },
+            .touch => |msg_id| {
+                var channel = self.channel orelse return error.NotSubscribed;
+                const res = try channel.touch(msg_id, self.identify.msg_timeout);
+                log.debug("{} touch {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
+            },
+            .cls => {
+                self.ready_count = 0;
+                try self.respond(.cls);
+                log.debug("{} cls", .{self.socket});
+            },
+            .nop => {
+                log.debug("{} nop", .{self.socket});
+            },
+            .auth => {
+                log.err("{} `auth` is not supported operation", .{self.socket});
+            },
+            .version => unreachable, // handled in the parser
+        }
     }
 
     fn recvFailed(self: *Conn, err: anyerror) Error!void {
@@ -413,7 +409,9 @@ pub const RecvBuf = struct {
     }
 
     pub fn set(self: *Self, bytes: []const u8) !void {
-        if (self.buf.len == bytes.len) return;
+        if (bytes.len == 0) return self.free();
+        if (self.buf.len == bytes.len and self.buf.ptr == bytes.ptr) return;
+
         const new_buf = try self.allocator.dupe(u8, bytes);
         self.free();
         self.buf = new_buf;

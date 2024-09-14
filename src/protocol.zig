@@ -88,10 +88,6 @@ pub const FrameType = enum(u32) {
     message = 2,
 };
 
-const Error = error{
-    Invalid,
-};
-
 pub const Parser = struct {
     buf: []const u8,
     pos: usize = 0,
@@ -99,10 +95,10 @@ pub const Parser = struct {
     // null - Not enough data in the buf.
     // pos  - Tail position after successful message parsing.
     //        First byte of the next message in buf or buf.len.
-    pub fn next(p: *Parser) Error!?Message {
+    pub fn next(p: *Parser) !?Message {
         while (true) {
             const msg = p.parse() catch |err| switch (err) {
-                error.BufferOverflow => return null,
+                error.SplitBuffer => return null,
                 error.Invalid => |e| return e,
             };
             if (msg != .version) return msg;
@@ -114,7 +110,7 @@ pub const Parser = struct {
     }
 
     fn parse(p: *Parser) !Message {
-        if (p.buf[p.pos..].len < 4) return error.BufferOverflow;
+        if (p.buf[p.pos..].len < 4) return error.SplitBuffer;
 
         const start_pos = p.pos;
         errdefer p.pos = start_pos;
@@ -222,14 +218,14 @@ pub const Parser = struct {
 
     fn matchString(p: *Parser, str: []const u8) !void {
         const buf = p.buf[p.pos..];
-        if (buf.len < str.len) return error.BufferOverflow;
+        if (buf.len < str.len) return error.SplitBuffer;
         if (!mem.eql(u8, buf[0..str.len], str)) return error.Invalid;
         p.pos += str.len;
     }
 
     fn readMessageId(p: *Parser, delim: u8) ![16]u8 {
         const buf = p.buf[p.pos..];
-        if (buf.len < 17) return error.BufferOverflow;
+        if (buf.len < 17) return error.SplitBuffer;
         if (buf[16] != delim) return error.Invalid;
         p.pos += 17;
         return buf[0..16].*;
@@ -241,21 +237,21 @@ pub const Parser = struct {
 
     fn readInt(p: *Parser) !u32 {
         const buf = p.buf[p.pos..];
-        if (buf.len < 4) return error.BufferOverflow;
+        if (buf.len < 4) return error.SplitBuffer;
         p.pos += 4;
         return mem.readInt(u32, buf[0..4], .big);
     }
 
     fn readString(p: *Parser, delim: u8) ![]const u8 {
         const buf = p.buf[p.pos..];
-        const len = mem.indexOfScalar(u8, buf, delim) orelse return error.BufferOverflow;
+        const len = mem.indexOfScalar(u8, buf, delim) orelse return error.SplitBuffer;
         p.pos += len + 1;
         return buf[0..len];
     }
 
     fn readBytes(p: *Parser, size: u32) ![]const u8 {
         const buf = p.buf[p.pos..];
-        if (buf.len < size) return error.BufferOverflow;
+        if (buf.len < size) return error.SplitBuffer;
         p.pos += size;
         return buf[0..size];
     }
@@ -277,7 +273,7 @@ test "identify" {
     }
     { // split buffer
         var p = Parser{ .buf = buf[0..22] };
-        try testing.expectError(error.BufferOverflow, p.parse());
+        try testing.expectError(error.SplitBuffer, p.parse());
         try testing.expectEqual(0, p.pos);
     }
     { // invalid command
@@ -307,11 +303,11 @@ test "sub" {
     }
     { // split buffer
         var p = Parser{ .buf = buf[0..6] };
-        try testing.expectError(error.BufferOverflow, p.parse());
+        try testing.expectError(error.SplitBuffer, p.parse());
         try testing.expectEqual(0, p.pos);
 
         p = Parser{ .buf = buf[0..14] };
-        try testing.expectError(error.BufferOverflow, p.parse());
+        try testing.expectError(error.SplitBuffer, p.parse());
         try testing.expectEqual(0, p.pos);
     }
 }
@@ -333,11 +329,11 @@ test "pub" {
     }
     { // split buffer
         var p = Parser{ .buf = buf[0..6] };
-        try testing.expectError(error.BufferOverflow, p.parse());
+        try testing.expectError(error.SplitBuffer, p.parse());
         try testing.expectEqual(0, p.pos);
 
         p = Parser{ .buf = buf[0..12] };
-        try testing.expectError(error.BufferOverflow, p.parse());
+        try testing.expectError(error.SplitBuffer, p.parse());
         try testing.expectEqual(0, p.pos);
     }
 }
@@ -358,11 +354,11 @@ test "mpub" {
     }
     { // split buffer
         var p = Parser{ .buf = buf[0..6] };
-        try testing.expectError(error.BufferOverflow, p.parse());
+        try testing.expectError(error.SplitBuffer, p.parse());
         try testing.expectEqual(0, p.pos);
 
         p = Parser{ .buf = buf[0..14] };
-        try testing.expectError(error.BufferOverflow, p.parse());
+        try testing.expectError(error.SplitBuffer, p.parse());
         try testing.expectEqual(0, p.pos);
     }
     { // invalid number of messages
