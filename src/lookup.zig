@@ -71,9 +71,8 @@ pub const Connector = struct {
 
     fn append(self: *Self, reg: Registration) !void {
         try self.registrations.append(reg);
-        if (self.topic.consumers.count() > 0) {
-            try self.topic.append(try reg.print(self.allocator));
-        }
+        if (self.topic.hasConsumers())
+            assert(try self.topic.append(try reg.print(self.allocator)));
     }
 
     pub fn topicDeleted(self: *Self, name: []const u8) !void {

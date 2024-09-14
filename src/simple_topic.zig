@@ -21,7 +21,14 @@ pub fn SimpleTopic(
                 const nn = self.next;
                 self.rc -= 1;
                 if (self.rc == 0) {
-                    allocator.free(self.data);
+                    switch (@typeInfo(Data)) {
+                        .Pointer => |ptr_info| switch (ptr_info.size) {
+                            .Slice => allocator.free(self.data),
+                            .One => allocator.destroy(self.data),
+                            else => @compileError("invalid type given"),
+                        },
+                        else => {},
+                    }
                     allocator.destroy(self);
                     if (nn) |n| n.unbox(allocator);
                 }
@@ -118,11 +125,13 @@ pub fn SimpleTopic(
             return null;
         }
 
-        pub fn append(self: *Self, data: Data) !void {
-            if (self.consumers.count() == 0) {
-                self.allocator.free(data);
-                return;
-            }
+        pub fn hasConsumers(self: *Self) bool {
+            return self.consumers.count() > 0;
+        }
+
+        pub fn append(self: *Self, data: Data) !bool {
+            if (!self.hasConsumers()) return false;
+
             const node = try self.allocator.create(Node);
             node.* = Node{ .data = data, .rc = 0, .next = null };
 
@@ -135,6 +144,7 @@ pub fn SimpleTopic(
                 first.next = Node.box(node);
             };
             try self.notify(node);
+            return true;
         }
 
         fn notify(self: *Self, node: *Node) !void {
@@ -154,7 +164,7 @@ pub fn SimpleTopic(
 fn addNode(topic: anytype, value: usize) !void {
     const v = try testing.allocator.create(usize);
     v.* = value;
-    try topic.append(v);
+    assert(try topic.append(v));
 }
 
 const TestConsumer = struct {
@@ -165,7 +175,9 @@ const TestConsumer = struct {
 };
 
 test SimpleTopic {
-    var topic = SimpleTopic(usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
+    // Using `*usize` instead of `usize` for Data to test that node data is also
+    // destroyed with node.
+    var topic = SimpleTopic(*usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
     defer topic.deinit();
 
     var c1 = TestConsumer{};
@@ -214,7 +226,12 @@ test SimpleTopic {
     { // noop append when no consumers
         topic.unsubscribe(&c1);
         topic.unsubscribe(&c2);
-        try addNode(&topic, 46);
+        {
+            const v = try testing.allocator.create(usize);
+            v.* = 46;
+            assert(try topic.append(v) == false);
+            testing.allocator.destroy(v);
+        }
         try testing.expect(topic.last == null);
     }
 
@@ -236,7 +253,7 @@ test SimpleTopic {
 }
 
 test "unsubscribe nulls last" {
-    var topic = SimpleTopic(usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
+    var topic = SimpleTopic(*usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
     defer topic.deinit();
 
     var c1 = TestConsumer{};
@@ -273,7 +290,7 @@ test "unsubscribe nulls last" {
 }
 
 test "first message" {
-    var topic = SimpleTopic(usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
+    var topic = SimpleTopic(*usize, TestConsumer, TestConsumer.wakeup).init(testing.allocator);
     defer topic.deinit();
 
     var c1 = TestConsumer{};
