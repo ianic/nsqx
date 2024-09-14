@@ -81,17 +81,24 @@ pub const Conn = struct {
         const head = try std.http.Server.Request.Head.parse(bytes[0..head_end]);
         const content_length = if (head.content_length) |l| l else 0;
         if (content_length != bytes[head_end..].len) {
-            log.err("{} receive buffer overflow method: {}, target: {s}, content length: {}", .{ self.socket, head.method, head.target, content_length });
+            log.err(
+                "{} receive buffer overflow method: {}, target: {s}, content length: {}",
+                .{ self.socket, head.method, head.target, content_length },
+            );
             return error.BadRequest;
         }
 
-        log.debug("{} method: {}, target: {s}, content length: {}", .{ self.socket, head.method, head.target, content_length });
+        log.debug(
+            "{} method: {}, target: {s}, content length: {}",
+            .{ self.socket, head.method, head.target, content_length },
+        );
 
-        if (std.mem.startsWith(u8, head.target, "/stats"))
-            return try jsonStat(self.gpa, writer, self.listener.server);
-        if (std.mem.startsWith(u8, head.target, "/info"))
-            return try jsonInfo(writer, self.listener.server, self.listener.options);
-        return error.NotFound;
+        const cmd = parse(head.target) catch return error.NotFound;
+        switch (cmd) {
+            .stats => return try jsonStat(self.gpa, writer, self.listener.server),
+            .info => return try jsonInfo(writer, self.listener.server, self.listener.options),
+            else => return error.NotFound,
+        }
     }
 
     fn send(self: *Conn) !void {
@@ -314,4 +321,94 @@ fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
 
     try std.json.stringify(stat, .{}, writer);
     return;
+}
+
+const Command = union(enum) {
+    topic_empty: []const u8,
+    topic_pause: []const u8,
+    topic_delete: []const u8,
+    channel_empty: Channel,
+    channel_pause: Channel,
+    channel_delete: Channel,
+    stats: void,
+    info: void,
+
+    const Channel = struct {
+        topic_name: []const u8,
+        name: []const u8,
+    };
+};
+
+fn parse(target: []const u8) !Command {
+    if (mem.startsWith(u8, target, "/stats")) return .{ .stats = {} };
+    if (mem.startsWith(u8, target, "/info")) return .{ .info = {} };
+
+    if (mem.startsWith(u8, target, "/topic")) {
+        if (mem.startsWith(u8, target[6..], "/empty?topic="))
+            return .{ .topic_empty = target[19..] };
+        if (mem.startsWith(u8, target[6..], "/pause?topic="))
+            return .{ .topic_pause = target[19..] };
+        if (mem.startsWith(u8, target[6..], "/delete?topic="))
+            return .{ .topic_delete = target[20..] };
+    }
+    if (mem.startsWith(u8, target, "/channel")) {
+        if (mem.startsWith(u8, target[8..], "/empty?"))
+            return .{ .channel_empty = .{
+                .topic_name = try findValue(target[15..], "topic"),
+                .name = try findValue(target[15..], "channel"),
+            } };
+        if (mem.startsWith(u8, target[8..], "/pause?"))
+            return .{ .channel_pause = .{
+                .topic_name = try findValue(target[15..], "topic"),
+                .name = try findValue(target[15..], "channel"),
+            } };
+        if (mem.startsWith(u8, target[8..], "/delete?"))
+            return .{ .channel_delete = .{
+                .topic_name = try findValue(target[16..], "topic"),
+                .name = try findValue(target[16..], "channel"),
+            } };
+    }
+    return error.UnknownCommand;
+}
+
+fn findValue(query: []const u8, key: []const u8) ![]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (mem.indexOfScalarPos(u8, pair, 0, '=')) |sep| {
+            if (mem.eql(u8, key, pair[0..sep])) return pair[sep + 1 ..];
+        }
+    }
+    return error.KeyNotFound;
+}
+
+const testing = std.testing;
+
+// parse also these params for stats requests
+// target: /stats?format=json&topic=topic-000&include_clients=false, content length: 0
+// target: /stats?format=json&topic=topic-000&channel=000, content length: 0
+// target: /stats?format=json&include_clients=false, content length: 0
+
+test parse {
+    try testing.expectEqualStrings("topic-001", (try parse("/topic/empty?topic=topic-001")).topic_empty);
+    try testing.expectEqualStrings("topic-002", (try parse("/topic/pause?topic=topic-002")).topic_pause);
+    try testing.expectEqualStrings("topic-003", (try parse("/topic/delete?topic=topic-003")).topic_delete);
+
+    var cmd = try parse("/channel/delete?topic=topic-004&channel=005");
+    try testing.expectEqualStrings("topic-004", cmd.channel_delete.topic_name);
+    try testing.expectEqualStrings("005", cmd.channel_delete.name);
+
+    cmd = try parse("/channel/empty?channel=009&topic=topic-008");
+    try testing.expectEqualStrings("topic-008", cmd.channel_empty.topic_name);
+    try testing.expectEqualStrings("009", cmd.channel_empty.name);
+
+    cmd = try parse("/channel/pause?topic=topic-006&channel=007");
+    try testing.expectEqualStrings("topic-006", cmd.channel_pause.topic_name);
+    try testing.expectEqualStrings("007", cmd.channel_pause.name);
+}
+
+test findValue {
+    try testing.expectEqualStrings("topic-001", try findValue("topic=topic-001&channel=001", "topic"));
+    try testing.expectEqualStrings("001", try findValue("topic=topic-001&channel=001", "channel"));
+    try testing.expectEqualStrings("", try findValue("topic=topic-001&channel=", "channel"));
+    try testing.expectError(error.KeyNotFound, findValue("topic=topic-001&channel=001", "pero"));
 }
