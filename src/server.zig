@@ -154,6 +154,11 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             return try t.sub(consumer, channel);
         }
 
+        pub fn deleteChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
+            const topic = self.topics.get(topic_name) orelse return error.TopicNotFound;
+            try topic.deleteChannel(name);
+        }
+
         fn getTopic(self: *Server, name: []const u8) !*Topic {
             if (self.topics.get(name)) |t| return t;
             return try self.createTopic(name);
@@ -256,7 +261,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     channel.initTimer(self.server.io);
                     try self.channels.put(key, channel);
 
-                    log.debug("created topic {s} channel {s}", .{ self.name, key });
+                    log.debug("topic '{s}' channel '{s}' created", .{ self.name, key });
                     try self.server.notifier.channelCreated(self.name, key);
                     return channel;
                 }
@@ -338,6 +343,15 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         if (channel.offset < min_seq) min_seq = channel.offset;
                     }
                     self.messages.release(self.allocator, min_seq);
+                }
+
+                fn deleteChannel(self: *Topic, name: []const u8) !void {
+                    if (self.channels.fetchRemove(name)) |kv| {
+                        var channel = kv.value;
+                        channel.deinit();
+                        log.debug("topic '{s}' channel '{s}' deleted", .{ self.name, name });
+                    }
+                    return error.ChannelNotFound;
                 }
             };
         }
@@ -637,13 +651,14 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
 
                 fn deinit(self: *Channel) void {
+                    for (self.consumers.items) |consumer| consumer.channelClosed();
                     self.timer.close() catch {};
-                    self.consumers.deinit();
                     for (self.in_flight.values()) |msg| self.allocator.destroy(msg);
                     while (self.deferred.removeOrNull()) |msg| self.allocator.destroy(msg);
                     self.in_flight.deinit();
-                    self.finished.deinit();
+                    self.consumers.deinit();
                     self.deferred.deinit();
+                    self.finished.deinit();
                 }
             };
         }

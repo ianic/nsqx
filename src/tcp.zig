@@ -369,6 +369,11 @@ pub const Conn = struct {
         try self.close();
     }
 
+    pub fn channelClosed(self: *Conn) void {
+        self.channel = null;
+        self.close() catch {};
+    }
+
     fn close(self: *Conn) !void {
         log.debug("{} close", .{self.socket});
         if (self.channel) |channel| try channel.unsub(self);

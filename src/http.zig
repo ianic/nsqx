@@ -97,6 +97,9 @@ pub const Conn = struct {
         switch (cmd) {
             .stats => return try jsonStat(self.gpa, writer, self.listener.server),
             .info => return try jsonInfo(writer, self.listener.server, self.listener.options),
+            .channel_delete => |arg| {
+                try self.listener.server.deleteChannel(arg.topic_name, arg.name);
+            },
             else => return error.NotFound,
         }
     }
