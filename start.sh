@@ -17,23 +17,20 @@ lookupd_pid=$!
     -broadcast-address localhost >> tmp/lookupd2 2>&1 &
 lookupd2_pid=$!
 
+# lookup for monitoring registrations
+cd ~/Code/nsql && zig run test/lookup.zig >> tmp/registrations 2>&1 &
+
 # admin
 ~/Code/go/nsq/apps/nsqadmin/nsqadmin \
     -lookupd-http-address localhost:4161 \
     -lookupd-http-address localhost:4163 >> tmp/nsqadmin 2>&1 &
 admin_pid=$!
 
-# deamon
+# daemon
 cd ~/Code/nsql
 ./zig-out/bin/nsql &
 nsql_pid=$!
 
-sleep 1
-cd ~/Code/nsql/test
-go run topics_producer.go >> ~/Code/nsql/tmp/producer 2>&1
-
-go run topics_consumer.go >> ~/Code/nsql/tmp/consumer 2>&1 &
-consumer_pid=$!
 
 cleanup() {
     set +e
@@ -41,7 +38,6 @@ cleanup() {
     kill $admin_pid >> /dev/null
     kill $lookupd_pid >> /dev/null
     kill $lookupd2_pid >> /dev/null
-    kill $consumer_pid >> /dev/null
 }
 trap cleanup INT TERM #EXIT
 

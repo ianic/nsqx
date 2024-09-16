@@ -160,10 +160,22 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             log.debug("deleted channel {s} on topic {s}", .{ name, topic_name });
         }
 
+        pub fn pauseChannel(self: *Server, topic_name: []const u8, name: []const u8, paused: bool) !void {
+            const topic = self.topics.get(topic_name) orelse return error.NotFound;
+            try topic.pauseChannel(name, paused);
+            log.debug("paused channel {s} on topic {s}", .{ name, topic_name });
+        }
+
         pub fn deleteTopic(self: *Server, name: []const u8) !void {
             const kv = self.topics.fetchRemove(name) orelse return error.NotFound;
             self.deinitTopic(kv.value);
             log.debug("deleted topic {s}", .{name});
+        }
+
+        pub fn pauseTopic(self: *Server, name: []const u8, paused: bool) !void {
+            const topic = self.topics.get(name) orelse return error.NotFound;
+            try topic.pause(paused);
+            log.debug("paused topic {s}", .{name});
         }
 
         fn getTopic(self: *Server, name: []const u8) !*Topic {
@@ -233,6 +245,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 sequence: u64 = 0,
                 next: ?*TopicMsg = null,
                 fin_count: usize = 0, // fin's in channels
+                paused: bool = false,
 
                 pub fn init(allocator: mem.Allocator, server: *Server, name: []const u8) Topic {
                     return .{
@@ -356,6 +369,20 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     const kv = self.channels.fetchRemove(name) orelse return error.NotFound;
                     self.deinitChannel(kv.value);
                 }
+
+                fn pause(self: *Topic, paused: bool) !void {
+                    if (self.paused == paused) return;
+                    self.paused = paused;
+                    if (!self.paused) { // wake-up all channels
+                        var iter = self.channels.valueIterator();
+                        while (iter.next()) |ptr| try ptr.*.wakeup();
+                    }
+                }
+
+                fn pauseChannel(self: *Topic, name: []const u8, paused: bool) !void {
+                    const channel = self.channels.get(name) orelse return error.NotFound;
+                    try channel.pause(paused);
+                }
             };
         }
 
@@ -390,6 +417,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     timeout: usize = 0, // time outed while in flight
                     requeue: usize = 0, // req by the client
                 } = .{},
+                paused: bool = false,
 
                 fn init(allocator: mem.Allocator, topic: *Topic, name: []const u8) Channel {
                     return .{
@@ -648,11 +676,18 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
 
                 fn nextTopicMsg(self: *Channel) ?*TopicMsg {
+                    if (self.paused or self.topic.paused) return null;
                     if (self.next) |tmsg| {
                         self.next = tmsg.next;
                         return tmsg;
                     }
                     return null;
+                }
+
+                fn pause(self: *Channel, paused: bool) !void {
+                    if (self.paused == paused) return;
+                    self.paused = paused;
+                    if (!self.paused) try self.wakeup();
                 }
 
                 fn deinit(self: *Channel) void {
@@ -861,7 +896,9 @@ const TestConsumer = struct {
         return 60000;
     }
 
-    fn channelClosed(_: *Self) void {}
+    fn channelClosed(self: *Self) void {
+        self.channel = null;
+    }
 };
 
 const TestIo = struct {
@@ -1131,6 +1168,58 @@ test "deferred messages" {
         try testing.expectEqual(2, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
     }
+}
+
+test "topic pause" {
+    const allocator = testing.allocator;
+    const topic_name = "topic";
+    const channel_name = "channel";
+
+    var io = TestIo{};
+    var notifier = NoopNotifier{};
+    var server = TestServer.init(allocator, &io, &notifier);
+    defer server.deinit();
+    const topic = try server.getTopic(topic_name);
+
+    {
+        try server.publish(topic_name, "message 1");
+        try server.publish(topic_name, "message 2");
+        try testing.expectEqual(2, topic.messages.count());
+    }
+
+    var consumer = TestConsumer.init(allocator);
+    defer consumer.deinit();
+    const channel = try server.sub(&consumer, topic_name, channel_name);
+    consumer.channel = channel;
+
+    { // while channel is paused topic messages are not delivered to the channel
+        try testing.expect(!channel.paused);
+        try server.pauseChannel(topic_name, channel_name, true);
+        try testing.expect(channel.paused);
+
+        try consumer.pull();
+        try testing.expectEqual(0, channel.in_flight.count());
+
+        // unpause will pull message
+        try server.pauseChannel(topic_name, channel_name, false);
+        try testing.expectEqual(1, channel.in_flight.count());
+    }
+
+    { // same while topic is paused
+        try testing.expect(!topic.paused);
+        try server.pauseTopic(topic_name, true);
+        try testing.expect(topic.paused);
+
+        try consumer.pull();
+        try testing.expectEqual(1, channel.in_flight.count());
+
+        // unpause
+        try server.pauseTopic(topic_name, false);
+        try testing.expectEqual(2, channel.in_flight.count());
+    }
+
+    try server.deleteTopic(topic_name);
+    try testing.expect(consumer.channel == null);
 }
 
 const TestNotifier = struct {

@@ -101,6 +101,10 @@ pub const Conn = struct {
             .info => return try jsonInfo(writer, server, self.listener.options),
             .channel_delete => |arg| try server.deleteChannel(arg.topic_name, arg.name),
             .topic_delete => |name| try server.deleteTopic(name),
+            .channel_pause => |arg| try server.pauseChannel(arg.topic_name, arg.name, true),
+            .channel_unpause => |arg| try server.pauseChannel(arg.topic_name, arg.name, false),
+            .topic_pause => |name| try server.pauseTopic(name, true),
+            .topic_unpause => |name| try server.pauseTopic(name, false),
             else => return error.NotFound,
         }
     }
@@ -223,7 +227,7 @@ const Stat = struct {
         timeout_count: u64,
         client_count: u64,
         clients: []Client,
-        paused: bool = false,
+        paused: bool,
         e2e_processing_latency: struct { count: u64 = 0 } = .{},
     };
     const Client = struct {
@@ -303,7 +307,7 @@ fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
                 .timeout_count = channel.stat.timeout,
                 .client_count = client_count,
                 .clients = clients,
-                .paused = false,
+                .paused = channel.paused,
             };
         }
 
@@ -312,7 +316,7 @@ fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
             .depth = topic.messages.count(),
             .message_count = topic.sequence,
             .message_bytes = 0, // TODO
-            .paused = false,
+            .paused = topic.paused,
             .channels = channels,
         };
     }
@@ -330,9 +334,11 @@ fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
 const Command = union(enum) {
     topic_empty: []const u8,
     topic_pause: []const u8,
+    topic_unpause: []const u8,
     topic_delete: []const u8,
     channel_empty: Channel,
     channel_pause: Channel,
+    channel_unpause: Channel,
     channel_delete: Channel,
     stats: void,
     info: void,
@@ -352,6 +358,8 @@ fn parse(target: []const u8) !Command {
             return .{ .topic_empty = target[19..] };
         if (mem.startsWith(u8, target[6..], "/pause?topic="))
             return .{ .topic_pause = target[19..] };
+        if (mem.startsWith(u8, target[6..], "/unpause?topic="))
+            return .{ .topic_unpause = target[21..] };
         if (mem.startsWith(u8, target[6..], "/delete?topic="))
             return .{ .topic_delete = target[20..] };
     }
@@ -365,6 +373,11 @@ fn parse(target: []const u8) !Command {
             return .{ .channel_pause = .{
                 .topic_name = try findValue(target[15..], "topic"),
                 .name = try findValue(target[15..], "channel"),
+            } };
+        if (mem.startsWith(u8, target[8..], "/unpause?"))
+            return .{ .channel_unpause = .{
+                .topic_name = try findValue(target[17..], "topic"),
+                .name = try findValue(target[17..], "channel"),
             } };
         if (mem.startsWith(u8, target[8..], "/delete?"))
             return .{ .channel_delete = .{
@@ -396,6 +409,7 @@ test parse {
     try testing.expectEqualStrings("topic-001", (try parse("/topic/empty?topic=topic-001")).topic_empty);
     try testing.expectEqualStrings("topic-002", (try parse("/topic/pause?topic=topic-002")).topic_pause);
     try testing.expectEqualStrings("topic-003", (try parse("/topic/delete?topic=topic-003")).topic_delete);
+    try testing.expectEqualStrings("topic-004", (try parse("/topic/unpause?topic=topic-004")).topic_unpause);
 
     var cmd = try parse("/channel/delete?topic=topic-004&channel=005");
     try testing.expectEqualStrings("topic-004", cmd.channel_delete.topic_name);
@@ -408,6 +422,10 @@ test parse {
     cmd = try parse("/channel/pause?topic=topic-006&channel=007");
     try testing.expectEqualStrings("topic-006", cmd.channel_pause.topic_name);
     try testing.expectEqualStrings("007", cmd.channel_pause.name);
+
+    cmd = try parse("/channel/unpause?topic=topic-008&channel=009");
+    try testing.expectEqualStrings("topic-008", cmd.channel_unpause.topic_name);
+    try testing.expectEqualStrings("009", cmd.channel_unpause.name);
 }
 
 test findValue {
