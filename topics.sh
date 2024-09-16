@@ -34,6 +34,7 @@ go run topics_consumer.go >> ~/Code/nsql/tmp/consumer 2>&1 &
 consumer_pid=$!
 
 cleanup() {
+    set +e
     kill $nsql_pid >> /dev/null
     kill $admin_pid >> /dev/null
     kill $lookupd_pid >> /dev/null
@@ -42,5 +43,5 @@ cleanup() {
 }
 trap cleanup INT TERM #EXIT
 
-wait $nsqd_pid
+wait $nsql_pid
 wait $lookupd_pid

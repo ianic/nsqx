@@ -22,10 +22,17 @@ pub const Connector = struct {
             name: []const u8,
         },
 
-        fn print(self: Registration, allocator: mem.Allocator) ![]const u8 {
+        fn register(self: Registration, allocator: mem.Allocator) ![]const u8 {
             return switch (self) {
                 .topic => |t| try std.fmt.allocPrint(allocator, "REGISTER {s}\n", .{t}),
                 .channel => |c| try std.fmt.allocPrint(allocator, "REGISTER {s} {s}\n", .{ c.topic_name, c.name }),
+            };
+        }
+
+        fn unregister(self: Registration, allocator: mem.Allocator) ![]const u8 {
+            return switch (self) {
+                .topic => |t| try std.fmt.allocPrint(allocator, "UNREGISTER {s}\n", .{t}),
+                .channel => |c| try std.fmt.allocPrint(allocator, "UNREGISTER {s} {s}\n", .{ c.topic_name, c.name }),
             };
         }
     };
@@ -36,6 +43,11 @@ pub const Connector = struct {
     connections: std.ArrayList(*Conn),
     identify: []const u8,
     topic: Topic,
+    state: State,
+    const State = enum {
+        active,
+        closing,
+    };
 
     pub fn init(allocator: mem.Allocator, io: *Io) Self {
         const identify = identifyMessage(allocator, "127.0.0.1", "hydra", 4151, 4150, "0.1.0") catch "";
@@ -46,16 +58,21 @@ pub const Connector = struct {
             .connections = std.ArrayList(*Conn).init(allocator),
             .topic = Topic.init(allocator),
             .identify = identify,
+            .state = .active,
         };
     }
 
     pub fn close(self: *Self) !void {
+        self.state = .closing;
         for (self.connections.items) |conn| try conn.close();
     }
 
     pub fn deinit(self: *Self) void {
         self.registrations.deinit();
-        for (self.connections.items) |conn| conn.deinit();
+        for (self.connections.items) |conn| {
+            conn.deinit();
+            self.allocator.destroy(conn);
+        }
         self.connections.deinit();
         self.allocator.free(self.identify);
         self.topic.deinit();
@@ -70,15 +87,19 @@ pub const Connector = struct {
     }
 
     fn append(self: *Self, reg: Registration) !void {
+        if (self.state != .active) return;
         try self.registrations.append(reg);
         if (self.topic.hasConsumers())
-            assert(try self.topic.append(try reg.print(self.allocator)));
+            assert(try self.topic.append(try reg.register(self.allocator)));
     }
 
     pub fn topicDeleted(self: *Self, name: []const u8) !void {
+        if (self.state != .active) return;
         for (self.registrations.items, 0..) |reg, i| {
             if (reg == .topic) {
                 if (reg.topic.ptr == name.ptr) {
+                    if (self.topic.hasConsumers())
+                        assert(try self.topic.append(try reg.unregister(self.allocator)));
                     _ = self.registrations.swapRemove(i);
                     return;
                 }
@@ -87,11 +108,14 @@ pub const Connector = struct {
     }
 
     pub fn channelDeleted(self: *Self, topic_name: []const u8, name: []const u8) !void {
+        if (self.state != .active) return;
         for (self.registrations.items, 0..) |reg, i| {
             if (reg == .channel) {
                 if (reg.channel.topic_name.ptr == topic_name.ptr and
                     reg.channel.name.ptr == name.ptr)
                 {
+                    if (self.topic.hasConsumers())
+                        assert(try self.topic.append(try reg.unregister(self.allocator)));
                     _ = self.registrations.swapRemove(i);
                     return;
                 }
@@ -107,7 +131,7 @@ pub const Connector = struct {
     }
 
     fn connected(self: *Self, conn: *Conn) !void {
-        const first = try self.state();
+        const first = try self.allRegistrations();
         if (first.len > 0) try self.topic.setFirst(first);
         try self.topic.subscribe(conn);
     }
@@ -117,12 +141,12 @@ pub const Connector = struct {
     }
 
     // Current state for newly connected lookupd
-    fn state(self: *Self) ![]const u8 {
+    fn allRegistrations(self: *Self) ![]const u8 {
         if (self.registrations.items.len == 0) return "";
 
         var arr = std.ArrayList(u8).init(self.allocator);
         for (self.registrations.items) |reg| {
-            const data = try reg.print(self.allocator);
+            const data = try reg.register(self.allocator);
             defer self.allocator.free(data);
             try arr.appendSlice(data);
         }
@@ -241,6 +265,7 @@ const Conn = struct {
 
     fn send(self: *Self, buf: []const u8) !void {
         assert(self.send_op == null);
+        assert(buf.len > 0);
         self.send_op = try self.io.send(self.socket, buf, self, sent, sendFailed);
     }
 

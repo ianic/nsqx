@@ -309,7 +309,7 @@ pub const Io = struct {
 
     pub fn drain(self: *Io) !void {
         while (self.stat.all.active() > 0) {
-            log.debug("draining active operations: {}\n", .{self.stat.all.active()});
+            log.debug("draining active operations: {}", .{self.stat.all.active()});
             try self.tick();
         }
     }

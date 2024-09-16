@@ -1,5 +1,5 @@
 #!/bin/bash
-# set -e
+set -e
 # set -u
 set -m
 
@@ -23,22 +23,19 @@ writer_pid=$!
 sh -c 'while ~/Code/go/nsq/bench/bench_reader/bench_reader ; do : ; done' &
 reader_pid=$!
 
+~/Code/go/nsq/apps/nsqadmin/nsqadmin --nsqd-http-address localhost:4151 >> /dev/null 2>&1 &
+admin_pid=$!
+
 cleanup() {
-    # echo cleanup
-    # echo writer $writer_pid
-    # echo reader $reader_pid
-    # echo nsqd $nsqd_pid
+    set +e
 
     killall bench_reader >> /dev/null
     killall bench_writer >> /dev/null
-    #kill $writer_pid
-    #kill $reader_pid
     kill $stat_pid >> /dev/null
+    kill $admin_pid >> /dev/null
 
     sleep 1
-    # echo nsql $nsqd_pid
     kill $nsqd_pid
-    #killall nsql
 }
 trap cleanup INT TERM #EXIT
 

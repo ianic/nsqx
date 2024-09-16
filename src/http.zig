@@ -58,6 +58,7 @@ pub const Conn = struct {
         const writer = body_list.writer().any();
 
         self.handle(writer, bytes) catch |err| {
+            log.warn("request failed {}", .{err});
             const rsp = switch (err) {
                 error.NotFound => not_found,
                 else => bad_request,
@@ -93,13 +94,13 @@ pub const Conn = struct {
             .{ self.socket, head.method, head.target, content_length },
         );
 
+        const server = self.listener.server;
         const cmd = parse(head.target) catch return error.NotFound;
         switch (cmd) {
-            .stats => return try jsonStat(self.gpa, writer, self.listener.server),
-            .info => return try jsonInfo(writer, self.listener.server, self.listener.options),
-            .channel_delete => |arg| {
-                try self.listener.server.deleteChannel(arg.topic_name, arg.name);
-            },
+            .stats => return try jsonStat(self.gpa, writer, server),
+            .info => return try jsonInfo(writer, server, self.listener.options),
+            .channel_delete => |arg| try server.deleteChannel(arg.topic_name, arg.name),
+            .topic_delete => |name| try server.deleteTopic(name),
             else => return error.NotFound,
         }
     }

@@ -155,8 +155,15 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
         }
 
         pub fn deleteChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
-            const topic = self.topics.get(topic_name) orelse return error.TopicNotFound;
+            const topic = self.topics.get(topic_name) orelse return error.NotFound;
             try topic.deleteChannel(name);
+            log.debug("deleted channel {s} on topic {s}", .{ name, topic_name });
+        }
+
+        pub fn deleteTopic(self: *Server, name: []const u8) !void {
+            const kv = self.topics.fetchRemove(name) orelse return error.NotFound;
+            self.deinitTopic(kv.value);
+            log.debug("deleted topic {s}", .{name});
         }
 
         fn getTopic(self: *Server, name: []const u8) !*Topic {
@@ -172,8 +179,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
             topic.* = Topic.init(self.allocator, self, key);
             try self.topics.put(key, topic);
-            log.debug("created topic {s}", .{name});
             try self.notifier.topicCreated(key);
+            log.debug("created topic {s}", .{name});
             return topic;
         }
 
@@ -194,15 +201,16 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
         pub fn deinit(self: *Server) void {
             var iter = self.topics.iterator();
-            while (iter.next()) |e| {
-                const key = e.key_ptr.*;
-                const topic = e.value_ptr.*;
-                self.notifier.topicDeleted(key) catch {};
-                topic.deinit();
-                self.allocator.destroy(topic);
-                self.allocator.free(e.key_ptr.*);
-            }
+            while (iter.next()) |e| self.deinitTopic(e.value_ptr.*);
             self.topics.deinit();
+        }
+
+        fn deinitTopic(self: *Server, topic: *Topic) void {
+            const key = topic.name;
+            topic.deinit();
+            self.notifier.topicDeleted(key) catch {};
+            self.allocator.free(key);
+            self.allocator.destroy(topic);
         }
 
         pub fn stopTimers(self: *Server) !void {
@@ -257,29 +265,28 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     const key = try self.allocator.dupe(u8, name);
                     errdefer self.allocator.free(key);
 
-                    channel.* = Channel.init(self.allocator, self);
+                    channel.* = Channel.init(self.allocator, self, key);
                     channel.initTimer(self.server.io);
+                    try self.server.notifier.channelCreated(self.name, channel.name);
                     try self.channels.put(key, channel);
 
                     log.debug("topic '{s}' channel '{s}' created", .{ self.name, key });
-                    try self.server.notifier.channelCreated(self.name, key);
                     return channel;
                 }
 
                 fn deinit(self: *Topic) void {
-                    {
-                        var iter = self.channels.iterator();
-                        while (iter.next()) |e| {
-                            const key = e.key_ptr.*;
-                            const channel = e.value_ptr.*;
-                            self.server.notifier.channelDeleted(self.name, key) catch {};
-                            channel.deinit();
-                            self.allocator.destroy(channel);
-                            self.allocator.free(e.key_ptr.*);
-                        }
-                        self.channels.deinit();
-                    }
+                    var iter = self.channels.iterator();
+                    while (iter.next()) |e| self.deinitChannel(e.value_ptr.*);
+                    self.channels.deinit();
                     self.messages.deinit(self.allocator);
+                }
+
+                fn deinitChannel(self: *Topic, channel: *Channel) void {
+                    const key = channel.name;
+                    self.server.notifier.channelDeleted(self.name, channel.name) catch {};
+                    channel.deinit();
+                    self.allocator.free(key);
+                    self.allocator.destroy(channel);
                 }
 
                 pub fn publish(self: *Topic, data: []const u8) !void {
@@ -346,12 +353,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
 
                 fn deleteChannel(self: *Topic, name: []const u8) !void {
-                    if (self.channels.fetchRemove(name)) |kv| {
-                        var channel = kv.value;
-                        channel.deinit();
-                        log.debug("topic '{s}' channel '{s}' deleted", .{ self.name, name });
-                    }
-                    return error.ChannelNotFound;
+                    const kv = self.channels.fetchRemove(name) orelse return error.NotFound;
+                    self.deinitChannel(kv.value);
                 }
             };
         }
@@ -359,6 +362,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
         pub fn ChannelType() type {
             return struct {
                 allocator: mem.Allocator,
+                name: []const u8,
                 topic: *Topic,
                 timer: Io.Timer = undefined,
                 consumers: std.ArrayList(*Consumer),
@@ -387,9 +391,10 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     requeue: usize = 0, // req by the client
                 } = .{},
 
-                fn init(allocator: mem.Allocator, topic: *Topic) Channel {
+                fn init(allocator: mem.Allocator, topic: *Topic, name: []const u8) Channel {
                     return .{
                         .allocator = allocator,
+                        .name = name,
                         .topic = topic,
                         .consumers = std.ArrayList(*Consumer).init(allocator),
                         .in_flight = std.AutoArrayHashMap(u64, *ChannelMsg).init(allocator),
@@ -855,6 +860,8 @@ const TestConsumer = struct {
     fn msgTimeout(_: *Self) u32 {
         return 60000;
     }
+
+    fn channelClosed(_: *Self) void {}
 };
 
 const TestIo = struct {
