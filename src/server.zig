@@ -30,9 +30,9 @@ const TopicMsg = struct {
     // Defer message delivery until timestamp is reached.
     defer_until: u64 = 0,
 
-    const frame_type = @intFromEnum(@import("protocol.zig").FrameType.message);
-
     fn asChannelMsg(self: TopicMsg) ChannelMsg {
+        const frame_type = @intFromEnum(@import("protocol.zig").FrameType.message);
+
         var header: [34]u8 = .{0} ** 34;
         mem.writeInt(u32, header[0..4], @intCast(self.body.len + 30), .big); // size
         mem.writeInt(u32, header[4..8], frame_type, .big); // frame type
@@ -176,6 +176,12 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             const topic = self.topics.get(name) orelse return error.NotFound;
             try topic.pause(paused);
             log.debug("paused topic {s}", .{name});
+        }
+
+        pub fn emptyTopic(self: *Server, name: []const u8) !void {
+            const topic = self.topics.get(name) orelse return error.NotFound;
+            try topic.empty();
+            log.debug("empty topic {s}", .{name});
         }
 
         fn getTopic(self: *Server, name: []const u8) !*Topic {
@@ -379,9 +385,18 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     }
                 }
 
+                fn empty(self: *Topic) !void {
+                    _ = self;
+                }
+
                 fn pauseChannel(self: *Topic, name: []const u8, paused: bool) !void {
                     const channel = self.channels.get(name) orelse return error.NotFound;
                     try channel.pause(paused);
+                }
+
+                fn emptyChannel(self: *Topic, name: []const u8) !void {
+                    const channel = self.channels.get(name) orelse return error.NotFound;
+                    try channel.empty();
                 }
             };
         }
@@ -571,24 +586,25 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     if (self.in_flight.fetchSwapRemove(seq)) |kv| {
                         self.stat.finish += 1;
                         self.allocator.destroy(kv.value);
-
-                        { // Move self.sequence or add seq to finished
-                            const before = self.offset;
-                            if (seq == self.offset + 1) {
-                                self.offset = seq;
-                            } else {
-                                try self.finished.add(seq);
-                            }
-                            while (self.finished.peek() == self.offset + 1) {
-                                self.offset = self.finished.remove();
-                            }
-                            if (self.offset > before) {
-                                self.topic.fin(self.offset);
-                            }
-                        }
+                        try self.updateOffset(seq);
                         return true;
                     }
                     return false;
+                }
+
+                fn updateOffset(self: *Channel, seq: u64) !void {
+                    const before = self.offset;
+                    if (seq == self.offset + 1) {
+                        self.offset = seq;
+                    } else {
+                        try self.finished.add(seq);
+                    }
+                    while (self.finished.peek() == self.offset + 1) {
+                        self.offset = self.finished.remove();
+                    }
+                    if (self.offset > before) {
+                        self.topic.fin(self.offset);
+                    }
                 }
 
                 /// Extend message timeout for interval (nanoseconds).
@@ -688,6 +704,10 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     if (self.paused == paused) return;
                     self.paused = paused;
                     if (!self.paused) try self.wakeup();
+                }
+
+                fn empty(self: *Channel) !void {
+                    self.next = null;
                 }
 
                 fn deinit(self: *Channel) void {
