@@ -15,10 +15,10 @@ const lookup = @import("lookup.zig");
 const log = std.log.scoped(.main);
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-    //const allocator = std.heap.c_allocator;
+    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    // defer _ = gpa.deinit();
+    // const allocator = gpa.allocator();
+    const allocator = std.heap.c_allocator;
     const options: Options = .{};
 
     const tcp_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.tcp_port);
@@ -114,13 +114,9 @@ fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
     while (ti.next()) |te| {
         const topic_name = te.key_ptr.*;
         const topic = te.value_ptr.*;
-        const size = topic.messages.size();
-        print("  {s} messages: {d} bytes: {} {}Mb {}Gb, sequence: {}\n", .{
+        print("  {s} depth: {d}  sequence: {}\n", .{
             topic_name,
-            topic.messages.count(),
-            size,
-            size / 1024 / 1024,
-            size / 1024 / 1024 / 1024,
+            topic.depth,
             topic.sequence,
         });
 

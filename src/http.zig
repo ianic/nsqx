@@ -314,7 +314,7 @@ fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
 
         topics[topic_idx] = Stat.Topic{
             .topic_name = topic_name,
-            .depth = topic.messages.count(),
+            .depth = topic.depth,
             .message_count = topic.sequence,
             .message_bytes = 0, // TODO
             .paused = topic.paused,

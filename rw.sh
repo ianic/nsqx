@@ -1,10 +1,11 @@
 #!/bin/bash
-set -e
 # set -u
 set -m
 
-kilall nsqadmin >> /dev/null && true
-kilall nsqlookup >> /dev/null  && true
+killall nsqadmin  >> /dev/null 2>&1
+killall nsqlookup >> /dev/null 2>&1
+
+set -e
 
 cd ~/Code/nsql
 zig build -Doptimize=ReleaseFast
@@ -18,8 +19,10 @@ cd ~/Code/nsql
 ./zig-out/bin/nsql 2>stat &
 nsqd_pid=$!
 
-sh -c 'while pkill -usr1 nsql; do sleep 10; done' &
-stat_pid=$!
+#sh -c 'while pkill -usr1 nsql; do sleep 10; done' &
+#stat_pid=$!
+
+sleep 0.3
 
 sh -c 'while ~/Code/go/nsq/bench/bench_writer/bench_writer ; do : ; done' &
 writer_pid=$!
@@ -34,7 +37,7 @@ cleanup() {
 
     killall bench_reader >> /dev/null
     killall bench_writer >> /dev/null
-    kill $stat_pid >> /dev/null
+    # kill $stat_pid >> /dev/null
     kill $admin_pid >> /dev/null
 
     sleep 1
