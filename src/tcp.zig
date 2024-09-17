@@ -309,7 +309,7 @@ pub const Conn = struct {
         var n: usize = 0;
         for (msgs) |msg| {
             self.send_vec[n] = .{ .base = &msg.header, .len = msg.header.len };
-            self.send_vec[n + 1] = .{ .base = msg.body.ptr, .len = msg.body.len };
+            self.send_vec[n + 1] = .{ .base = msg.body().ptr, .len = msg.body().len };
             n += 2;
         }
         try self.send(n);

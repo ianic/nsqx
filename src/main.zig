@@ -15,10 +15,10 @@ const lookup = @import("lookup.zig");
 const log = std.log.scoped(.main);
 
 pub fn main() !void {
-    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer _ = gpa.deinit();
-    // const allocator = gpa.allocator();
-    const allocator = std.heap.c_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    //const allocator = std.heap.c_allocator;
     const options: Options = .{};
 
     const tcp_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.tcp_port);
@@ -128,12 +128,11 @@ fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
         while (ci.next()) |ce| {
             const channel_name = ce.key_ptr.*;
             const channel = ce.value_ptr.*;
-            print("  --{s} consumers: {},  in flight messages: {}, deferred: {}, offset: {}\n", .{
+            print("  --{s} consumers: {},  in flight messages: {}, deferred: {}\n", .{
                 channel_name,
                 channel.consumers.items.len,
                 channel.in_flight.count(),
                 channel.deferred.count(),
-                channel.offset,
             });
             print("    pull: {}, send: {}, finish: {}, timeout: {}, requeue: {}\n", .{
                 channel.stat.pull,

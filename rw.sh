@@ -3,6 +3,9 @@ set -e
 # set -u
 set -m
 
+kilall nsqadmin >> /dev/null && true
+kilall nsqlookup >> /dev/null  && true
+
 cd ~/Code/nsql
 zig build -Doptimize=ReleaseFast
 
