@@ -28,17 +28,17 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
         allocator: mem.Allocator,
         topics: std.StringHashMap(*Topic),
-        started_at: u64,
         io: *Io,
         notifier: *Notifier,
+        started_at: u64,
 
         pub fn init(allocator: mem.Allocator, io: *Io, notifier: *Notifier) Server {
             return .{
                 .allocator = allocator,
                 .topics = std.StringHashMap(*Topic).init(allocator),
-                .started_at = io.now(),
                 .io = io,
                 .notifier = notifier,
+                .started_at = io.now(),
             };
         }
 
@@ -97,7 +97,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             const key = try self.allocator.dupe(u8, name);
             errdefer self.allocator.free(key);
 
-            topic.* = Topic.init(self.allocator, self, key);
+            topic.* = Topic.init(self, key);
             try self.topics.put(key, topic);
             try self.notifier.topicCreated(key);
             log.debug("created topic {s}", .{name});
@@ -218,7 +218,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     total_bytes: usize = 0,
                 } = .{},
 
-                pub fn init(allocator: mem.Allocator, server: *Server, name: []const u8) Topic {
+                pub fn init(server: *Server, name: []const u8) Topic {
+                    const allocator = server.allocator;
                     return .{
                         .allocator = allocator,
                         .name = name,
@@ -250,7 +251,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     const key = try self.allocator.dupe(u8, name);
                     errdefer self.allocator.free(key);
 
-                    channel.* = Channel.init(self.allocator, self, key);
+                    channel.* = Channel.init(self, key);
                     channel.initTimer(self.server.io);
                     try self.server.notifier.channelCreated(self.name, channel.name);
                     try self.channels.put(key, channel);
@@ -515,7 +516,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 } = .{},
                 paused: bool = false,
 
-                fn init(allocator: mem.Allocator, topic: *Topic, name: []const u8) Channel {
+                fn init(topic: *Topic, name: []const u8) Channel {
+                    const allocator = topic.allocator;
                     return .{
                         .allocator = allocator,
                         .name = name,
@@ -1307,27 +1309,27 @@ test "topic pause" {
 
     { // while channel is paused topic messages are not delivered to the channel
         try testing.expect(!channel.paused);
-        try server.pauseChannel(topic_name, channel_name, true);
+        try server.pauseChannel(topic_name, channel_name);
         try testing.expect(channel.paused);
 
         try consumer.pull();
         try testing.expectEqual(0, channel.in_flight.count());
 
         // unpause will pull message
-        try server.pauseChannel(topic_name, channel_name, false);
+        try server.unpauseChannel(topic_name, channel_name);
         try testing.expectEqual(1, channel.in_flight.count());
     }
 
     { // same while topic is paused
         try testing.expect(!topic.paused);
-        try server.pauseTopic(topic_name, true);
+        try server.pauseTopic(topic_name);
         try testing.expect(topic.paused);
 
         try consumer.pull();
         try testing.expectEqual(1, channel.in_flight.count());
 
         // unpause
-        try server.pauseTopic(topic_name, false);
+        try server.unpauseTopic(topic_name);
         try testing.expectEqual(2, channel.in_flight.count());
     }
 
