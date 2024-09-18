@@ -40,12 +40,18 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             rc: usize = 0,
 
             pub fn release(self: *TopicMsg) void {
+                // std.debug.print("release {} {}\n", .{ self.rc, self });
                 assert(self.rc > 0);
                 self.rc -= 1;
                 if (self.rc == 0) {
                     const next = self.next;
-                    self.topic.deleteMessage(self);
-                    if (next) |n| n.release();
+                    const topic = self.topic;
+                    topic.deleteMessage(self);
+                    if (next) |n| {
+                        n.release();
+                    } else {
+                        topic.last = null;
+                    }
                 }
             }
 
@@ -278,9 +284,17 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 sequence: u64 = 0,
                 first: ?*TopicMsg = null, // starting point for first channel
                 last: ?*TopicMsg = null, // linked list of topic messages
-                depth: u64 = 0,
-                fin_count: usize = 0, // fin's in channels
                 paused: bool = false,
+                metric: struct {
+                    // Current number of messages in the topic linked list.
+                    depth: usize = 0,
+                    // Size in bytes of the current messages.
+                    depth_bytes: usize = 0,
+                    // Total number of messages.
+                    total: usize = 0,
+                    // Total size of all messages.
+                    total_bytes: usize = 0,
+                } = .{},
 
                 pub fn init(allocator: mem.Allocator, server: *Server, name: []const u8) Topic {
                     return .{
@@ -302,7 +316,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     // First channel gets all messages from the topic
                     if (self.channels.count() == 1) {
                         channel.next = self.first;
-                        channel.metric.depth = self.depth;
+                        channel.metric.depth = self.metric.depth;
                         self.first = null;
                     }
                     return channel;
@@ -327,7 +341,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     var iter = self.channels.iterator();
                     while (iter.next()) |e| self.deinitChannel(e.value_ptr.*);
                     self.channels.deinit();
-                    if (self.last) |l| l.release();
+                    //if (self.last) |l| l.release();
                 }
 
                 fn deinitChannel(self: *Topic, channel: *Channel) void {
@@ -369,12 +383,9 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     // Update last pointer
                     if (self.last) |prev| {
                         assert(prev.sequence + 1 == msg.sequence);
-                        self.last = msg.acquire();
                         prev.next = msg.acquire(); // Previous points to new
-                        prev.release(); // Decrement previous reference count
-                    } else {
-                        self.last = msg.acquire();
                     }
+                    self.last = msg;
 
                     // If there is no channels messages are accumulated in
                     // topic. We need to hold pointer to the first message (to
@@ -400,14 +411,19 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         .body = body,
                         .rc = 0,
                     };
-                    self.depth += 1;
+                    self.metric.depth += 1;
+                    self.metric.depth_bytes +%= body.len;
+                    self.metric.total +%= 1;
+                    self.metric.total_bytes +%= body.len;
                     return msg;
                 }
 
                 fn deleteMessage(self: *Topic, msg: *TopicMsg) void {
+                    //std.debug.print("deleteMessage {} {}\n", .{ msg.sequence, msg });
+                    self.metric.depth -= 1;
+                    self.metric.depth_bytes -|= msg.body.len;
                     self.allocator.free(msg.body);
                     self.allocator.destroy(msg);
-                    self.depth -= 1;
                 }
 
                 // Notify all channels that there is pending messages
@@ -438,7 +454,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     if (self.first) |first| {
                         first.release();
                         self.first = null;
-                        self.depth = 0;
+                        self.metric.depth = 0;
+                        self.metric.depth_bytes = 0;
                     }
                 }
 
@@ -1124,7 +1141,7 @@ test "first channel gets all messages accumulated in topic" {
         try server.publish(topic_name, "message body");
 
     const topic = try server.getOrCreateTopic(topic_name);
-    try testing.expectEqual(no, topic.depth);
+    try testing.expectEqual(no, topic.metric.depth);
 
     // subscribe creates channel
     var consumer = TestConsumer.init(allocator);
@@ -1132,7 +1149,7 @@ test "first channel gets all messages accumulated in topic" {
     const channel = try server.sub(&consumer, topic_name, channel_name);
     consumer.channel = channel;
     try testing.expect(channel.next != null);
-    try testing.expectEqual(16, topic.depth);
+    try testing.expectEqual(16, topic.metric.depth);
     try testing.expectEqual(no, channel.metric.depth);
 
     for (0..no) |i| {
@@ -1265,7 +1282,7 @@ test "topic pause" {
     {
         try server.publish(topic_name, "message 1");
         try server.publish(topic_name, "message 2");
-        try testing.expectEqual(2, topic.depth);
+        try testing.expectEqual(2, topic.metric.depth);
     }
 
     var consumer = TestConsumer.init(allocator);
@@ -1435,28 +1452,43 @@ test "depth" {
     try server.publish(topic_name, "message 1");
     try server.publish(topic_name, "message 2");
 
-    try testing.expectEqual(2, topic.depth);
+    try testing.expectEqual(2, topic.metric.depth);
     try testing.expectEqual(2, channel1.metric.depth);
     try testing.expectEqual(2, channel2.metric.depth);
 
+    try testing.expectEqual(1, channel1.next.?.sequence);
+    try testing.expectEqual(1, channel2.next.?.sequence);
     try consumer1.pullAndFin();
-    try testing.expectEqual(2, topic.depth);
+    try testing.expectEqual(2, channel1.next.?.sequence);
+
+    try testing.expectEqual(2, topic.metric.depth);
     try testing.expectEqual(1, channel1.metric.depth);
     try testing.expectEqual(2, channel2.metric.depth);
 
     try consumer2.pullAndFin();
-    try testing.expectEqual(1, topic.depth);
+    try testing.expectEqual(1, topic.metric.depth);
     try testing.expectEqual(1, channel1.metric.depth);
     try testing.expectEqual(1, channel2.metric.depth);
 
     try consumer2.pullAndFin();
-    try testing.expectEqual(1, topic.depth);
+    try testing.expectEqual(1, topic.metric.depth);
     try testing.expectEqual(1, channel1.metric.depth);
     try testing.expectEqual(0, channel2.metric.depth);
 
     try server.publish(topic_name, "message 3");
 
-    try testing.expectEqual(2, topic.depth);
+    try testing.expectEqual(2, topic.metric.depth);
     try testing.expectEqual(2, channel1.metric.depth);
     try testing.expectEqual(1, channel2.metric.depth);
+
+    { // When all pulled: depth to 0, topic.last is null
+        try testing.expectEqual(3, topic.last.?.sequence);
+        try consumer2.pullAndFin();
+        try consumer1.pullAndFin();
+        try consumer1.pullAndFin();
+        try testing.expectEqual(0, channel1.metric.depth);
+        try testing.expectEqual(0, channel2.metric.depth);
+        try testing.expectEqual(0, topic.metric.depth);
+        try testing.expect(topic.last == null);
+    }
 }

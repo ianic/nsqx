@@ -37,9 +37,18 @@ cd ~/Code/nsql
 ./zig-out/bin/nsql &
 nsql_pid=$!
 
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel1 -topic topic1  | sed "s/^/[channel1] /" &
+
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel2 -topic topic1  | sed "s/^/[channel2 conusmer1] /" &
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel2 -topic topic1  | sed "s/^/[channel2 consumer2] /" &
+
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel3 -topic topic1  | sed "s/^/[channel3 conusmer1] /" &
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel3 -topic topic1  | sed "s/^/[channel3 consumer2] /" &
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel3 -topic topic1  | sed "s/^/[channel3 consumer3] /" &
 
 cleanup() {
     set +e
+    killall nsq_tila >> /dev/null 2>&1
     kill $nsql_pid >> /dev/null
     kill $admin_pid >> /dev/null
     kill $lookupd_pid >> /dev/null

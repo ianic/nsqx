@@ -117,7 +117,7 @@ fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
         const topic = te.value_ptr.*;
         print("  {s} depth: {d}  sequence: {}\n", .{
             topic_name,
-            topic.depth,
+            topic.metric.depth,
             topic.sequence,
         });
 
