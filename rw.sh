@@ -2,6 +2,7 @@
 # set -u
 set -m
 
+killall nsql  >> /dev/null 2>&1
 killall nsqadmin  >> /dev/null 2>&1
 killall nsqlookup >> /dev/null 2>&1
 
@@ -22,7 +23,7 @@ nsqd_pid=$!
 #sh -c 'while pkill -usr1 nsql; do sleep 10; done' &
 #stat_pid=$!
 
-sleep 0.3
+sleep 1
 
 sh -c 'while ~/Code/go/nsq/bench/bench_writer/bench_writer ; do : ; done' &
 writer_pid=$!

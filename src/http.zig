@@ -300,7 +300,7 @@ fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
 
             channels[channel_idx] = Stat.Channel{
                 .channel_name = channel_name,
-                .depth = channel.in_flight.count() + channel.deferred.count(),
+                .depth = channel.depth,
                 .in_flight_count = channel.in_flight.count(),
                 .deferred_count = channel.deferred.count(),
                 .message_count = channel.stat.pull,

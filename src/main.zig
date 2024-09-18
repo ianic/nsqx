@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const Atomic = std.atomic.Value;
 
@@ -8,17 +9,17 @@ const tcp = @import("tcp.zig");
 const http = @import("http.zig");
 const lookup = @import("lookup.zig");
 
-// pub const std_options = std.Options{
-//     .log_level = .info,
-// };
-//
+pub const std_options = std.Options{
+    .log_level = .info,
+};
+
 const log = std.log.scoped(.main);
 
 pub fn main() !void {
-    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    // defer _ = gpa.deinit();
-    // const allocator = gpa.allocator();
-    const allocator = std.heap.c_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = if (builtin.mode == .ReleaseFast) std.heap.c_allocator else gpa.allocator();
+
     const options: Options = .{};
 
     const tcp_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.tcp_port);

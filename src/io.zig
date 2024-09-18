@@ -302,7 +302,8 @@ pub const Io = struct {
         self.stat.loops += 1;
         const n = try self.readCompletions(&cqes);
         if (n > 0) {
-            self.timestamp = timestamp();
+            const new_timestamp = timestamp();
+            self.timestamp = if (new_timestamp == self.timestamp) new_timestamp + 1 else new_timestamp;
             try self.flushCompletions(cqes[0..n]);
         }
     }

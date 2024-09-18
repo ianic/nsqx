@@ -75,6 +75,7 @@ const TopicMsg = struct {
 pub const ChannelMsg = struct {
     msg: *TopicMsg,
     header: [34]u8,
+    sent_at: u64 = 0,
     in_flight_socket: socket_t = 0,
     // Timestamp in nanoseconds. When in flight and timestamp is reached message should
     // be re-queued. If deferred message should not be delivered until timestamp
@@ -356,15 +357,16 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                 pub fn multiPublish(self: *Topic, msgs: u32, data: []const u8) !void {
                     var pos: usize = 0;
-                    var first: ?*TopicMsg = null;
-                    for (0..msgs) |_| {
+                    var first: *TopicMsg = undefined;
+                    for (0..msgs) |i| {
                         const len = mem.readInt(u32, data[pos..][0..4], .big);
                         pos += 4;
                         const msg = try self.append(data[pos..][0..len]);
-                        if (first == null) first = msg;
+                        if (i == 0) first = msg.acquire();
                         pos += len;
                     }
-                    try self.notifyChannels(first.?, msgs);
+                    try self.notifyChannels(first, msgs);
+                    first.release();
                 }
 
                 fn append(self: *Topic, data: []const u8) !*TopicMsg {
@@ -513,6 +515,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     var n: usize = 0;
                     while (n < msgs.len) : (n += 1) {
                         if (self.getMsg() catch null) |msg| {
+                            msg.sent_at = self.timer.now();
                             msg.in_flight_socket = consumer.socket;
                             try self.inFlightAppend(msg, nsFromMs(consumer.msgTimeout()));
                             msgs[n] = msg;
@@ -667,19 +670,20 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
 
                 pub fn unsub(self: *Channel, consumer: *Consumer) !void {
-                    // Remove in_flight messages of that consumer
-                    outer: while (true) {
+                    { // Remove in_flight messages of that consumer
+                        var msgs = std.ArrayList(*ChannelMsg).init(self.allocator);
+                        defer msgs.deinit();
                         for (self.in_flight.values()) |msg| {
-                            if (msg.in_flight_socket == consumer.socket) {
-                                _ = try self.req(msg.id(), 0);
-                                continue :outer; // restart on delete from in_flight
-                            }
+                            if (msg.in_flight_socket == consumer.socket)
+                                try msgs.append(msg);
                         }
-                        break;
+                        for (msgs.items) |msg| try self.requeue(msg, 0);
+                        self.stat.requeue += msgs.items.len;
                     }
+
                     // Remove consumer
                     for (self.consumers.items, 0..) |item, i| {
-                        if (item.socket == consumer.socket) {
+                        if (item == consumer) {
                             _ = self.consumers.swapRemove(i);
                             return;
                         }
@@ -732,8 +736,29 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
 
                 fn empty(self: *Channel) !void {
-                    for (self.in_flight.values()) |cm| cm.deinit(self.allocator);
-                    self.in_flight.clearAndFree();
+                    { // Remove in-flight messages that are not currently in the kernel
+                        var msgs = std.ArrayList(*ChannelMsg).init(self.allocator);
+                        defer msgs.deinit();
+                        for (self.consumers.items) |consumer| { // For each consumer
+                            for (self.in_flight.values()) |cm| {
+                                if (cm.in_flight_socket == consumer.socket and // If that messages is in-flight on that consumer
+                                    cm.sent_at < consumer.sent_at) // And send is returned from kernel
+                                    try msgs.append(cm);
+                            }
+                        }
+                        if (msgs.items.len == self.in_flight.count()) { // Hopefully there is no messages in the kernel
+                            // Remove all
+                            for (self.in_flight.values()) |cm| cm.deinit(self.allocator);
+                            self.in_flight.clearAndFree();
+                        } else {
+                            // Selectively remove
+                            for (msgs.items) |cm| {
+                                assert(self.in_flight.swapRemove(cm.sequence()));
+                                cm.deinit(self.allocator);
+                            }
+                        }
+                    }
+
                     while (self.deferred.removeOrNull()) |cm| cm.deinit(self.allocator);
                     self.depth = 0;
                     if (self.next) |n| n.release();
@@ -871,22 +896,33 @@ test "channel fin req" {
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
     }
-    { // fin seq 2, advances window start from sequence 1 to 3
+    { // fin seq 2
         try testing.expectEqual(1, channel.depth);
         try testing.expect(try channel.fin(ChannelMsg.idFromSeq(2))); // fin 2
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(0, channel.depth);
     }
+    { // consumer unsubscribe re-queues in-flight messages
+        try server.publish(topic_name, "4");
+        consumer.ready_count = 1;
+        try channel.wakeup();
+        try testing.expectEqual(1, channel.in_flight.count());
+        try channel.unsub(&consumer);
+        try testing.expectEqual(0, channel.in_flight.count());
+        try testing.expectEqual(1, channel.deferred.count());
+        try testing.expectEqual(0, channel.consumers.items.len);
+    }
 }
 
 const TestConsumer = struct {
     const Self = @This();
 
-    socket: socket_t = 0,
+    socket: socket_t = 42,
     channel: ?*TestServer.Channel = null,
     sequences: std.ArrayList(u64) = undefined,
     ready_count: usize = 1,
+    sent_at: u64 = 0,
 
     fn init(alloc: mem.Allocator) Self {
         return .{ .sequences = std.ArrayList(u64).init(alloc) };
@@ -1252,6 +1288,41 @@ test "topic pause" {
 
     try server.deleteTopic(topic_name);
     try testing.expect(consumer.channel == null);
+}
+
+test "channel empty" {
+    const allocator = testing.allocator;
+    const topic_name = "topic";
+    const channel_name = "channel";
+
+    var io = TestIo{};
+    var notifier = NoopNotifier{};
+    var server = TestServer.init(allocator, &io, &notifier);
+    defer server.deinit();
+
+    var consumer = TestConsumer.init(allocator);
+    defer consumer.deinit();
+
+    const channel = try server.sub(&consumer, topic_name, channel_name);
+    consumer.channel = channel;
+
+    io.timestamp = 1;
+    try server.publish(topic_name, "message 1");
+    try server.publish(topic_name, "message 2");
+
+    io.timestamp = 2;
+    try consumer.pull();
+    try testing.expectEqual(2, channel.in_flight.count());
+    try channel.empty();
+    try testing.expectEqual(2, channel.in_flight.count());
+
+    consumer.sent_at = 2;
+    try channel.empty();
+    try testing.expectEqual(1, channel.in_flight.count());
+
+    consumer.sent_at = 3;
+    try channel.empty();
+    try testing.expectEqual(0, channel.in_flight.count());
 }
 
 const TestNotifier = struct {

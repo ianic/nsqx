@@ -116,6 +116,7 @@ pub const Conn = struct {
         finish: u64 = 0,
         requeue: u64 = 0,
     } = .{},
+    sent_at: u64 = 0, // Timestamp of the last finished send
 
     const Response = enum {
         ok,
@@ -132,7 +133,7 @@ pub const Conn = struct {
             .addr = addr,
             .recv_buf = RecvBuf.init(listener.allocator),
         };
-        conn.stat.connected_at = listener.io.timestamp;
+        conn.stat.connected_at = listener.io.now();
         return conn;
     }
 
@@ -345,6 +346,7 @@ pub const Conn = struct {
 
     fn sent(self: *Conn) Error!void {
         self.send_op = null;
+        self.sent_at = self.io.now();
         try self.initSendVec();
         if (self.pending_response) |r| {
             try self.respond(r);
@@ -362,6 +364,7 @@ pub const Conn = struct {
 
     fn sendFailed(self: *Conn, err: anyerror) Error!void {
         self.send_op = null;
+        self.sent_at = self.io.now();
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.err("{} send failed {}", .{ self.socket, err }),
