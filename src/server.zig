@@ -53,9 +53,15 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             log.debug("deleted channel {s} on topic {s}", .{ name, topic_name });
         }
 
-        pub fn pauseChannel(self: *Server, topic_name: []const u8, name: []const u8, paused: bool) !void {
+        pub fn pauseChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
             const topic = self.topics.get(topic_name) orelse return error.NotFound;
-            try topic.pauseChannel(name, paused);
+            try topic.pauseChannel(name);
+            log.debug("paused channel {s} on topic {s}", .{ name, topic_name });
+        }
+
+        pub fn unpauseChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
+            const topic = self.topics.get(topic_name) orelse return error.NotFound;
+            try topic.unpauseChannel(name);
             log.debug("paused channel {s} on topic {s}", .{ name, topic_name });
         }
 
@@ -65,10 +71,16 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             log.debug("deleted topic {s}", .{name});
         }
 
-        pub fn pauseTopic(self: *Server, name: []const u8, paused: bool) !void {
+        pub fn pauseTopic(self: *Server, name: []const u8) !void {
             const topic = self.topics.get(name) orelse return error.NotFound;
-            try topic.pause(paused);
+            topic.pause();
             log.debug("paused topic {s}", .{name});
+        }
+
+        pub fn unpauseTopic(self: *Server, name: []const u8) !void {
+            const topic = self.topics.get(name) orelse return error.NotFound;
+            try topic.unpause();
+            log.debug("un-paused topic {s}", .{name});
         }
 
         pub fn emptyTopic(self: *Server, name: []const u8) !void {
@@ -350,13 +362,15 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     self.deinitChannel(kv.value);
                 }
 
-                fn pause(self: *Topic, paused: bool) !void {
-                    if (self.paused == paused) return;
-                    self.paused = paused;
-                    if (!self.paused) { // wake-up all channels
-                        var iter = self.channels.valueIterator();
-                        while (iter.next()) |ptr| try ptr.*.wakeup();
-                    }
+                fn pause(self: *Topic) void {
+                    self.paused = true;
+                }
+
+                fn unpause(self: *Topic) !void {
+                    self.paused = false;
+                    // wake-up all channels
+                    var iter = self.channels.valueIterator();
+                    while (iter.next()) |ptr| try ptr.*.wakeup();
                 }
 
                 fn empty(self: *Topic) !void {
@@ -368,9 +382,14 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     }
                 }
 
-                fn pauseChannel(self: *Topic, name: []const u8, paused: bool) !void {
+                fn pauseChannel(self: *Topic, name: []const u8) !void {
                     const channel = self.channels.get(name) orelse return error.NotFound;
-                    try channel.pause(paused);
+                    channel.pause();
+                }
+
+                fn unpauseChannel(self: *Topic, name: []const u8) !void {
+                    const channel = self.channels.get(name) orelse return error.NotFound;
+                    try channel.unpause();
                 }
 
                 fn emptyChannel(self: *Topic, name: []const u8) !void {
@@ -746,10 +765,13 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     return null;
                 }
 
-                fn pause(self: *Channel, paused: bool) !void {
-                    if (self.paused == paused) return;
-                    self.paused = paused;
-                    if (!self.paused) try self.wakeup();
+                fn pause(self: *Channel) void {
+                    self.paused = true;
+                }
+
+                fn unpause(self: *Channel) !void {
+                    self.paused = false;
+                    try self.wakeup();
                 }
 
                 fn empty(self: *Channel) !void {
