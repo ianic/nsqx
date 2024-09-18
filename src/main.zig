@@ -131,12 +131,11 @@ fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
                 channel.in_flight.count(),
                 channel.deferred.count(),
             });
-            print("    pull: {}, send: {}, finish: {}, timeout: {}, requeue: {}\n", .{
-                channel.stat.pull,
-                channel.stat.send,
-                channel.stat.finish,
-                channel.stat.timeout,
-                channel.stat.requeue,
+            print("    pull: {}, finish: {}, timeout: {}, requeue: {}\n", .{
+                channel.metric.pull,
+                channel.metric.finish,
+                channel.metric.timeout,
+                channel.metric.requeue,
             });
         }
     }

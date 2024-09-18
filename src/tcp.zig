@@ -13,7 +13,7 @@ const Error = @import("io.zig").Error;
 const lookup = @import("lookup.zig");
 pub const Server = @import("server.zig").ServerType(Conn, Io, lookup.Connector);
 const Channel = Server.Channel;
-const Msg = @import("server.zig").ChannelMsg;
+const Msg = Server.ChannelMsg;
 const max_msgs_send_batch_size = @import("server.zig").max_msgs_send_batch_size;
 
 const log = std.log.scoped(.tcp);

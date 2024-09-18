@@ -298,15 +298,37 @@ fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
                 };
             }
 
+            // gauge   - current value, can go up or down
+            // counter - summary value since start/creation, only increases
+
             channels[channel_idx] = Stat.Channel{
                 .channel_name = channel_name,
-                .depth = channel.depth,
-                .in_flight_count = channel.in_flight.count(),
-                .deferred_count = channel.deferred.count(),
-                .message_count = channel.stat.pull,
-                .requeue_count = channel.stat.requeue,
-                .timeout_count = channel.stat.timeout,
-                .client_count = client_count,
+
+                // Current number of messages published to the topic but not
+                // processed by this channel.
+                .depth = channel.metric.depth, // gauge
+
+                // Current number of in-flight messages, sent to the client but
+                // not fin jet.
+                .in_flight_count = channel.in_flight.count(), // gauge
+
+                // Current number of messages in the deferred queue. Message can be
+                // deferred by the client (re-queue action), by timeout while
+                // in-flight, or by producer (defer publish).
+                .deferred_count = channel.deferred.count(), // gauge
+
+                // Total number of messages finished by the clinet(s).
+                .message_count = channel.metric.finish, // counter
+
+                // Total number of messages re-queued by the client(s).
+                .requeue_count = channel.metric.requeue, // counter
+
+                // Total number of messages timed-out while in-flight.
+                .timeout_count = channel.metric.timeout, // counter
+
+                // Current number of connected clients.
+                .client_count = client_count, // gauge
+
                 .clients = clients,
                 .paused = channel.paused,
             };
