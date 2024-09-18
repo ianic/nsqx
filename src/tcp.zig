@@ -26,9 +26,10 @@ pub fn ListenerType(comptime ConnType: type) type {
         io: *Io,
         op: ?*Op = null,
         conns: std.AutoHashMap(socket_t, *ConnType),
-        stat: struct {
-            accepted: u64 = 0,
-            completed: u64 = 0,
+        metric: struct {
+            // Total number of
+            accept: u64 = 0, // accepted connections
+            close: u64 = 0, // closed (completed) connections
         } = .{},
 
         const Self = @This();
@@ -57,7 +58,7 @@ pub fn ListenerType(comptime ConnType: type) type {
             try self.conns.put(socket, conn);
             conn.* = ConnType.init(self, socket, addr);
             try conn.recv();
-            self.stat.accepted +%= 1;
+            self.metric.accept +%= 1;
         }
 
         fn failed(self: *Self, err: anyerror) Error!void {
@@ -81,7 +82,7 @@ pub fn ListenerType(comptime ConnType: type) type {
         pub fn remove(self: *Self, conn: *ConnType) void {
             assert(self.conns.remove(conn.socket));
             self.allocator.destroy(conn);
-            self.stat.completed +%= 1;
+            self.metric.close +%= 1;
         }
     };
 }
@@ -110,9 +111,10 @@ pub const Conn = struct {
     send_msghdr: posix.msghdr_const = .{ .iov = undefined, .iovlen = undefined, .name = null, .namelen = 0, .control = null, .controllen = 0, .flags = 0 },
     channel: ?*Channel = null,
     identify: protocol.Identify = .{},
-    stat: struct {
+    metric: struct {
         connected_at: u64 = 0,
-        messages: u64 = 0,
+        // Total number of
+        send: u64 = 0,
         finish: u64 = 0,
         requeue: u64 = 0,
     } = .{},
@@ -133,7 +135,7 @@ pub const Conn = struct {
             .addr = addr,
             .recv_buf = RecvBuf.init(listener.allocator),
         };
-        conn.stat.connected_at = listener.io.now();
+        conn.metric.connected_at = listener.io.now();
         return conn;
     }
 
@@ -253,7 +255,7 @@ pub const Conn = struct {
                 var channel = self.channel orelse return error.NotSubscribed;
                 self.in_flight -|= 1;
                 const res = try channel.fin(msg_id);
-                if (res) self.stat.finish += 1;
+                if (res) self.metric.finish += 1;
                 ready_changed.* = true;
                 log.debug("{} fin {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
             },
@@ -261,7 +263,7 @@ pub const Conn = struct {
                 var channel = self.channel orelse return error.NotSubscribed;
                 self.in_flight -|= 1;
                 const res = try channel.req(arg.msg_id, arg.delay);
-                if (res) self.stat.requeue += 1;
+                if (res) self.metric.requeue += 1;
                 log.debug("{} req {} {}", .{ self.socket, Msg.seqFromId(arg.msg_id), res });
             },
             .touch => |msg_id| {
@@ -306,7 +308,6 @@ pub const Conn = struct {
 
     pub fn sendMsgs(self: *Conn, msgs: []*Msg) !void {
         assert(msgs.len <= self.send_vec.len / 2);
-        self.stat.messages += msgs.len;
         var n: usize = 0;
         for (msgs) |msg| {
             self.send_vec[n] = .{ .base = &msg.header, .len = msg.header.len };
@@ -314,15 +315,8 @@ pub const Conn = struct {
             n += 2;
         }
         try self.send(n);
+        self.metric.send += msgs.len;
         self.in_flight += @intCast(msgs.len);
-    }
-
-    pub fn sendMsg(self: *Conn, msg: *Msg) !void {
-        self.stat.messages += 1;
-        self.send_vec[0] = .{ .base = &msg.header, .len = msg.header.len };
-        self.send_vec[1] = .{ .base = msg.body.ptr, .len = msg.body.len };
-        try self.send(2);
-        self.in_flight += 1;
     }
 
     fn send(self: *Conn, vec_len: usize) !void {

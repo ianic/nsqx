@@ -35,9 +35,9 @@ pub const Io = struct {
             return @as(f64, @floatFromInt(self.no_bufs)) / @as(f64, @floatFromInt(total)) * 100;
         }
     } = .{},
-    stat: Stat = .{},
+    metric: Metric = .{},
 
-    const Stat = struct {
+    const Metric = struct {
         loops: usize = 0,
         cqes: usize = 0,
 
@@ -88,7 +88,7 @@ pub const Io = struct {
             }
         };
 
-        fn submit(self: *Stat, op: *Op) void {
+        fn submit(self: *Metric, op: *Op) void {
             self.all.submit();
             switch (op.args) {
                 .accept => self.accept.submit(),
@@ -102,7 +102,7 @@ pub const Io = struct {
             }
         }
 
-        fn complete(self: *Stat, op: *Op) void {
+        fn complete(self: *Metric, op: *Op) void {
             self.all.complete();
             switch (op.args) {
                 .accept => self.accept.complete(),
@@ -116,7 +116,7 @@ pub const Io = struct {
             }
         }
 
-        fn restart(self: *Stat, op: *Op) void {
+        fn restart(self: *Metric, op: *Op) void {
             self.all.restart();
             switch (op.args) {
                 .accept => self.accept.restart(),
@@ -160,7 +160,7 @@ pub const Io = struct {
     }
 
     fn release(self: *Io, op: *Op) void {
-        self.stat.complete(op);
+        self.metric.complete(op);
         self.allocator.destroy(op);
     }
 
@@ -299,7 +299,7 @@ pub const Io = struct {
 
     pub fn tick(self: *Io) !void {
         var cqes: [256]std.os.linux.io_uring_cqe = undefined;
-        self.stat.loops += 1;
+        self.metric.loops += 1;
         const n = try self.readCompletions(&cqes);
         if (n > 0) {
             const new_timestamp = timestamp();
@@ -309,8 +309,8 @@ pub const Io = struct {
     }
 
     pub fn drain(self: *Io) !void {
-        while (self.stat.all.active() > 0) {
-            log.debug("draining active operations: {}", .{self.stat.all.active()});
+        while (self.metric.all.active() > 0) {
+            log.debug("draining active operations: {}", .{self.metric.all.active()});
             try self.tick();
         }
     }
@@ -327,7 +327,7 @@ pub const Io = struct {
     }
 
     fn flushCompletions(self: *Io, cqes: []linux.io_uring_cqe) !void {
-        self.stat.cqes += cqes.len;
+        self.metric.cqes += cqes.len;
         for (cqes) |cqe| {
             if (cqe.user_data == 0) continue; // no op for this cqe
             const op: *Op = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
@@ -353,7 +353,7 @@ pub const Io = struct {
                     switch (res) {
                         .done => self.release(op),
                         .restart => {
-                            self.stat.restart(op);
+                            self.metric.restart(op);
                             try op.prep();
                         },
                     }
@@ -524,7 +524,7 @@ pub const Op = struct {
     }
 
     fn prep(op: *Op) !void {
-        op.io.stat.submit(op);
+        op.io.metric.submit(op);
         const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
         switch (op.args) {
             .accept => |*arg| _ = try op.io.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),

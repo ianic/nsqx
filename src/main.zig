@@ -91,19 +91,19 @@ fn mallocTrim() void {
 fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
     const print = std.debug.print;
     print("listener connections:\n", .{});
-    print("  active {}, accepted: {}, completed: {}\n", .{ listener.stat.accepted - listener.stat.completed, listener.stat.accepted, listener.stat.completed });
+    print("  active {}, accepted: {}, completed: {}\n", .{ listener.metric.accept - listener.metric.close, listener.metric.accept, listener.metric.close });
 
     print("io operations: loops: {}, cqes: {}, cqes/loop {}\n", .{
-        io.stat.loops,
-        io.stat.cqes,
-        if (io.stat.loops > 0) io.stat.cqes / io.stat.loops else 0,
+        io.metric.loops,
+        io.metric.cqes,
+        if (io.metric.loops > 0) io.metric.cqes / io.metric.loops else 0,
     });
-    print("  all    {}\n", .{io.stat.all});
-    print("  recv   {}\n", .{io.stat.recv});
-    print("  sendv  {}\n", .{io.stat.sendv});
-    print("  ticker {}\n", .{io.stat.ticker});
-    print("  close  {}\n", .{io.stat.close});
-    print("  accept {}\n", .{io.stat.accept});
+    print("  all    {}\n", .{io.metric.all});
+    print("  recv   {}\n", .{io.metric.recv});
+    print("  sendv  {}\n", .{io.metric.sendv});
+    print("  ticker {}\n", .{io.metric.ticker});
+    print("  close  {}\n", .{io.metric.close});
+    print("  accept {}\n", .{io.metric.accept});
 
     print(
         "  receive buffers group:\n    success: {}, no-buffs: {} {d:5.2}%\n",
