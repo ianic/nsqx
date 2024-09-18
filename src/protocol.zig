@@ -5,38 +5,38 @@ const fmt = std.fmt;
 pub const Message = union(MessageTag) {
     version: void,
     identify: []const u8,
-    sub: struct {
+    subscribe: struct {
         topic: []const u8,
         channel: []const u8,
     },
-    spub: struct {
+    publish: struct {
         topic: []const u8,
         data: []const u8,
     },
-    mpub: struct {
+    multi_publish: struct {
         topic: []const u8,
         msgs: u32, // number of messages in data
         data: []const u8, // [ 4-byte message #1 size ][ N-byte binary data ]...
     },
-    dpub: struct {
+    deferred_publish: struct {
         topic: []const u8,
         data: []const u8,
         delay: u32, //  defer publish for delay milliseconds
     },
-    rdy: u32,
-    fin: [16]u8,
-    req: struct {
+    ready: u32,
+    finish: [16]u8,
+    requeue: struct {
         msg_id: [16]u8,
         delay: u32, //  defer requeue for delay milliseconds
     },
     touch: [16]u8,
-    cls: void,
+    close: void,
     nop: void,
     auth: []const u8,
 
     pub fn isPublish(self: @This()) bool {
         return switch (self) {
-            .spub, .mpub, .dpub => true,
+            .publish, .multi_publish, .deferred_publish => true,
             else => false,
         };
     }
@@ -69,15 +69,15 @@ pub const Options = struct {
 const MessageTag = enum {
     version,
     identify,
-    sub,
-    spub, // pub is keyword, so calling it single publish
-    mpub,
-    dpub,
-    rdy,
-    fin,
-    req,
+    subscribe,
+    publish, // pub is keyword, so calling it single publish
+    multi_publish,
+    deferred_publish,
+    ready,
+    finish,
+    requeue,
     touch,
-    cls,
+    close,
     nop,
     auth,
 };
@@ -129,14 +129,14 @@ pub const Parser = struct {
                 try p.matchString("SUB ");
                 const topic = try p.readString(' ');
                 const channel = try p.readString('\n');
-                return .{ .sub = .{ .topic = topic, .channel = channel } };
+                return .{ .subscribe = .{ .topic = topic, .channel = channel } };
             },
             'P' => {
                 // PUB <topic_name>\n[ 4-byte size in bytes ][ N-byte binary data ]
                 try p.matchString("PUB ");
                 const topic = try p.readString('\n');
                 const data = try p.readBytes(try p.readInt());
-                return .{ .spub = .{ .topic = topic, .data = data } };
+                return .{ .publish = .{ .topic = topic, .data = data } };
             },
             'M' => {
                 // MPUB <topic_name>\n[ 4-byte body size ][ 4-byte num messages ]
@@ -156,7 +156,7 @@ pub const Parser = struct {
                 }
                 if (p.pos != data_end_pos) return error.Invalid;
 
-                return .{ .mpub = .{ .topic = topic, .msgs = msgs, .data = data } };
+                return .{ .multi_publish = .{ .topic = topic, .msgs = msgs, .data = data } };
             },
             'D' => {
                 // DPUB <topic_name> <defer_time>\n
@@ -166,7 +166,7 @@ pub const Parser = struct {
                 const delay = try p.readStringInt('\n');
                 const size = try p.readInt();
                 const data = try p.readBytes(size);
-                return .{ .dpub = .{ .topic = topic, .delay = delay, .data = data } };
+                return .{ .deferred_publish = .{ .topic = topic, .delay = delay, .data = data } };
             },
             'R' => {
                 switch (p.buf[p.pos + 1]) {
@@ -174,14 +174,14 @@ pub const Parser = struct {
                         // RDY <count>\n
                         try p.matchString("RDY ");
                         const count = try p.readStringInt('\n');
-                        return .{ .rdy = count };
+                        return .{ .ready = count };
                     },
                     'E' => {
                         // REQ <message_id> <timeout>\n
                         try p.matchString("REQ ");
                         const msg_id = try p.readMessageId(' ');
                         const delay = try p.readStringInt('\n');
-                        return .{ .req = .{ .msg_id = msg_id, .delay = delay } };
+                        return .{ .requeue = .{ .msg_id = msg_id, .delay = delay } };
                     },
                     else => return error.Invalid,
                 }
@@ -190,7 +190,7 @@ pub const Parser = struct {
                 // FIN <message_id>\n
                 try p.matchString("FIN ");
                 const msg_id = try p.readMessageId('\n');
-                return .{ .fin = msg_id };
+                return .{ .finish = msg_id };
             },
             'T' => {
                 // TOUCH <message_id>\n
@@ -200,7 +200,7 @@ pub const Parser = struct {
             },
             'C' => { // CLS\n
                 try p.matchString("CLS\n");
-                return .{ .cls = {} };
+                return .{ .close = {} };
             },
             'N' => { // NOP\n
                 try p.matchString("NOP\n");
@@ -291,13 +291,13 @@ test "sub" {
     {
         var p = Parser{ .buf = buf };
         var m = try p.parse();
-        try testing.expectEqualStrings(m.sub.topic, "pero");
-        try testing.expectEqualStrings(m.sub.channel, "zdero");
+        try testing.expectEqualStrings(m.subscribe.topic, "pero");
+        try testing.expectEqualStrings(m.subscribe.channel, "zdero");
         try testing.expectEqual(15, p.pos);
         try testing.expectEqual('S', buf[15]);
         m = try p.parse();
-        try testing.expectEqualStrings(m.sub.topic, "jozo");
-        try testing.expectEqualStrings(m.sub.channel, "bozo");
+        try testing.expectEqualStrings(m.subscribe.topic, "jozo");
+        try testing.expectEqualStrings(m.subscribe.channel, "bozo");
         try testing.expectEqual(29, p.pos);
         try testing.expectEqual('-', buf[29]);
     }
@@ -317,13 +317,13 @@ test "pub" {
     {
         var p = Parser{ .buf = buf };
         var m = try p.parse();
-        try testing.expectEqualStrings("pero", m.spub.topic);
-        try testing.expectEqualStrings("zdero", m.spub.data);
+        try testing.expectEqualStrings("pero", m.publish.topic);
+        try testing.expectEqualStrings("zdero", m.publish.data);
         try testing.expectEqual(18, p.pos);
         try testing.expectEqual('P', buf[18]);
         m = try p.parse();
-        try testing.expectEqualStrings(m.spub.topic, "foo");
-        try testing.expectEqualStrings(m.spub.data, "bar");
+        try testing.expectEqualStrings(m.publish.topic, "foo");
+        try testing.expectEqualStrings(m.publish.data, "bar");
         try testing.expectEqual(33, p.pos);
         try testing.expectEqual('-', buf[33]);
     }
@@ -338,7 +338,7 @@ test "pub" {
     }
 }
 
-test "mpub" {
+test "multi_publish" {
     const buf = "MPUB pero\n" ++
         "\x00\x00\x00\x14" ++ // body size
         "\x00\x00\x00\x02" ++ // number of message
@@ -347,9 +347,9 @@ test "mpub" {
     {
         var p = Parser{ .buf = buf };
         const m = try p.parse();
-        try testing.expectEqualStrings("pero", m.mpub.topic);
-        try testing.expectEqual(2, m.mpub.msgs);
-        try testing.expectEqual(16, m.mpub.data.len);
+        try testing.expectEqualStrings("pero", m.multi_publish.topic);
+        try testing.expectEqual(2, m.multi_publish.msgs);
+        try testing.expectEqual(16, m.multi_publish.data.len);
         try testing.expectEqual(buf.len, p.pos);
     }
     { // split buffer
@@ -379,35 +379,35 @@ test "mpub" {
     }
 }
 
-test "dpub" {
+test "deferred_publish" {
     const buf = "DPUB pero 1234\n" ++
         "\x00\x00\x00\x03bar"; // [size][body]
     {
         var p = Parser{ .buf = buf };
         const m = try p.parse();
-        try testing.expectEqualStrings("pero", m.dpub.topic);
-        try testing.expectEqual(1234, m.dpub.delay);
-        try testing.expectEqual(3, m.dpub.data.len);
+        try testing.expectEqualStrings("pero", m.deferred_publish.topic);
+        try testing.expectEqual(1234, m.deferred_publish.delay);
+        try testing.expectEqual(3, m.deferred_publish.data.len);
         try testing.expectEqual(buf.len, p.pos);
     }
 }
 
-test "rdy,fin.." {
+test "ready,finish.." {
     const buf = "RDY 123\nFIN 0123456789abcdef\nTOUCH 0123401234012345\nCLS\nNOP\nREQ 5678956789567890 4567\n";
     var p = Parser{ .buf = buf };
     var m = try p.parse();
-    try testing.expectEqual(123, m.rdy);
+    try testing.expectEqual(123, m.ready);
     m = try p.parse();
-    try testing.expectEqualStrings("0123456789abcdef", &m.fin);
+    try testing.expectEqualStrings("0123456789abcdef", &m.finish);
     m = try p.parse();
     try testing.expectEqualStrings("0123401234012345", &m.touch);
     m = try p.parse();
-    try testing.expect(m == .cls);
+    try testing.expect(m == .close);
     m = try p.parse();
     try testing.expect(m == .nop);
     m = try p.parse();
-    try testing.expectEqualStrings("5678956789567890", &m.req.msg_id);
-    try testing.expectEqual(4567, m.req.delay);
+    try testing.expectEqualStrings("5678956789567890", &m.requeue.msg_id);
+    try testing.expectEqual(4567, m.requeue.delay);
 }
 
 pub const Identify = struct {

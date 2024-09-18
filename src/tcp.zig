@@ -122,7 +122,7 @@ pub const Conn = struct {
 
     const Response = enum {
         ok,
-        cls,
+        close,
         heartbeat,
     };
 
@@ -226,55 +226,55 @@ pub const Conn = struct {
                 try self.respond(.ok);
                 log.debug("{} identify {}", .{ self.socket, self.identify });
             },
-            .sub => |arg| {
-                self.channel = try server.sub(self, arg.topic, arg.channel);
+            .subscribe => |arg| {
+                self.channel = try server.subscribe(self, arg.topic, arg.channel);
                 try self.respond(.ok);
                 log.debug("{} subscribe: {s} {s}", .{ self.socket, arg.topic, arg.channel });
             },
-            .spub => |arg| {
+            .publish => |arg| {
                 try server.publish(arg.topic, arg.data);
                 try self.respond(.ok);
                 log.debug("{} publish: {s}", .{ self.socket, arg.topic });
             },
-            .mpub => |arg| {
+            .multi_publish => |arg| {
                 try server.multiPublish(arg.topic, arg.msgs, arg.data);
                 try self.respond(.ok);
                 log.debug("{} multi publish: {s} messages: {}", .{ self.socket, arg.topic, arg.msgs });
             },
-            .dpub => |arg| {
+            .deferred_publish => |arg| {
                 try server.deferredPublish(arg.topic, arg.data, arg.delay);
                 try self.respond(.ok);
                 log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });
             },
-            .rdy => |count| {
+            .ready => |count| {
                 self.ready_count = count;
                 ready_changed.* = true;
                 log.debug("{} ready: {}", .{ self.socket, count });
             },
-            .fin => |msg_id| {
+            .finish => |msg_id| {
                 var channel = self.channel orelse return error.NotSubscribed;
                 self.in_flight -|= 1;
-                const res = try channel.fin(msg_id);
+                const res = try channel.finish(msg_id);
                 if (res) self.metric.finish += 1;
                 ready_changed.* = true;
-                log.debug("{} fin {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
+                log.debug("{} finish {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
             },
-            .req => |arg| {
+            .requeue => |arg| {
                 var channel = self.channel orelse return error.NotSubscribed;
                 self.in_flight -|= 1;
-                const res = try channel.req(arg.msg_id, arg.delay);
+                const res = try channel.requeue(arg.msg_id, arg.delay);
                 if (res) self.metric.requeue += 1;
-                log.debug("{} req {} {}", .{ self.socket, Msg.seqFromId(arg.msg_id), res });
+                log.debug("{} requeue {} {}", .{ self.socket, Msg.seqFromId(arg.msg_id), res });
             },
             .touch => |msg_id| {
                 var channel = self.channel orelse return error.NotSubscribed;
                 const res = try channel.touch(msg_id, self.identify.msg_timeout);
                 log.debug("{} touch {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
             },
-            .cls => {
+            .close => {
                 self.ready_count = 0;
-                try self.respond(.cls);
-                log.debug("{} cls", .{self.socket});
+                try self.respond(.close);
+                log.debug("{} close", .{self.socket});
             },
             .nop => {
                 log.debug("{} nop", .{self.socket});
@@ -334,7 +334,7 @@ pub const Conn = struct {
         switch (rsp) {
             .ok => try self.sendResponse("OK"),
             .heartbeat => try self.sendResponse("_heartbeat_"),
-            .cls => try self.sendResponse("CLOSE_WAIT"),
+            .close => try self.sendResponse("CLOSE_WAIT"),
         }
     }
 
@@ -373,7 +373,7 @@ pub const Conn = struct {
 
     fn close(self: *Conn) !void {
         log.debug("{} close", .{self.socket});
-        if (self.channel) |channel| try channel.unsub(self);
+        if (self.channel) |channel| try channel.unsubscribe(self);
         if (self.ticker_op) |op| {
             try op.cancel();
             op.unsubscribe(self);

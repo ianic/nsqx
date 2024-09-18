@@ -42,9 +42,9 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             };
         }
 
-        pub fn sub(self: *Server, consumer: *Consumer, topic: []const u8, channel: []const u8) !*Channel {
+        pub fn subscribe(self: *Server, consumer: *Consumer, topic: []const u8, channel: []const u8) !*Channel {
             const t = try self.getOrCreateTopic(topic);
-            return try t.sub(consumer, channel);
+            return try t.subscribe(consumer, channel);
         }
 
         pub fn deleteChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
@@ -228,13 +228,13 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     };
                 }
 
-                fn sub(self: *Topic, consumer: *Consumer, name: []const u8) !*Channel {
+                fn subscribe(self: *Topic, consumer: *Consumer, name: []const u8) !*Channel {
                     if (self.channels.get(name)) |channel| {
-                        try channel.sub(consumer);
+                        try channel.subscribe(consumer);
                         return channel;
                     }
                     var channel = try self.createChannel(name);
-                    try channel.sub(consumer);
+                    try channel.subscribe(consumer);
 
                     // First channel gets all messages from the topic
                     if (self.channels.count() == 1) {
@@ -534,6 +534,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     self.timer = io.initTimer(self, timerTimeout);
                 }
 
+                /// Called from topic when new topic message is created.
                 fn topicAppended(self: *Channel, msg: *Topic.Msg) !void {
                     if (self.next == null) {
                         self.next = msg.acquire();
@@ -547,13 +548,13 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         if (!try self.fillConsumer(consumer)) break;
                 }
 
-                // Returns true if there is more messages for next consumer
+                /// Returns true if there is more messages for next consumer
                 fn fillConsumer(self: *Channel, consumer: *Consumer) !bool {
                     var msgs_buf: [max_msgs_send_batch_size]*Msg = undefined;
                     var msgs = msgs_buf[0..@min(consumer.ready(), msgs_buf.len)];
                     var n: usize = 0;
                     while (n < msgs.len) : (n += 1) {
-                        if (self.getMsg() catch null) |msg| {
+                        if (self.nextMsg() catch null) |msg| {
                             msg.sent_at = self.timer.now();
                             msg.in_flight_socket = consumer.socket;
                             try self.inFlightAppend(msg, nsFromMs(consumer.msgTimeout()));
@@ -564,8 +565,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     consumer.sendMsgs(msgs[0..n]) catch |err| {
                         log.err("failed to send msg {}, re-queuing", .{err});
                         for (msgs[0..n]) |msg|
-                            assert(self.req(msg.id(), 0) catch false);
-                        return false;
+                            self.deffer(msg, 0) catch {}; // TODO handle error
+                        return true;
                     };
                     return n == msgs.len;
                 }
@@ -620,7 +621,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     }
                     for (msgs.items) |msg| {
                         log.debug("{} message timeout {}", .{ msg.in_flight_socket, msg.sequence() });
-                        try self.requeue(msg, 0);
+                        try self.deffer(msg, 0);
                     }
                     self.metric.timeout += msgs.items.len;
                     return timeout;
@@ -659,11 +660,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     }
                 };
 
-                pub fn fin(self: *Channel, msg_id: [16]u8) !bool {
-                    return self.finSeq(Msg.seqFromId(msg_id));
-                }
-
-                pub fn finSeq(self: *Channel, seq: u64) !bool {
+                pub fn finish(self: *Channel, msg_id: [16]u8) !bool {
+                    const seq = Msg.seqFromId(msg_id);
                     if (self.in_flight.fetchSwapRemove(seq)) |kv| {
                         self.metric.finish += 1;
                         self.metric.depth -= 1;
@@ -683,17 +681,18 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     return false;
                 }
 
-                pub fn req(self: *Channel, msg_id: [16]u8, delay: u32) !bool {
+                pub fn requeue(self: *Channel, msg_id: [16]u8, delay: u32) !bool {
                     const seq = Msg.seqFromId(msg_id);
                     if (self.in_flight.get(seq)) |msg| {
-                        try self.requeue(msg, delay);
+                        try self.deffer(msg, delay);
                         self.metric.requeue += 1;
                         return true;
                     }
                     return false;
                 }
 
-                fn requeue(self: *Channel, msg: *Msg, delay: u32) !void {
+                /// Move message from in_flight to the deferred
+                fn deffer(self: *Channel, msg: *Msg, delay: u32) !void {
                     msg.in_flight_socket = 0;
                     msg.incAttempts();
                     msg.timestamp = if (delay == 0) 0 else self.timer.now() + nsFromMs(delay);
@@ -703,11 +702,11 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     assert(self.in_flight.swapRemove(msg.sequence()));
                 }
 
-                fn sub(self: *Channel, consumer: *Consumer) !void {
+                fn subscribe(self: *Channel, consumer: *Consumer) !void {
                     try self.consumers.append(consumer);
                 }
 
-                pub fn unsub(self: *Channel, consumer: *Consumer) !void {
+                pub fn unsubscribe(self: *Channel, consumer: *Consumer) !void {
                     { // Remove in_flight messages of that consumer
                         var msgs = std.ArrayList(*Msg).init(self.allocator);
                         defer msgs.deinit();
@@ -715,7 +714,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                             if (msg.in_flight_socket == consumer.socket)
                                 try msgs.append(msg);
                         }
-                        for (msgs.items) |msg| try self.requeue(msg, 0);
+                        for (msgs.items) |msg| try self.deffer(msg, 0);
                         self.metric.requeue += msgs.items.len;
                     }
 
@@ -733,7 +732,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     _ = try self.fillConsumer(consumer);
                 }
 
-                fn getMsg(self: *Channel) !?*Msg {
+                fn nextMsg(self: *Channel) !?*Msg {
                     const now = self.timer.now();
 
                     // First look into deferred messages
@@ -832,7 +831,7 @@ test "channel consumers iterator" {
     defer server.deinit();
 
     var consumer1 = TestConsumer.init(allocator);
-    var channel = try server.sub(&consumer1, "topic", "channel");
+    var channel = try server.subscribe(&consumer1, "topic", "channel");
 
     var iter = channel.consumersIterator();
     try testing.expectEqual(&consumer1, iter.next().?);
@@ -843,8 +842,8 @@ test "channel consumers iterator" {
     consumer1.ready_count = 1;
     var consumer2 = TestConsumer.init(allocator);
     var consumer3 = TestConsumer.init(allocator);
-    channel = try server.sub(&consumer2, "topic", "channel");
-    channel = try server.sub(&consumer3, "topic", "channel");
+    channel = try server.subscribe(&consumer2, "topic", "channel");
+    channel = try server.subscribe(&consumer3, "topic", "channel");
     try testing.expectEqual(3, channel.consumers.items.len);
 
     iter = channel.consumersIterator();
@@ -874,7 +873,7 @@ test "channel fin req" {
     var consumer = TestConsumer.init(allocator);
     defer consumer.deinit();
     consumer.ready_count = 0;
-    var channel = try server.sub(&consumer, topic_name, channel_name);
+    var channel = try server.subscribe(&consumer, topic_name, channel_name);
 
     try server.publish(topic_name, "1");
     try server.publish(topic_name, "2");
@@ -901,7 +900,7 @@ test "channel fin req" {
         try testing.expectEqual(2, channel.next.?.sequence);
     }
     { // consumer sends fin, 0 in flight after that
-        try testing.expect(try channel.fin(consumer.lastId())); // fin 1
+        try testing.expect(try channel.finish(consumer.lastId())); // fin 1
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(2, channel.metric.depth);
@@ -928,7 +927,7 @@ test "channel fin req" {
         try testing.expectEqual(1, channel.deferred.count());
     }
     { // out of order fin, fin seq 3 while 2 is still in flight
-        try testing.expect(try channel.fin(idFromSeq(3))); // fin 3
+        try testing.expect(try channel.finish(idFromSeq(3))); // fin 3
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
     }
@@ -941,7 +940,7 @@ test "channel fin req" {
     }
     { // fin seq 2
         try testing.expectEqual(1, channel.metric.depth);
-        try testing.expect(try channel.fin(idFromSeq(2))); // fin 2
+        try testing.expect(try channel.finish(idFromSeq(2))); // fin 2
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(0, channel.metric.depth);
@@ -951,7 +950,7 @@ test "channel fin req" {
         consumer.ready_count = 1;
         try channel.wakeup();
         try testing.expectEqual(1, channel.in_flight.count());
-        try channel.unsub(&consumer);
+        try channel.unsubscribe(&consumer);
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
         try testing.expectEqual(0, channel.consumers.items.len);
@@ -988,7 +987,7 @@ const TestConsumer = struct {
 
     // send fin for the last received message
     fn fin(self: *Self) !void {
-        assert(try self.channel.?.fin(self.lastId()));
+        assert(try self.channel.?.finish(self.lastId()));
     }
 
     // pull message from channel
@@ -1085,7 +1084,7 @@ test "multiple channels" {
 
     var c1 = TestConsumer.init(allocator);
     defer c1.deinit();
-    c1.channel = try server.sub(&c1, topic_name, channel_name1);
+    c1.channel = try server.subscribe(&c1, topic_name, channel_name1);
     c1.ready_count = no * 3;
 
     { // single channel, single consumer
@@ -1102,7 +1101,7 @@ test "multiple channels" {
 
     var c2 = TestConsumer.init(allocator);
     defer c2.deinit();
-    c2.channel = try server.sub(&c2, topic_name, channel_name2);
+    c2.channel = try server.subscribe(&c2, topic_name, channel_name2);
     c2.ready_count = no * 2;
 
     { // two channels on the same topic
@@ -1115,7 +1114,7 @@ test "multiple channels" {
 
     var c3 = TestConsumer.init(allocator);
     defer c3.deinit();
-    c3.channel = try server.sub(&c3, topic_name, channel_name2);
+    c3.channel = try server.subscribe(&c3, topic_name, channel_name2);
     c3.ready_count = no;
 
     { // two channels, one has single consumer another has two consumers
@@ -1162,7 +1161,7 @@ test "first channel gets all messages accumulated in topic" {
     // subscribe creates channel
     var consumer = TestConsumer.init(allocator);
     defer consumer.deinit();
-    const channel = try server.sub(&consumer, topic_name, channel_name);
+    const channel = try server.subscribe(&consumer, topic_name, channel_name);
     consumer.channel = channel;
     try testing.expect(channel.next != null);
     try testing.expectEqual(16, topic.metric.depth);
@@ -1189,7 +1188,7 @@ test "timeout messages" {
 
     var consumer = TestConsumer.init(allocator);
     defer consumer.deinit();
-    const channel = try server.sub(&consumer, topic_name, channel_name);
+    const channel = try server.subscribe(&consumer, topic_name, channel_name);
     consumer.channel = channel;
 
     for (0..no) |i| {
@@ -1253,7 +1252,7 @@ test "deferred messages" {
 
     var consumer = TestConsumer.init(allocator);
     defer consumer.deinit();
-    const channel = try server.sub(&consumer, topic_name, channel_name);
+    const channel = try server.subscribe(&consumer, topic_name, channel_name);
     consumer.channel = channel;
 
     { // publish two deferred messages, channel puts them into deferred queue
@@ -1304,7 +1303,7 @@ test "topic pause" {
 
     var consumer = TestConsumer.init(allocator);
     defer consumer.deinit();
-    const channel = try server.sub(&consumer, topic_name, channel_name);
+    const channel = try server.subscribe(&consumer, topic_name, channel_name);
     consumer.channel = channel;
 
     { // while channel is paused topic messages are not delivered to the channel
@@ -1350,7 +1349,7 @@ test "channel empty" {
     var consumer = TestConsumer.init(allocator);
     defer consumer.deinit();
 
-    const channel = try server.sub(&consumer, topic_name, channel_name);
+    const channel = try server.subscribe(&consumer, topic_name, channel_name);
     consumer.channel = channel;
 
     io.timestamp = 1;
@@ -1429,13 +1428,13 @@ test "notifier" {
 
     var consumer = TestConsumer.init(allocator);
     defer consumer.deinit();
-    _ = try server.sub(&consumer, "topic1", "channel1");
+    _ = try server.subscribe(&consumer, "topic1", "channel1");
     try testing.expectEqual(2, notifier.registrations.items.len);
 
-    _ = try server.sub(&consumer, "topic1", "channel2");
+    _ = try server.subscribe(&consumer, "topic1", "channel2");
     try testing.expectEqual(3, notifier.registrations.items.len);
 
-    _ = try server.sub(&consumer, "topic2", "channel2");
+    _ = try server.subscribe(&consumer, "topic2", "channel2");
     try testing.expectEqual(5, notifier.registrations.items.len);
 
     // test deletes
@@ -1454,11 +1453,11 @@ test "depth" {
 
     var consumer1 = TestConsumer.init(allocator);
     defer consumer1.deinit();
-    consumer1.channel = try server.sub(&consumer1, topic_name, "channel1");
+    consumer1.channel = try server.subscribe(&consumer1, topic_name, "channel1");
 
     var consumer2 = TestConsumer.init(allocator);
     defer consumer2.deinit();
-    consumer2.channel = try server.sub(&consumer2, topic_name, "channel2");
+    consumer2.channel = try server.subscribe(&consumer2, topic_name, "channel2");
 
     const channel1 = consumer1.channel.?;
     const channel2 = consumer2.channel.?;
