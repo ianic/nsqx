@@ -448,7 +448,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     // is reached.
                     timestamp: u64 = 0,
 
-                    fn deinit(self: *Msg, allocator: mem.Allocator) void {
+                    fn destroy(self: *Msg, allocator: mem.Allocator) void {
                         self.msg.release(); // release inner topic message
                         allocator.destroy(self); // destroy this channel message
                     }
@@ -552,6 +552,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 } = .{},
                 paused: bool = false,
 
+                // Init/deinit -----------------
+
                 fn init(topic: *Topic, name: []const u8) Channel {
                     const allocator = topic.allocator;
                     return .{
@@ -566,11 +568,30 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     };
                 }
 
+                // Need stable self pointer for this part of the init.
                 fn initTimer(self: *Channel, io: *Io) void {
                     self.timer = io.initTimer(self, timerTimeout);
                 }
 
-                /// Called from topic when new topic message is created.
+                fn deinit(self: *Channel) void {
+                    self.timer.close() catch {};
+                    for (self.consumers.items) |consumer| consumer.channelClosed();
+                    for (self.in_flight.values()) |cm| cm.destroy(self.allocator);
+                    while (self.deferred.removeOrNull()) |cm| cm.destroy(self.allocator);
+                    self.in_flight.deinit();
+                    self.deferred.deinit();
+                    self.consumers.deinit();
+                    if (self.next) |n| n.release();
+                    self.next = null;
+                }
+
+                fn subscribe(self: *Channel, consumer: *Consumer) !void {
+                    try self.consumers.append(consumer);
+                }
+
+                // -----------------
+
+                // Called from topic when new topic message is created.
                 fn topicAppended(self: *Channel, msg: *Topic.Msg) void {
                     if (self.next == null) {
                         self.next = msg.acquire();
@@ -580,13 +601,14 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     }
                 }
 
+                // Try to push messages to the consumers.
                 fn wakeup(self: *Channel) !void {
                     var iter = self.consumersIterator();
                     while (iter.next()) |consumer|
                         if (!try self.fillConsumer(consumer)) break;
                 }
 
-                /// Returns true if there is more messages for next consumer
+                // Returns true if there is more messages for next consumer
                 fn fillConsumer(self: *Channel, consumer: *Consumer) !bool {
                     var msgs_buf: [max_msgs_send_batch_size]*Msg = undefined;
                     var msgs = msgs_buf[0..@min(consumer.ready(), msgs_buf.len)];
@@ -609,18 +631,63 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     return n == msgs.len;
                 }
 
+                fn nextMsg(self: *Channel) !?*Msg {
+                    const now = self.timer.now();
+
+                    // First look into deferred messages
+                    if (self.deferred.peek()) |msg| {
+                        if (msg.timestamp <= now) {
+                            return self.deferred.remove();
+                        }
+                    }
+
+                    // Then try to find next message in topic
+                    while (self.nextTopicMsg()) |topic_msg| {
+                        const msg = try self.allocator.create(Msg);
+                        msg.* = topic_msg.asChannelMsg();
+                        self.metric.pull += 1;
+                        if (msg.timestamp > now) {
+                            try self.deferred.add(msg);
+                            try self.setTimeout(msg.timestamp);
+                            continue;
+                        }
+                        return msg;
+                    }
+                    return null;
+                }
+
+                fn nextTopicMsg(self: *Channel) ?*Topic.Msg {
+                    if (self.paused or self.topic.paused) return null;
+                    if (self.next) |msg| {
+                        self.next = msg.nextAcquire();
+                        return msg;
+                    }
+                    return null;
+                }
+
+                // Move message from in_flight to the deferred
+                fn deffer(self: *Channel, msg: *Msg, delay: u32) !void {
+                    msg.in_flight_socket = 0;
+                    msg.incAttempts();
+                    msg.timestamp = if (delay == 0) 0 else self.timer.now() + nsFromMs(delay);
+                    if (msg.timestamp > 0)
+                        try self.setTimeout(msg.timestamp);
+                    try self.deferred.add(msg);
+                    assert(self.in_flight.swapRemove(msg.sequence()));
+                }
+
                 fn inFlightAppend(self: *Channel, msg: *Msg, msg_timeout: u64) !void {
                     msg.timestamp = self.timer.now() + msg_timeout;
                     try self.setTimeout(msg.timestamp);
                     try self.in_flight.put(msg.sequence(), msg);
                 }
 
-                /// Sets next timer timeout
+                // Sets next timer timeout
                 fn setTimeout(self: *Channel, next_timeout: u64) !void {
                     try self.timer.set(next_timeout);
                 }
 
-                /// Callback when timer timeout if fired
+                // Callback when timer timeout if fired
                 fn timerTimeout(self: *Channel) Error!void {
                     const now = self.timer.now();
                     const next_timeout = @min(
@@ -631,7 +698,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     try self.setTimeout(next_timeout);
                 }
 
-                /// Returns next timeout of deferred messages
+                // Returns next timeout of deferred messages
                 fn deferredTimeout(self: *Channel, now: u64) !u64 {
                     var timeout: u64 = Io.Timer.no_timeout;
                     if (self.deferred.count() > 0) {
@@ -643,9 +710,9 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     return timeout;
                 }
 
-                /// Finds time-outed in flight messages and move them to the
-                /// deferred queue.
-                /// Returns next timeout for in flight messages.
+                // Finds time-outed in flight messages and move them to the
+                // deferred queue.
+                // Returns next timeout for in flight messages.
                 fn inFlightTimeout(self: *Channel, now: u64) !u64 {
                     var msgs = std.ArrayList(*Msg).init(self.allocator);
                     defer msgs.deinit();
@@ -698,12 +765,14 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     }
                 };
 
+                // Consumer interface actions -----------------
+
                 pub fn finish(self: *Channel, msg_id: [16]u8) !bool {
                     const seq = Msg.seqFromId(msg_id);
                     if (self.in_flight.fetchSwapRemove(seq)) |kv| {
                         self.metric.finish += 1;
                         self.metric.depth -= 1;
-                        kv.value.deinit(self.allocator);
+                        kv.value.destroy(self.allocator);
                         return true;
                     }
                     return false;
@@ -729,21 +798,6 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     return false;
                 }
 
-                /// Move message from in_flight to the deferred
-                fn deffer(self: *Channel, msg: *Msg, delay: u32) !void {
-                    msg.in_flight_socket = 0;
-                    msg.incAttempts();
-                    msg.timestamp = if (delay == 0) 0 else self.timer.now() + nsFromMs(delay);
-                    if (msg.timestamp > 0)
-                        try self.setTimeout(msg.timestamp);
-                    try self.deferred.add(msg);
-                    assert(self.in_flight.swapRemove(msg.sequence()));
-                }
-
-                fn subscribe(self: *Channel, consumer: *Consumer) !void {
-                    try self.consumers.append(consumer);
-                }
-
                 pub fn unsubscribe(self: *Channel, consumer: *Consumer) !void {
                     { // Remove in_flight messages of that consumer
                         var msgs = std.ArrayList(*Msg).init(self.allocator);
@@ -765,44 +819,13 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     }
                 }
 
+                /// Consumer calls this when ready to send more messages.
                 pub fn ready(self: *Channel, consumer: *Consumer) !void {
                     if (consumer.ready() == 0) return;
                     _ = try self.fillConsumer(consumer);
                 }
 
-                fn nextMsg(self: *Channel) !?*Msg {
-                    const now = self.timer.now();
-
-                    // First look into deferred messages
-                    if (self.deferred.peek()) |msg| {
-                        if (msg.timestamp <= now) {
-                            return self.deferred.remove();
-                        }
-                    }
-
-                    // Then try to find next message in topic
-                    while (self.nextTopicMsg()) |topic_msg| {
-                        const msg = try self.allocator.create(Msg);
-                        msg.* = topic_msg.asChannelMsg();
-                        self.metric.pull += 1;
-                        if (msg.timestamp > now) {
-                            try self.deferred.add(msg);
-                            try self.setTimeout(msg.timestamp);
-                            continue;
-                        }
-                        return msg;
-                    }
-                    return null;
-                }
-
-                fn nextTopicMsg(self: *Channel) ?*Topic.Msg {
-                    if (self.paused or self.topic.paused) return null;
-                    if (self.next) |msg| {
-                        self.next = msg.nextAcquire();
-                        return msg;
-                    }
-                    return null;
-                }
+                // Http admin interface  -----------------
 
                 fn pause(self: *Channel) void {
                     self.paused = true;
@@ -826,34 +849,22 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         }
                         if (msgs.items.len == self.in_flight.count()) { // Hopefully there is no messages in the kernel
                             // Remove all
-                            for (self.in_flight.values()) |cm| cm.deinit(self.allocator);
+                            for (self.in_flight.values()) |cm| cm.destroy(self.allocator);
                             self.in_flight.clearAndFree();
                         } else {
                             // Selectively remove
                             for (msgs.items) |cm| {
                                 assert(self.in_flight.swapRemove(cm.sequence()));
-                                cm.deinit(self.allocator);
+                                cm.destroy(self.allocator);
                             }
                         }
                     }
                     // Remove all deferred messages.
-                    while (self.deferred.removeOrNull()) |cm| cm.deinit(self.allocator);
+                    while (self.deferred.removeOrNull()) |cm| cm.destroy(self.allocator);
                     // Position to the end of the topic.
                     if (self.next) |n| n.release();
                     self.next = null;
                     self.metric.depth = self.in_flight.count();
-                }
-
-                fn deinit(self: *Channel) void {
-                    self.timer.close() catch {};
-                    for (self.consumers.items) |consumer| consumer.channelClosed();
-                    for (self.in_flight.values()) |cm| cm.deinit(self.allocator);
-                    while (self.deferred.removeOrNull()) |cm| cm.deinit(self.allocator);
-                    self.in_flight.deinit();
-                    self.deferred.deinit();
-                    self.consumers.deinit();
-                    if (self.next) |n| n.release();
-                    self.next = null;
                 }
             };
         }
