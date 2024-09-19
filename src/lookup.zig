@@ -10,36 +10,16 @@ const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
 const Topic = @import("simple_topic.zig").SimpleTopic([]const u8, Conn, Conn.pullTopic);
 const RecvBuf = @import("tcp.zig").RecvBuf;
+const Server = @import("tcp.zig").Server;
 
 const log = std.log.scoped(.lookup);
 
 pub const Connector = struct {
     const Self = @This();
-    const Registration = union(enum) {
-        topic: []const u8,
-        channel: struct {
-            topic_name: []const u8,
-            name: []const u8,
-        },
-
-        fn register(self: Registration, allocator: mem.Allocator) ![]const u8 {
-            return switch (self) {
-                .topic => |t| try std.fmt.allocPrint(allocator, "REGISTER {s}\n", .{t}),
-                .channel => |c| try std.fmt.allocPrint(allocator, "REGISTER {s} {s}\n", .{ c.topic_name, c.name }),
-            };
-        }
-
-        fn unregister(self: Registration, allocator: mem.Allocator) ![]const u8 {
-            return switch (self) {
-                .topic => |t| try std.fmt.allocPrint(allocator, "UNREGISTER {s}\n", .{t}),
-                .channel => |c| try std.fmt.allocPrint(allocator, "UNREGISTER {s} {s}\n", .{ c.topic_name, c.name }),
-            };
-        }
-    };
 
     allocator: mem.Allocator,
     io: *Io,
-    registrations: std.ArrayList(Registration),
+    server: *Server,
     connections: std.ArrayList(*Conn),
     identify: []const u8,
     topic: Topic,
@@ -50,11 +30,13 @@ pub const Connector = struct {
     };
 
     pub fn init(allocator: mem.Allocator, io: *Io) Self {
+        // TODO: create identify from command line arguments, options
         const identify = identifyMessage(allocator, "127.0.0.1", "hydra", 4151, 4150, "0.1.0") catch "";
+
         return .{
             .allocator = allocator,
             .io = io,
-            .registrations = std.ArrayList(Registration).init(allocator),
+            .server = undefined,
             .connections = std.ArrayList(*Conn).init(allocator),
             .topic = Topic.init(allocator),
             .identify = identify,
@@ -68,7 +50,6 @@ pub const Connector = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.registrations.deinit();
         for (self.connections.items) |conn| {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -78,49 +59,35 @@ pub const Connector = struct {
         self.topic.deinit();
     }
 
-    pub fn topicCreated(self: *Self, name: []const u8) !void {
-        try self.append(.{ .topic = name });
+    pub fn topicCreated(self: *Self, name: []const u8) void {
+        self.register("REGISTER {s}\n", .{name});
     }
 
-    pub fn channelCreated(self: *Self, topic_name: []const u8, name: []const u8) !void {
-        try self.append(.{ .channel = .{ .topic_name = topic_name, .name = name } });
+    pub fn channelCreated(self: *Self, topic_name: []const u8, name: []const u8) void {
+        self.register("REGISTER {s} {s}\n", .{ topic_name, name });
     }
 
-    fn append(self: *Self, reg: Registration) !void {
-        if (self.state != .active) return;
-        try self.registrations.append(reg);
-        if (self.topic.hasConsumers())
-            assert(try self.topic.append(try reg.register(self.allocator)));
+    pub fn topicDeleted(self: *Self, name: []const u8) void {
+        self.register("UNREGISTER {s}\n", .{name});
     }
 
-    pub fn topicDeleted(self: *Self, name: []const u8) !void {
-        if (self.state != .active) return;
-        for (self.registrations.items, 0..) |reg, i| {
-            if (reg == .topic) {
-                if (reg.topic.ptr == name.ptr) {
-                    if (self.topic.hasConsumers())
-                        assert(try self.topic.append(try reg.unregister(self.allocator)));
-                    _ = self.registrations.swapRemove(i);
-                    return;
-                }
-            }
-        }
+    pub fn channelDeleted(self: *Self, topic_name: []const u8, name: []const u8) void {
+        self.register("UNREGISTER {s} {s}\n", .{ topic_name, name });
     }
 
-    pub fn channelDeleted(self: *Self, topic_name: []const u8, name: []const u8) !void {
-        if (self.state != .active) return;
-        for (self.registrations.items, 0..) |reg, i| {
-            if (reg == .channel) {
-                if (reg.channel.topic_name.ptr == topic_name.ptr and
-                    reg.channel.name.ptr == name.ptr)
-                {
-                    if (self.topic.hasConsumers())
-                        assert(try self.topic.append(try reg.unregister(self.allocator)));
-                    _ = self.registrations.swapRemove(i);
-                    return;
-                }
-            }
-        }
+    fn register(self: *Self, comptime fmt: []const u8, args: anytype) void {
+        if (self.state != .active or !self.topic.hasConsumers()) return;
+        self.registerFailable(fmt, args) catch |err| {
+            // Disconnect all connections. On next connect they will get fresh
+            // current state.
+            for (self.connections.items) |conn| conn.disconnect();
+            log.err("add registration failed {}", .{err});
+        };
+    }
+
+    fn registerFailable(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+        const buf = try std.fmt.allocPrint(self.allocator, fmt, args);
+        assert(try self.topic.append(buf));
     }
 
     pub fn addLookupd(self: *Self, address: std.net.Address) !void {
@@ -130,42 +97,63 @@ pub const Connector = struct {
         try conn.connect();
     }
 
-    fn connected(self: *Self, conn: *Conn) !void {
-        const first = try self.allRegistrations();
-        if (first.len > 0) try self.topic.setFirst(first);
+    fn connect(self: *Self, conn: *Conn) !void {
+        if (self.server.topics.count() > 0) {
+            try self.topic.setFirst(self.registrations() catch return error.OutOfMemory);
+        }
         try self.topic.subscribe(conn);
     }
 
-    fn disconnected(self: *Self, conn: *Conn) void {
+    fn disconnect(self: *Self, conn: *Conn) void {
         self.topic.unsubscribe(conn);
     }
 
     // Current state for newly connected lookupd
-    fn allRegistrations(self: *Self) ![]const u8 {
-        if (self.registrations.items.len == 0) return "";
+    fn registrations(self: *Self) ![]const u8 {
+        if (self.server.topics.count() == 0) return "";
 
-        var arr = std.ArrayList(u8).init(self.allocator);
-        for (self.registrations.items) |reg| {
-            const data = try reg.register(self.allocator);
-            defer self.allocator.free(data);
-            try arr.appendSlice(data);
-        }
-        return try arr.toOwnedSlice();
+        var writer = RegistrationsWriter.init(self.allocator);
+        try self.server.iterateNames(&writer);
+        return try writer.toOwned();
+    }
+};
+
+pub const RegistrationsWriter = struct {
+    list: std.ArrayList(u8),
+
+    const Self = @This();
+    pub fn init(allocator: mem.Allocator) Self {
+        return .{
+            .list = std.ArrayList(u8).init(allocator),
+        };
+    }
+
+    pub fn topic(self: *Self, name: []const u8) !void {
+        const writer = self.list.writer().any();
+        try writer.print("REGISTER {s}\n", .{name});
+    }
+    pub fn channel(self: *Self, topic_name: []const u8, name: []const u8) !void {
+        const writer = self.list.writer().any();
+        try writer.print("REGISTER {s} {s}\n", .{ topic_name, name });
+    }
+
+    pub fn toOwned(self: *Self) ![]const u8 {
+        const buf = try self.list.toOwnedSlice();
+        self.list.deinit();
+        return buf;
     }
 };
 
 const Conn = struct {
-    allocator: mem.Allocator,
     connector: *Connector,
     recv_buf: RecvBuf,
-    err: ?anyerror = null,
-    socket: socket_t = 0,
-    address: std.net.Address,
     io: *Io,
+    address: std.net.Address,
+    socket: socket_t = 0,
     send_op: ?*Op = null,
     recv_op: ?*Op = null,
-    state: State = .init,
     ticker_op: ?*Op = null,
+    state: State = .init,
 
     const ping_msg = "PING\n";
     const ping_interval = 15 * 1000; // in milliseconds
@@ -184,7 +172,6 @@ const Conn = struct {
     pub fn init(connector: *Connector, address: std.net.Address) Self {
         const allocator = connector.allocator;
         return .{
-            .allocator = allocator,
             .connector = connector,
             .io = connector.io,
             .address = address,
@@ -209,17 +196,25 @@ const Conn = struct {
     }
 
     fn reconnect(self: *Self) Error!void {
+        if (self.send_op) |op| {
+            op.unsubscribe(self);
+            self.send_op = null;
+        }
+        if (self.recv_op) |op| {
+            op.unsubscribe(self);
+            self.recv_op = null;
+        }
+        if (self.socket != 0) {
+            try self.io.close(self.socket);
+            self.socket = 0;
+        }
         self.state = .connecting;
         _ = try self.io.socketCreate(self.address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, self, socketCreated, socketFailed);
     }
 
     fn tick(self: *Self) Error!void {
         switch (self.state) {
-            .disconnected => {
-                try self.io.close(self.socket);
-                self.socket = 0;
-                try self.reconnect();
-            },
+            .disconnected => try self.reconnect(),
             .connected => try self.ping(),
             else => {},
         }
@@ -240,12 +235,12 @@ const Conn = struct {
     }
 
     fn socketFailed(self: *Self, err: anyerror) Error!void {
-        self.disconnected();
+        self.disconnect();
         log.err("socket create failed {}", .{err});
     }
 
     fn connectFailed(self: *Self, err: anyerror) Error!void {
-        self.disconnected();
+        self.disconnect();
         log.info("{} connect failed {}", .{ self.address, err });
     }
 
@@ -253,13 +248,13 @@ const Conn = struct {
         self.state = .connected;
         try self.send(self.connector.identify);
         try self.recv();
-        try self.connector.connected(self);
+        try self.connector.connect(self);
         log.debug("{} connected", .{self.address});
     }
 
-    fn disconnected(self: *Self) void {
+    fn disconnect(self: *Self) void {
         self.state = .disconnected;
-        self.connector.disconnected(self);
+        self.connector.disconnect(self);
         log.info("{} disconnected", .{self.address});
     }
 
@@ -284,7 +279,7 @@ const Conn = struct {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.err("{} send failed {}", .{ self.address, err }),
         }
-        if (self.state == .connected) self.disconnected();
+        if (self.state == .connected) self.disconnect();
     }
 
     fn recv(self: *Self) !void {
@@ -328,7 +323,7 @@ const Conn = struct {
             error.ConnectionResetByPeer => {},
             else => log.err("{} recv failed {}", .{ self.address, err }),
         }
-        if (self.state == .connected) self.disconnected();
+        if (self.state == .connected) self.disconnect();
     }
 
     pub fn close(self: *Self) !void {

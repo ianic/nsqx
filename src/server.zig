@@ -99,7 +99,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
             topic.* = Topic.init(self, key);
             try self.topics.put(key, topic);
-            try self.notifier.topicCreated(key);
+            self.notifier.topicCreated(key);
             log.debug("created topic {s}", .{name});
             return topic;
         }
@@ -128,7 +128,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
         fn deinitTopic(self: *Server, topic: *Topic) void {
             const key = topic.name;
             topic.deinit();
-            self.notifier.topicDeleted(key) catch {};
+            self.notifier.topicDeleted(key);
             self.allocator.free(key);
             self.allocator.destroy(topic);
         }
@@ -142,6 +142,26 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
             }
         }
+
+        /// Iterate over topic and channel names.
+        pub fn iterateNames(self: *Server, writer: anytype) !void {
+            var ti = self.topics.valueIterator();
+            while (ti.next()) |topic| {
+                try writer.topic(topic.*.name);
+                var ci = topic.*.channels.valueIterator();
+                while (ci.next()) |channel| {
+                    try writer.channel(topic.*.name, channel.*.name);
+                }
+            }
+        }
+
+        pub const NamesIterator = struct {
+            topic_iter: std.StringHashMap(*Topic).Iterator,
+
+            pub fn next() !?struct { topic: []const u8, channel: ?[]const u8 } {}
+        };
+
+        pub fn namesIterator() NamesIterator {}
 
         fn TopicType() type {
             return struct {
@@ -253,9 +273,9 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                     channel.* = Channel.init(self, key);
                     channel.initTimer(self.server.io);
-                    try self.server.notifier.channelCreated(self.name, channel.name);
                     try self.channels.put(key, channel);
 
+                    self.server.notifier.channelCreated(self.name, channel.name);
                     log.debug("topic '{s}' channel '{s}' created", .{ self.name, key });
                     return channel;
                 }
@@ -269,7 +289,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                 fn deinitChannel(self: *Topic, channel: *Channel) void {
                     const key = channel.name;
-                    self.server.notifier.channelDeleted(self.name, channel.name) catch {};
+                    self.server.notifier.channelDeleted(self.name, channel.name);
                     channel.deinit();
                     self.allocator.free(key);
                     self.allocator.destroy(channel);
@@ -922,7 +942,7 @@ test "channel fin req" {
         try testing.expect(channel.next == null);
     }
     { // 2 is re-queued
-        try testing.expect(try channel.req(idFromSeq(2), 0)); // req 2
+        try testing.expect(try channel.requeue(idFromSeq(2), 0)); // req 2
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
     }
@@ -1061,11 +1081,20 @@ const TestTimer = struct {
 };
 
 const NoopNotifier = struct {
+    call_count: usize = 0,
     const Self = @This();
-    fn topicCreated(_: *Self, _: []const u8) !void {}
-    fn channelCreated(_: *Self, _: []const u8, _: []const u8) !void {}
-    fn topicDeleted(_: *Self, _: []const u8) !void {}
-    fn channelDeleted(_: *Self, _: []const u8, _: []const u8) !void {}
+    fn topicCreated(self: *Self, _: []const u8) void {
+        self.call_count += 1;
+    }
+    fn channelCreated(self: *Self, _: []const u8, _: []const u8) void {
+        self.call_count += 1;
+    }
+    fn topicDeleted(self: *Self, _: []const u8) void {
+        self.call_count += 1;
+    }
+    fn channelDeleted(self: *Self, _: []const u8, _: []const u8) void {
+        self.call_count += 1;
+    }
 };
 
 const TestServer = ServerType(TestConsumer, TestIo, NoopNotifier);
@@ -1270,7 +1299,7 @@ test "deferred messages" {
         try testing.expectEqual(1, channel.deferred.count());
     }
     { // re-queue
-        assert(try channel.req(TestServer.Channel.Msg.idFromSeq(2), 2));
+        assert(try channel.requeue(TestServer.Channel.Msg.idFromSeq(2), 2));
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(2, channel.deferred.count());
     }
@@ -1421,25 +1450,38 @@ test "notifier" {
     const allocator = testing.allocator;
 
     var io = TestIo{};
-    var notifier = TestNotifier.init(allocator);
-    defer notifier.deinit();
-    const Server = ServerType(TestConsumer, TestIo, TestNotifier);
-    var server = Server.init(allocator, &io, &notifier);
+    var notifier = NoopNotifier{};
+    var server = TestServer.init(allocator, &io, &notifier);
 
     var consumer = TestConsumer.init(allocator);
     defer consumer.deinit();
     _ = try server.subscribe(&consumer, "topic1", "channel1");
-    try testing.expectEqual(2, notifier.registrations.items.len);
+    try testing.expectEqual(2, notifier.call_count);
 
     _ = try server.subscribe(&consumer, "topic1", "channel2");
-    try testing.expectEqual(3, notifier.registrations.items.len);
+    try testing.expectEqual(3, notifier.call_count);
 
     _ = try server.subscribe(&consumer, "topic2", "channel2");
-    try testing.expectEqual(5, notifier.registrations.items.len);
+    try testing.expectEqual(5, notifier.call_count);
 
+    {
+        var writer = @import("lookup.zig").RegistrationsWriter.init(testing.allocator);
+        try server.iterateNames(&writer);
+        const buf = try writer.toOwned();
+        defer testing.allocator.free(buf);
+
+        try testing.expectEqualStrings(
+            \\REGISTER topic2
+            \\REGISTER topic2 channel2
+            \\REGISTER topic1
+            \\REGISTER topic1 channel2
+            \\REGISTER topic1 channel1
+            \\
+        , buf);
+    }
     // test deletes
     server.deinit();
-    try testing.expectEqual(0, notifier.registrations.items.len);
+    try testing.expectEqual(10, notifier.call_count);
 }
 
 test "depth" {

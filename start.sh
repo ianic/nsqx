@@ -58,3 +58,11 @@ trap cleanup INT TERM #EXIT
 
 wait $nsql_pid
 wait $lookupd_pid
+
+
+# for ti in $(seq 99); do
+#     for ci in $(seq 9); do
+#         nsq_tail -nsqd-tcp-address localhost:4150 -channel channel-$ci -topic topic-$ti -n 1 &
+#         echo $ti-$ci  | to_nsq -nsqd-tcp-address localhost:4150 -topic topic-$ti
+#     done
+# done

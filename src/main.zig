@@ -38,15 +38,20 @@ pub fn main() !void {
 
     var lookup_connector = lookup.Connector.init(allocator, &io);
     defer lookup_connector.deinit();
-    const lookupd1 = try std.net.Address.parseIp4("127.0.0.1", 4160);
-    const lookupd2 = try std.net.Address.parseIp4("127.0.0.1", 4162);
-    const lookupd3 = try std.net.Address.parseIp4("127.0.0.1", 4164);
-    try lookup_connector.addLookupd(lookupd1);
-    try lookup_connector.addLookupd(lookupd2);
-    try lookup_connector.addLookupd(lookupd3);
 
     var server = tcp.Server.init(allocator, &io, &lookup_connector);
     defer server.deinit();
+
+    { // start lookupd connections
+        // TODO: can we avoid this
+        lookup_connector.server = &server;
+        const lookupd1 = try std.net.Address.parseIp4("127.0.0.1", 4160);
+        const lookupd2 = try std.net.Address.parseIp4("127.0.0.1", 4162);
+        const lookupd3 = try std.net.Address.parseIp4("127.0.0.1", 4164);
+        try lookup_connector.addLookupd(lookupd1);
+        try lookup_connector.addLookupd(lookupd2);
+        try lookup_connector.addLookupd(lookupd3);
+    }
 
     var tcp_listener = try tcp.Listener.init(allocator, &io, &server, options);
     defer tcp_listener.deinit();
