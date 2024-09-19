@@ -106,7 +106,7 @@ pub const Conn = struct {
             .topic_pause => |name| try server.pauseTopic(name),
             .topic_unpause => |name| try server.unpauseTopic(name),
             .topic_empty => |name| try server.emptyTopic(name),
-            else => return error.NotFound,
+            .channel_empty => |arg| try server.emptyChannel(arg.topic_name, arg.name),
         }
     }
 

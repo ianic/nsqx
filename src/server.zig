@@ -32,6 +32,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
         notifier: *Notifier,
         started_at: u64,
 
+        // Init/deinit -----------------
+
         pub fn init(allocator: mem.Allocator, io: *Io, notifier: *Notifier) Server {
             return .{
                 .allocator = allocator,
@@ -40,83 +42,6 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 .notifier = notifier,
                 .started_at = io.now(),
             };
-        }
-
-        pub fn subscribe(self: *Server, consumer: *Consumer, topic: []const u8, channel: []const u8) !*Channel {
-            const t = try self.getOrCreateTopic(topic);
-            return try t.subscribe(consumer, channel);
-        }
-
-        pub fn deleteChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
-            const topic = self.topics.get(topic_name) orelse return error.NotFound;
-            try topic.deleteChannel(name);
-            log.debug("deleted channel {s} on topic {s}", .{ name, topic_name });
-        }
-
-        pub fn pauseChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
-            const topic = self.topics.get(topic_name) orelse return error.NotFound;
-            try topic.pauseChannel(name);
-            log.debug("paused channel {s} on topic {s}", .{ name, topic_name });
-        }
-
-        pub fn unpauseChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
-            const topic = self.topics.get(topic_name) orelse return error.NotFound;
-            try topic.unpauseChannel(name);
-            log.debug("paused channel {s} on topic {s}", .{ name, topic_name });
-        }
-
-        pub fn deleteTopic(self: *Server, name: []const u8) !void {
-            const kv = self.topics.fetchRemove(name) orelse return error.NotFound;
-            self.deinitTopic(kv.value);
-            log.debug("deleted topic {s}", .{name});
-        }
-
-        pub fn pauseTopic(self: *Server, name: []const u8) !void {
-            const topic = self.topics.get(name) orelse return error.NotFound;
-            topic.pause();
-            log.debug("paused topic {s}", .{name});
-        }
-
-        pub fn unpauseTopic(self: *Server, name: []const u8) !void {
-            const topic = self.topics.get(name) orelse return error.NotFound;
-            try topic.unpause();
-            log.debug("un-paused topic {s}", .{name});
-        }
-
-        pub fn emptyTopic(self: *Server, name: []const u8) !void {
-            const topic = self.topics.get(name) orelse return error.NotFound;
-            try topic.empty();
-            log.debug("empty topic {s}", .{name});
-        }
-
-        fn getOrCreateTopic(self: *Server, name: []const u8) !*Topic {
-            if (self.topics.get(name)) |t| return t;
-
-            const topic = try self.allocator.create(Topic);
-            errdefer self.allocator.destroy(topic);
-            const key = try self.allocator.dupe(u8, name);
-            errdefer self.allocator.free(key);
-
-            topic.* = Topic.init(self, key);
-            try self.topics.put(key, topic);
-            self.notifier.topicCreated(key);
-            log.debug("created topic {s}", .{name});
-            return topic;
-        }
-
-        pub fn publish(self: *Server, topic_name: []const u8, data: []const u8) !void {
-            const topic = try self.getOrCreateTopic(topic_name);
-            try topic.publish(data);
-        }
-
-        pub fn multiPublish(self: *Server, topic_name: []const u8, msgs: u32, data: []const u8) !void {
-            const topic = try self.getOrCreateTopic(topic_name);
-            try topic.multiPublish(msgs, data);
-        }
-
-        pub fn deferredPublish(self: *Server, topic_name: []const u8, data: []const u8, delay: u32) !void {
-            const topic = try self.getOrCreateTopic(topic_name);
-            try topic.deferredPublish(data, delay);
         }
 
         pub fn deinit(self: *Server) void {
@@ -143,6 +68,96 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             }
         }
 
+        // Publish/subscribe -----------------
+
+        fn getOrCreateTopic(self: *Server, name: []const u8) !*Topic {
+            if (self.topics.get(name)) |t| return t;
+
+            const topic = try self.allocator.create(Topic);
+            errdefer self.allocator.destroy(topic);
+            const key = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(key);
+            try self.topics.ensureUnusedCapacity(1);
+
+            topic.* = Topic.init(self, key);
+            self.topics.putAssumeCapacityNoClobber(key, topic);
+            self.notifier.topicCreated(key);
+            log.debug("created topic {s}", .{name});
+            return topic;
+        }
+
+        pub fn subscribe(self: *Server, consumer: *Consumer, topic: []const u8, channel: []const u8) !*Channel {
+            const t = try self.getOrCreateTopic(topic);
+            return try t.subscribe(consumer, channel);
+        }
+
+        pub fn publish(self: *Server, topic_name: []const u8, data: []const u8) !void {
+            const topic = try self.getOrCreateTopic(topic_name);
+            try topic.publish(data);
+        }
+
+        pub fn multiPublish(self: *Server, topic_name: []const u8, msgs: u32, data: []const u8) !void {
+            const topic = try self.getOrCreateTopic(topic_name);
+            try topic.multiPublish(msgs, data);
+        }
+
+        pub fn deferredPublish(self: *Server, topic_name: []const u8, data: []const u8, delay: u32) !void {
+            const topic = try self.getOrCreateTopic(topic_name);
+            try topic.deferredPublish(data, delay);
+        }
+
+        // Http interface actions -----------------
+
+        pub fn deleteTopic(self: *Server, name: []const u8) !void {
+            const kv = self.topics.fetchRemove(name) orelse return error.NotFound;
+            self.deinitTopic(kv.value);
+            log.debug("deleted topic {s}", .{name});
+        }
+
+        pub fn deleteChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
+            const topic = self.topics.get(topic_name) orelse return error.NotFound;
+            try topic.deleteChannel(name);
+            log.debug("deleted channel {s} on topic {s}", .{ name, topic_name });
+        }
+
+        pub fn pauseTopic(self: *Server, name: []const u8) !void {
+            const topic = self.topics.get(name) orelse return error.NotFound;
+            topic.pause();
+            log.debug("paused topic {s}", .{name});
+        }
+
+        pub fn unpauseTopic(self: *Server, name: []const u8) !void {
+            const topic = self.topics.get(name) orelse return error.NotFound;
+            try topic.unpause();
+            log.debug("un-paused topic {s}", .{name});
+        }
+
+        pub fn pauseChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
+            const topic = self.topics.get(topic_name) orelse return error.NotFound;
+            try topic.pauseChannel(name);
+            log.debug("paused channel {s} on topic {s}", .{ name, topic_name });
+        }
+
+        pub fn unpauseChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
+            const topic = self.topics.get(topic_name) orelse return error.NotFound;
+            try topic.unpauseChannel(name);
+            log.debug("paused channel {s} on topic {s}", .{ name, topic_name });
+        }
+
+        pub fn emptyTopic(self: *Server, name: []const u8) !void {
+            const topic = self.topics.get(name) orelse return error.NotFound;
+            try topic.empty();
+            log.debug("empty topic {s}", .{name});
+        }
+
+        pub fn emptyChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
+            const topic = self.topics.get(topic_name) orelse return error.NotFound;
+            try topic.emptyChannel(name);
+            log.debug("empty channel {s} on topic {s}", .{ name, topic_name });
+        }
+
+        // Lookup registrations -----------------
+
         /// Iterate over topic and channel names.
         pub fn iterateNames(self: *Server, writer: anytype) !void {
             var ti = self.topics.valueIterator();
@@ -155,14 +170,6 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             }
         }
 
-        pub const NamesIterator = struct {
-            topic_iter: std.StringHashMap(*Topic).Iterator,
-
-            pub fn next() !?struct { topic: []const u8, channel: ?[]const u8 } {}
-        };
-
-        pub fn namesIterator() NamesIterator {}
-
         fn TopicType() type {
             return struct {
                 const Msg = struct {
@@ -171,18 +178,20 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     body: []const u8,
                     // Defer message delivery until timestamp is reached.
                     defer_until: u64 = 0,
+                    // Linked list next node pointer
                     next: ?*Msg = null,
                     // Reference counting
                     topic: *Topic,
                     rc: usize = 0,
 
+                    // Decrease reference counter and free
                     pub fn release(self: *Msg) void {
                         assert(self.rc > 0);
                         self.rc -= 1;
                         if (self.rc == 0) {
                             const next = self.next;
                             const topic = self.topic;
-                            topic.deleteMessage(self);
+                            topic.destroyMessage(self);
                             if (next) |n| {
                                 n.release();
                             } else {
@@ -197,22 +206,25 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         return null;
                     }
 
+                    // Increase reference counter
                     pub fn acquire(self: *Msg) *Msg {
                         self.rc += 1;
                         return self;
                     }
 
+                    // Convert Topic.Msg to Channel.Msg
                     fn asChannelMsg(self: *Msg) Channel.Msg {
-                        const frame_type = @intFromEnum(@import("protocol.zig").FrameType.message);
-
                         var header: [34]u8 = .{0} ** 34;
-                        mem.writeInt(u32, header[0..4], @intCast(self.body.len + 30), .big); // size
-                        mem.writeInt(u32, header[4..8], frame_type, .big); // frame type
-                        mem.writeInt(u64, header[8..16], self.created_at, .big); // timestamp
-                        mem.writeInt(u16, header[16..18], 1, .big); // attempts
-                        mem.writeInt(u64, header[26..34], self.sequence, .big); // message id
+                        { // Write to header
+                            const frame_type = @intFromEnum(@import("protocol.zig").FrameType.message);
+                            mem.writeInt(u32, header[0..4], @intCast(self.body.len + 30), .big); // size
+                            mem.writeInt(u32, header[4..8], frame_type, .big); // frame type
+                            mem.writeInt(u64, header[8..16], self.created_at, .big); // timestamp
+                            mem.writeInt(u16, header[16..18], 1, .big); // attempts
+                            mem.writeInt(u64, header[26..34], self.sequence, .big); // message id
+                        }
                         return .{
-                            .msg = self,
+                            .msg = self, // Channel.Msg has pointer to Topic.Msg
                             .header = header,
                             .timestamp = self.defer_until,
                         };
@@ -223,9 +235,13 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 name: []const u8,
                 server: *Server,
                 channels: std.StringHashMap(*Channel),
+                // Topic message sequence, used for message id.
                 sequence: u64 = 0,
-                first: ?*Msg = null, // starting point for first channel
-                last: ?*Msg = null, // linked list of topic messages
+                // Pointer to the first message when topic has no channels. Null
+                // if topic has channels.
+                first: ?*Msg = null,
+                // Week pointer to the end of linked list of topic messages
+                last: ?*Msg = null,
                 paused: bool = false,
                 metric: struct {
                     // Current number of messages in the topic linked list.
@@ -248,43 +264,10 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     };
                 }
 
-                fn subscribe(self: *Topic, consumer: *Consumer, name: []const u8) !*Channel {
-                    if (self.channels.get(name)) |channel| {
-                        try channel.subscribe(consumer);
-                        return channel;
-                    }
-                    var channel = try self.createChannel(name);
-                    try channel.subscribe(consumer);
-
-                    // First channel gets all messages from the topic
-                    if (self.channels.count() == 1) {
-                        channel.next = self.first;
-                        channel.metric.depth = self.metric.depth;
-                        self.first = null;
-                    }
-                    return channel;
-                }
-
-                fn createChannel(self: *Topic, name: []const u8) !*Channel {
-                    const channel = try self.allocator.create(Channel);
-                    errdefer self.allocator.destroy(channel);
-                    const key = try self.allocator.dupe(u8, name);
-                    errdefer self.allocator.free(key);
-
-                    channel.* = Channel.init(self, key);
-                    channel.initTimer(self.server.io);
-                    try self.channels.put(key, channel);
-
-                    self.server.notifier.channelCreated(self.name, channel.name);
-                    log.debug("topic '{s}' channel '{s}' created", .{ self.name, key });
-                    return channel;
-                }
-
                 fn deinit(self: *Topic) void {
                     var iter = self.channels.iterator();
                     while (iter.next()) |e| self.deinitChannel(e.value_ptr.*);
                     self.channels.deinit();
-                    //if (self.last) |l| l.release();
                 }
 
                 fn deinitChannel(self: *Topic, channel: *Channel) void {
@@ -295,18 +278,47 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     self.allocator.destroy(channel);
                 }
 
-                pub fn publish(self: *Topic, data: []const u8) !void {
-                    const msg = try self.append(data);
-                    try self.notifyChannels(msg, 1);
+                fn subscribe(self: *Topic, consumer: *Consumer, name: []const u8) !*Channel {
+                    if (self.channels.get(name)) |channel| {
+                        try channel.subscribe(consumer);
+                        return channel;
+                    }
+                    const is_first = self.channels.count() == 0;
+
+                    const channel = try self.allocator.create(Channel);
+                    errdefer self.allocator.destroy(channel);
+                    const key = try self.allocator.dupe(u8, name);
+                    errdefer self.allocator.free(key);
+                    try self.channels.ensureUnusedCapacity(1);
+
+                    channel.* = Channel.init(self, key);
+                    channel.initTimer(self.server.io);
+                    errdefer channel.deinit();
+                    try channel.subscribe(consumer);
+                    self.channels.putAssumeCapacityNoClobber(key, channel);
+
+                    if (is_first) { // First channel gets all messages from the topic
+                        channel.next = self.first;
+                        channel.metric.depth = self.metric.depth;
+                        self.first = null;
+                    }
+                    self.server.notifier.channelCreated(self.name, channel.name);
+                    log.debug("topic '{s}' channel '{s}' created", .{ self.name, key });
+                    return channel;
                 }
 
-                pub fn deferredPublish(self: *Topic, data: []const u8, delay: u32) !void {
+                fn publish(self: *Topic, data: []const u8) !void {
+                    const msg = try self.append(data);
+                    self.notifyChannels(msg, 1);
+                }
+
+                fn deferredPublish(self: *Topic, data: []const u8, delay: u32) !void {
                     var msg = try self.append(data);
                     msg.defer_until = self.server.io.now() + nsFromMs(delay);
-                    try self.notifyChannels(msg, 1);
+                    self.notifyChannels(msg, 1);
                 }
 
-                pub fn multiPublish(self: *Topic, msgs: u32, data: []const u8) !void {
+                fn multiPublish(self: *Topic, msgs: u32, data: []const u8) !void {
                     var pos: usize = 0;
                     var first: *Msg = undefined;
                     for (0..msgs) |i| {
@@ -316,20 +328,43 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         if (i == 0) first = msg.acquire();
                         pos += len;
                     }
-                    try self.notifyChannels(first, msgs);
+                    self.notifyChannels(first, msgs);
                     first.release();
                 }
 
+                // Create Topic.Msg add it to the linked list or topic messages
                 fn append(self: *Topic, data: []const u8) !*Msg {
-                    var msg = try self.createMessage(data);
+                    var msg = brk: {
+                        // Allocate message and body
+                        const msg = try self.allocator.create(Msg);
+                        errdefer self.allocator.destroy(msg);
+                        const body = try self.allocator.dupe(u8, data);
+                        errdefer self.allocator.free(body);
 
-                    // Update last pointer
-                    if (self.last) |prev| {
-                        assert(prev.sequence + 1 == msg.sequence);
-                        prev.next = msg.acquire(); // Previous points to new
+                        // Init message
+                        self.sequence += 1;
+                        msg.* = .{
+                            .topic = self,
+                            .sequence = self.sequence,
+                            .created_at = self.server.io.now(),
+                            .body = body,
+                            .rc = 0,
+                        };
+                        break :brk msg;
+                    };
+                    { // Update metrics
+                        self.metric.depth += 1;
+                        self.metric.depth_bytes +%= data.len;
+                        self.metric.total +%= 1;
+                        self.metric.total_bytes +%= data.len;
                     }
-                    self.last = msg;
-
+                    { // Update last pointer
+                        if (self.last) |prev| {
+                            assert(prev.sequence + 1 == msg.sequence);
+                            prev.next = msg.acquire(); // Previous points to new
+                        }
+                        self.last = msg;
+                    }
                     // If there is no channels messages are accumulated in
                     // topic. We need to hold pointer to the first message (to
                     // prevent release).
@@ -338,30 +373,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     return msg;
                 }
 
-                fn createMessage(self: *Topic, data: []const u8) !*Msg {
-                    // Allocate message and body
-                    const msg = try self.allocator.create(Msg);
-                    errdefer self.allocator.destroy(msg);
-                    const body = try self.allocator.dupe(u8, data);
-                    errdefer self.allocator.free(body);
-
-                    // Init message
-                    self.sequence += 1;
-                    msg.* = .{
-                        .topic = self,
-                        .sequence = self.sequence,
-                        .created_at = self.server.io.now(),
-                        .body = body,
-                        .rc = 0,
-                    };
-                    self.metric.depth += 1;
-                    self.metric.depth_bytes +%= body.len;
-                    self.metric.total +%= 1;
-                    self.metric.total_bytes +%= body.len;
-                    return msg;
-                }
-
-                fn deleteMessage(self: *Topic, msg: *Msg) void {
+                fn destroyMessage(self: *Topic, msg: *Msg) void {
                     self.metric.depth -= 1;
                     self.metric.depth_bytes -|= msg.body.len;
                     self.allocator.free(msg.body);
@@ -369,14 +381,16 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
 
                 // Notify all channels that there is pending messages
-                fn notifyChannels(self: *Topic, next: *Msg, msgs: u32) !void {
+                fn notifyChannels(self: *Topic, next: *Msg, msgs: u32) void {
                     var iter = self.channels.valueIterator();
                     while (iter.next()) |ptr| {
                         const channel = ptr.*;
-                        try channel.topicAppended(next);
+                        channel.topicAppended(next);
                         channel.metric.depth += msgs;
                     }
                 }
+
+                // Http interface actions -----------------
 
                 fn deleteChannel(self: *Topic, name: []const u8) !void {
                     const kv = self.channels.fetchRemove(name) orelse return error.NotFound;
@@ -417,6 +431,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     const channel = self.channels.get(name) orelse return error.NotFound;
                     try channel.empty();
                 }
+
+                // -----------------
             };
         }
 
@@ -555,10 +571,12 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
 
                 /// Called from topic when new topic message is created.
-                fn topicAppended(self: *Channel, msg: *Topic.Msg) !void {
+                fn topicAppended(self: *Channel, msg: *Topic.Msg) void {
                     if (self.next == null) {
                         self.next = msg.acquire();
-                        try self.wakeup();
+                        self.wakeup() catch |err| {
+                            log.err("fail to wakeup channel {s}: {}", .{ self.name, err });
+                        };
                     }
                 }
 
