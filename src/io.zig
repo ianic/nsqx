@@ -22,6 +22,7 @@ pub const Error = error{
 
 pub const Io = struct {
     allocator: mem.Allocator,
+    op_pool: std.heap.MemoryPool(Op) = undefined,
     ring: IoUring = undefined,
     timestamp: u64 = 0,
     recv_buf_grp: IoUring.BufferGroup = undefined,
@@ -139,6 +140,7 @@ pub const Io = struct {
         } else {
             self.recv_buf_grp.buffers_count = 0;
         }
+        self.op_pool = try std.heap.MemoryPool(Op).initPreheated(self.allocator, 1024);
     }
 
     fn initBufferGroup(self: *Io, id: u16, count: u16, size: u32) !IoUring.BufferGroup {
@@ -153,15 +155,16 @@ pub const Io = struct {
             self.recv_buf_grp.deinit();
         }
         self.ring.deinit();
+        self.op_pool.deinit();
     }
 
     fn acquire(self: *Io) !*Op {
-        return try self.allocator.create(Op);
+        return try self.op_pool.create();
     }
 
     fn release(self: *Io, op: *Op) void {
         self.metric.complete(op);
-        self.allocator.destroy(op);
+        self.op_pool.destroy(op);
     }
 
     pub fn accept(
@@ -248,7 +251,7 @@ pub const Io = struct {
 
     pub fn ticker(
         self: *Io,
-        msec: i64, // miliseconds
+        msec: i64, // miliseconds  TODO: use msec or nsec on both places
         context: anytype,
         comptime ticked: fn (@TypeOf(context)) Error!void,
         comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,

@@ -14,12 +14,6 @@ fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * ns_per_ms;
 }
 
-// iovlen in msghdr is limited by IOV_MAX in <limits.h>. On modern Linux
-// systems, the limit is 1024. Each message has header and body: 2 iovecs that
-// limits number of messages in a batch to 512.
-// ref: https://man7.org/linux/man-pages/man2/readv.2.html
-pub const max_msgs_send_batch_size = 512;
-
 pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
     return struct {
         const Server = @This();
@@ -604,12 +598,12 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                 // Try to push messages to the consumers.
                 fn wakeup(self: *Channel) !void {
-                    // const cnt = self.consumers.items.len;
-                    // if (cnt == 0) return;
-                    // if (cnt == 1) {
-                    //     _ = try self.fillConsumer(self.consumers.items[0]);
-                    //     return;
-                    // }
+                    const cnt = self.consumers.items.len;
+                    if (cnt == 0) return;
+                    if (cnt == 1) {
+                        _ = try self.fillConsumer(self.consumers.items[0]);
+                        return;
+                    }
                     var iter = self.consumersIterator();
                     while (iter.next()) |consumer|
                         if (!try self.fillConsumer(consumer)) break;
@@ -624,7 +618,6 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         var msg = (self.nextMsg(consumer.msgTimeout()) catch null) orelse break;
                         msg.sent_at = self.timer.now();
                         msg.in_flight_socket = consumer.socket;
-                        //std.debug.print("prepare {}\n", .{n});
                         consumer.prepareSend(&msg.header, msg.msg.body, n);
                     }
                     if (n == 0) return false;
