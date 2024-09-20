@@ -155,10 +155,14 @@ pub const Conn = struct {
         self.ticker_op = try self.io.ticker(msec, self, tick, tickerFailed);
     }
 
+    // Channel api -----------------
+
+    /// Consumer setting
     pub fn msgTimeout(self: *Conn) u32 {
         return self.identify.msg_timeout;
     }
 
+    /// Number of messages connection is ready to send
     pub fn ready(self: *Conn) u32 {
         if (self.send_op != null) return 0;
         if (self.in_flight >= self.ready_count) return 0;
@@ -167,6 +171,30 @@ pub const Conn = struct {
             self.send_vec.maxMsgs(),
         );
     }
+
+    /// Prepares single message to be sent. Fills vectored sending structures.
+    /// msg_no must be 0,1,2
+    pub fn prepareSend(self: *Conn, header: []const u8, body: []const u8, msg_no: u32) !void {
+        if (msg_no == 0) try self.send_vec.prepInit(self.allocator, self.ready_count);
+        self.send_vec.prep(header, body);
+    }
+
+    /// Sends all prepared messages.
+    /// msgs must be number of prepared messages
+    pub fn sendPrepared(self: *Conn, msgs: u32) !void {
+        assert(msgs == self.send_vec.prepMsgs());
+        try self.send();
+        self.metric.send += msgs;
+        self.in_flight += msgs;
+    }
+
+    /// When channel is deleted via web interface
+    pub fn channelClosed(self: *Conn) void {
+        self.channel = null;
+        self.close() catch {};
+    }
+
+    // Channel api -----------------
 
     fn tick(self: *Conn) Error!void {
         if (self.outstanding_heartbeats > 4) {
@@ -295,45 +323,9 @@ pub const Conn = struct {
         try self.close();
     }
 
-    fn sendResponse(self: *Conn, data: []const u8) !void {
-        var hdr = &self.send_buf;
-        assert(data.len <= hdr.len - 8);
-        mem.writeInt(u32, hdr[0..4], @intCast(4 + data.len), .big);
-        mem.writeInt(u32, hdr[4..8], @intFromEnum(protocol.FrameType.response), .big);
-        @memcpy(hdr[8..][0..data.len], data);
-        self.send_vec.prepOne(self.send_buf[0 .. data.len + 8]);
-        try self.send();
-    }
-
-    // msg_no must be 0,1,2
-    pub fn prepareSend(self: *Conn, header: []const u8, body: []const u8, msg_no: u32) !void {
-        if (msg_no == 0) try self.send_vec.prepInit(self.allocator, self.ready_count);
-        self.send_vec.prep(header, body);
-    }
-
-    // msgs must be number of prepared messages
-    pub fn sendPrepared(self: *Conn, msgs: u32) !void {
-        assert(msgs == self.send_vec.prepMsgs());
-        try self.send();
-        self.metric.send += msgs;
-        self.in_flight += msgs;
-    }
-
     fn send(self: *Conn) !void {
         assert(self.send_op == null);
         self.send_op = try self.io.sendv(self.socket, self.send_vec.ptr(), self, sent, sendFailed);
-    }
-
-    fn respond(self: *Conn, rsp: Response) !void {
-        if (self.send_op != null) {
-            self.pending_response = rsp;
-            return;
-        }
-        switch (rsp) {
-            .ok => try self.sendResponse("OK"),
-            .heartbeat => try self.sendResponse("_heartbeat_"),
-            .close => try self.sendResponse("CLOSE_WAIT"),
-        }
     }
 
     fn sent(self: *Conn) Error!void {
@@ -357,9 +349,26 @@ pub const Conn = struct {
         try self.close();
     }
 
-    pub fn channelClosed(self: *Conn) void {
-        self.channel = null;
-        self.close() catch {};
+    fn respond(self: *Conn, rsp: Response) !void {
+        if (self.send_op != null) {
+            self.pending_response = rsp;
+            return;
+        }
+        switch (rsp) {
+            .ok => try self.sendResponse("OK"),
+            .heartbeat => try self.sendResponse("_heartbeat_"),
+            .close => try self.sendResponse("CLOSE_WAIT"),
+        }
+    }
+
+    fn sendResponse(self: *Conn, data: []const u8) !void {
+        var hdr = &self.send_buf;
+        assert(data.len <= hdr.len - 8);
+        mem.writeInt(u32, hdr[0..4], @intCast(4 + data.len), .big);
+        mem.writeInt(u32, hdr[4..8], @intFromEnum(protocol.FrameType.response), .big);
+        @memcpy(hdr[8..][0..data.len], data);
+        self.send_vec.prepOne(self.send_buf[0 .. data.len + 8]);
+        try self.send();
     }
 
     fn close(self: *Conn) !void {
@@ -416,8 +425,8 @@ pub const RecvBuf = struct {
     }
 };
 
-// Growable vectored send structures. Call prepInit then prep multiple times and
-// then use ptr in sendv.
+/// Growable vectored send structures. Call prepInit then prep multiple times and
+/// then use ptr in sendv.
 const SendVec = struct {
     // iovlen in msghdr is limited by IOV_MAX in <limits.h>. On modern Linux
     // systems, the limit is 1024. Each message has header and body: 2 iovecs that
@@ -448,12 +457,12 @@ const SendVec = struct {
         allocator.free(self.iov);
     }
 
-    // Max number of messages which can fit into iov.
+    /// Max number of messages which can fit into iov.
     fn maxMsgs(self: *Self) usize {
         return self.iov.len / 2;
     }
 
-    // Number of prepared messages
+    /// Number of prepared messages
     fn prepMsgs(self: *Self) usize {
         return @as(usize, @intCast(self.msghdr.iovlen)) / 2;
     }
@@ -463,7 +472,7 @@ const SendVec = struct {
         self.msghdr.iovlen = 1;
     }
 
-    // Start of prepare multiple messages
+    /// Start of prepare multiple messages
     fn prepInit(self: *Self, allocator: mem.Allocator, want_msgs: usize) !void {
         self.msghdr.iovlen = 0;
         const new_len: usize = @as(usize, @intCast(@min(want_msgs, max_msgs))) * 2;
@@ -474,7 +483,7 @@ const SendVec = struct {
         }
     }
 
-    // Puts each message(header/body) into iov
+    /// Puts each message(header/body) into iov
     fn prep(self: *Self, header: []const u8, body: []const u8) void {
         const n: usize = @intCast(self.msghdr.iovlen);
         self.iov[n] = .{ .base = header.ptr, .len = header.len };
@@ -482,7 +491,7 @@ const SendVec = struct {
         self.msghdr.iovlen += 2;
     }
 
-    // Pointer to use in sendv
+    /// Pointer to use in vectored send (sendv)
     fn ptr(self: *Self) *posix.msghdr_const {
         return &self.msghdr;
     }
