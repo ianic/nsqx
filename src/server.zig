@@ -618,7 +618,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         var msg = (self.nextMsg(consumer.msgTimeout()) catch null) orelse break;
                         msg.sent_at = self.timer.now();
                         msg.in_flight_socket = consumer.socket;
-                        consumer.prepareSend(&msg.header, msg.msg.body, n);
+                        try consumer.prepareSend(&msg.header, msg.msg.body, n);
                     }
                     if (n == 0) return false;
                     try consumer.sendPrepared(n);
@@ -1025,7 +1025,7 @@ const TestConsumer = struct {
         return self.ready_count;
     }
 
-    fn prepareSend(self: *Self, header: []const u8, body: []const u8, msg_no: u32) void {
+    fn prepareSend(self: *Self, header: []const u8, body: []const u8, msg_no: u32) !void {
         const sequence = mem.readInt(u64, header[26..34], .big);
         self.sequences.append(sequence) catch unreachable;
         _ = msg_no;
