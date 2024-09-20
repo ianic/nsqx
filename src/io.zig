@@ -954,7 +954,7 @@ test "ticker" {
 
     const delay = 123;
     const op = try io.ticker(delay, &ctx, Ctx.ticked, null);
-    defer allocator.destroy(op);
+    _ = op;
     const start = unixMilli();
     try io.tick();
     const elapsed = unixMilli() - start;
