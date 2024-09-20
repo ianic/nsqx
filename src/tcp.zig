@@ -14,7 +14,12 @@ const lookup = @import("lookup.zig");
 pub const Server = @import("server.zig").ServerType(Conn, Io, lookup.Connector);
 const Channel = Server.Channel;
 const Msg = Server.Channel.Msg;
-const max_msgs_send_batch_size = @import("server.zig").max_msgs_send_batch_size;
+
+// iovlen in msghdr is limited by IOV_MAX in <limits.h>. On modern Linux
+// systems, the limit is 1024. Each message has header and body: 2 iovecs that
+// limits number of messages in a batch to 512.
+// ref: https://man7.org/linux/man-pages/man2/readv.2.html
+const max_msgs_send_batch_size = 512;
 
 const log = std.log.scoped(.tcp);
 
@@ -306,20 +311,21 @@ pub const Conn = struct {
         try self.send(1);
     }
 
-    pub fn sendMsgs(self: *Conn, msgs: []*Msg) !void {
-        assert(msgs.len <= self.send_vec.len / 2);
-        var n: usize = 0;
-        for (msgs) |msg| {
-            self.send_vec[n] = .{ .base = &msg.header, .len = msg.header.len };
-            self.send_vec[n + 1] = .{ .base = msg.body().ptr, .len = msg.body().len };
-            n += 2;
-        }
-        try self.send(n);
-        self.metric.send += msgs.len;
-        self.in_flight += @intCast(msgs.len);
+    // msg_no must be 0,1,2
+    pub fn prepareSend(self: *Conn, header: []const u8, body: []const u8, msg_no: u32) void {
+        const n = msg_no * 2;
+        self.send_vec[n] = .{ .base = header.ptr, .len = header.len };
+        self.send_vec[n + 1] = .{ .base = if (body.len == 0) header.ptr else body.ptr, .len = body.len };
     }
 
-    fn send(self: *Conn, vec_len: usize) !void {
+    // msgs must be number of prepared messages
+    pub fn sendPrepared(self: *Conn, msgs: u32) !void {
+        try self.send(msgs * 2);
+        self.metric.send += msgs;
+        self.in_flight += msgs;
+    }
+
+    fn send(self: *Conn, vec_len: u32) !void {
         assert(self.send_op == null);
         self.send_msghdr.iov = self.send_vec.ptr;
         self.send_msghdr.iovlen = @intCast(vec_len);
