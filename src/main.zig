@@ -8,10 +8,11 @@ const Io = @import("io.zig").Io;
 const tcp = @import("tcp.zig");
 const http = @import("http.zig");
 const lookup = @import("lookup.zig");
+const statsd = @import("statsd.zig");
 
-pub const std_options = std.Options{
-    .log_level = .info,
-};
+// pub const std_options = std.Options{
+//     .log_level = .info,
+// };
 
 const log = std.log.scoped(.main);
 
@@ -27,6 +28,8 @@ pub fn main() !void {
 
     const http_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.http_port);
     const http_socket = (try http_addr.listen(.{ .reuse_address = true })).stream.handle;
+
+    const statsd_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 8125);
 
     var io = Io{ .allocator = allocator };
     try io.init(
@@ -61,6 +64,9 @@ pub fn main() !void {
     defer http_listener.deinit();
     try http_listener.accept(http_socket);
 
+    var statsd_connector = statsd.Connector{ .io = &io, .allocator = allocator, .address = statsd_addr };
+    try statsd_connector.start();
+
     catchSignals();
     while (true) {
         try io.tick();
@@ -78,6 +84,7 @@ pub fn main() !void {
     }
 
     log.info("draining", .{});
+    try statsd_connector.close();
     try server.stopTimers();
     try lookup_connector.close();
     try http_listener.close();
@@ -112,7 +119,7 @@ fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
 
     print(
         "  receive buffers group:\n    success: {}, no-buffs: {} {d:5.2}%\n",
-        .{ io.recv_buf_grp_stat.success, io.recv_buf_grp_stat.no_bufs, io.recv_buf_grp_stat.noBufs() },
+        .{ io.metric.recv_buf_grp.success, io.metric.recv_buf_grp.no_bufs, io.metric.recv_buf_grp.noBufs() },
     );
 
     print("server topics: {}\n", .{server.topics.count()});

@@ -26,21 +26,25 @@ pub const Io = struct {
     ring: IoUring = undefined,
     timestamp: u64 = 0,
     recv_buf_grp: IoUring.BufferGroup = undefined,
-    recv_buf_grp_stat: struct {
-        success: usize = 0,
-        no_bufs: usize = 0,
-
-        pub fn noBufs(self: @This()) f64 {
-            const total = self.success + self.no_bufs;
-            if (total == 0) return 0;
-            return @as(f64, @floatFromInt(self.no_bufs)) / @as(f64, @floatFromInt(total)) * 100;
-        }
-    } = .{},
     metric: Metric = .{},
+    prev_metric: Metric = .{},
 
     const Metric = struct {
         loops: usize = 0,
         cqes: usize = 0,
+        send_bytes: usize = 0,
+        recv_bytes: usize = 0,
+
+        recv_buf_grp: struct {
+            success: usize = 0,
+            no_bufs: usize = 0,
+
+            pub fn noBufs(self: @This()) f64 {
+                const total = self.success + self.no_bufs;
+                if (total == 0) return 0;
+                return @as(f64, @floatFromInt(self.no_bufs)) / @as(f64, @floatFromInt(total)) * 100;
+            }
+        } = .{},
 
         all: Counter = .{},
         accept: Counter = .{},
@@ -131,6 +135,72 @@ pub const Io = struct {
             }
         }
     };
+
+    pub fn writeMetrics(self: *Io, writer: anytype) !void {
+        // c - current value
+        // p - previous value
+        {
+            const c = self.metric.all;
+            const p = &self.prev_metric.all;
+            try writer.counter("io.op.all.submitted", c.submitted, p.submitted);
+            try writer.counter("io.op.all.completed", c.completed, p.completed);
+            try writer.counter("io.op.all.restarted", c.restarted, p.restarted);
+            try writer.gauge("io.op.all.active", self.metric.all.active());
+        }
+        {
+            const c = self.metric.sendv;
+            const p = &self.prev_metric.sendv;
+            try writer.counter("io.op.send.submitted", c.submitted, p.submitted);
+            try writer.counter("io.op.send.completed", c.completed, p.completed);
+            try writer.counter("io.op.send.restarted", c.restarted, p.restarted);
+            try writer.gauge("io.op.send.active", self.metric.sendv.active());
+        }
+        {
+            const c = self.metric.recv;
+            const p = &self.prev_metric.recv;
+            try writer.counter("io.op.recv.submitted", c.submitted, p.submitted);
+            try writer.counter("io.op.recv.completed", c.completed, p.completed);
+            try writer.counter("io.op.recv.restarted", c.restarted, p.restarted);
+            try writer.gauge("io.op.recv.active", self.metric.recv.active());
+        }
+        {
+            const c = self.metric.accept;
+            const p = &self.prev_metric.accept;
+            try writer.counter("io.op.accept.submitted", c.submitted, p.submitted);
+            try writer.counter("io.op.accept.completed", c.completed, p.completed);
+            try writer.counter("io.op.accept.restarted", c.restarted, p.restarted);
+            try writer.gauge("io.op.accept.active", self.metric.accept.active());
+        }
+        {
+            const c = self.metric.connect;
+            const p = &self.prev_metric.connect;
+            try writer.counter("io.op.connect.submitted", c.submitted, p.submitted);
+            try writer.counter("io.op.connect.completed", c.completed, p.completed);
+            try writer.counter("io.op.connect.restarted", c.restarted, p.restarted);
+            try writer.gauge("io.op.connect.active", self.metric.connect.active());
+        }
+        {
+            const c = self.metric.ticker;
+            const p = &self.prev_metric.ticker;
+            try writer.counter("io.op.ticker.submitted", c.submitted, p.submitted);
+            try writer.counter("io.op.ticker.completed", c.completed, p.completed);
+            try writer.counter("io.op.ticker.restarted", c.restarted, p.restarted);
+            try writer.gauge("io.op.ticker.active", self.metric.ticker.active());
+        }
+        {
+            const c = self.metric;
+            const p = &self.prev_metric;
+            try writer.counter("io.loops", c.loops, p.loops);
+            try writer.counter("io.cqes", c.cqes, p.cqes);
+
+            try writer.counter("io.send_bytes", c.send_bytes, p.send_bytes);
+            try writer.counter("io.recv_bytes", c.recv_bytes, p.recv_bytes);
+
+            try writer.counter("io.recv_buf_grp.success", c.recv_buf_grp.success, p.recv_buf_grp.success);
+            try writer.counter("io.recv_buf_grp.no_bufs", c.recv_buf_grp.no_bufs, p.recv_buf_grp.no_bufs);
+        }
+        self.prev_metric = self.metric;
+    }
 
     pub fn init(self: *Io, ring_entries: u16, recv_buffers: u16, recv_buffer_len: u32) !void {
         self.ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER);
@@ -630,15 +700,16 @@ pub const Op = struct {
                             try failed(ctx, error.EndOfFile);
                             return .done;
                         }
+                        op.io.metric.recv_bytes +%= n;
 
                         const buffer_id = cqe.buffer_id() catch unreachable;
                         const bytes = op.io.recv_buf_grp.get(buffer_id)[0..n];
                         defer op.io.recv_buf_grp.put(buffer_id);
                         try received(ctx, bytes);
-                        op.io.recv_buf_grp_stat.success += 1;
+                        op.io.metric.recv_buf_grp.success += 1;
                     },
                     .NOBUFS => {
-                        op.io.recv_buf_grp_stat.no_bufs += 1;
+                        op.io.metric.recv_buf_grp.no_bufs += 1;
                         //log.warn("{} recv buffer group NOBUFS temporary error", .{op.args.recv});
                     },
                     .INTR => {},
@@ -710,6 +781,7 @@ pub const Op = struct {
                 switch (cqe.err()) {
                     .SUCCESS => {
                         const n: usize = @intCast(cqe.res);
+                        op.io.metric.send_bytes +%= n;
 
                         // zero copy send handling
                         // if (cqe.flags & linux.IORING_CQE_F_MORE > 0) {
@@ -772,6 +844,7 @@ pub const Op = struct {
                 switch (cqe.err()) {
                     .SUCCESS => {
                         const n: usize = @intCast(cqe.res);
+                        op.io.metric.send_bytes +%= n;
                         const send_buf = op.args.send.buf;
                         if (n < send_buf.len) {
                             op.args.send.buf = send_buf[n..];
@@ -1003,3 +1076,192 @@ fn unixMilli() i64 {
     };
     return ts.sec * 1000 + @divTrunc(ts.nsec, ns_per_ms);
 }
+
+test "send udp" {
+    const allocator = testing.allocator;
+    var io = Io{ .allocator = allocator };
+    try io.init(4, 0, 0);
+    defer io.deinit();
+
+    const Ctx = struct {
+        io: *Io,
+        allocator: mem.Allocator,
+        address: std.net.Address,
+
+        socket: socket_t = 0,
+        err: ?anyerror = null,
+        callback_count: usize = 0,
+        send_op: ?*Op = null,
+        ticker_op: ?*Op = null,
+        iter: BufferSizeIterator = .{ .buf = &.{}, .pos = 0, .size = 0 },
+
+        const Self = @This();
+
+        fn start(self: *Self) !void {
+            const ping_interval = 2 * 1000; // in milliseconds
+            self.ticker_op = try self.io.ticker(ping_interval, self, tick, tickerFailed);
+        }
+
+        fn tick(self: *Self) Error!void {
+            if (self.socket == 0) {
+                return try self.socketCreate();
+            }
+            if (self.send_op != null) return;
+            if (self.iter.done()) try self.generate();
+            try self.send();
+        }
+
+        fn tickerFailed(self: *Self, err: anyerror) Error!void {
+            self.ticker_op = null;
+            switch (err) {
+                error.Canceled => {},
+                else => {
+                    log.err("ticker failed {}", .{err});
+                    try self.start();
+                },
+            }
+        }
+
+        fn socketCreate(self: *Self) !void {
+            _ = try self.io.socketCreate(
+                self.address.any.family,
+                posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
+                0,
+                self,
+                socketCreated,
+                connectFailed,
+            );
+        }
+
+        fn socketCreated(self: *Self, socket: socket_t) Error!void {
+            self.socket = socket;
+            _ = try self.io.connect(self.socket, self.address, self, connected, connectFailed);
+        }
+
+        fn connectFailed(self: *Self, err: anyerror) Error!void {
+            std.debug.print("connectFailed {}\n", .{err});
+            try self.io.close(self.socket);
+            self.socket = 0;
+        }
+
+        fn connected(self: *Self) Error!void {
+            self.callback_count += 1;
+        }
+
+        fn generate(self: *Self) Error!void {
+            var file = std.fs.cwd().openFile("/home/ianic/Code/tls.zig/example/cert/pg2600.txt", .{}) catch unreachable;
+            defer file.close();
+            const book = file.readToEndAlloc(self.allocator, 1024 * 1024 * 1024) catch unreachable;
+            self.iter = BufferSizeIterator{ .buf = book, .size = 504 };
+        }
+
+        fn send(self: *Self) !void {
+            if (self.iter.next()) |buf| {
+                self.send_op = try self.io.send(self.socket, buf, self, sent, sendFailed);
+            }
+        }
+
+        fn sent(self: *Self) Error!void {
+            self.callback_count += 1;
+            self.send_op = null;
+            if (self.iter.done()) {
+                self.allocator.free(self.iter.buf);
+                self.iter = .{ .buf = &.{}, .pos = 0, .size = 0 };
+                std.debug.print("sent {}\n", .{self.callback_count});
+            } else {
+                try self.send();
+            }
+        }
+
+        fn sendFailed(self: *Self, err: anyerror) Error!void {
+            self.send_op = null;
+            std.debug.print("sendFailed {}\n", .{err});
+        }
+    };
+
+    const addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 8126);
+
+    var ctx = Ctx{
+        .allocator = allocator,
+        .io = &io,
+        .address = addr,
+    };
+    try ctx.start();
+
+    // _ = try io.socketCreate(addr.any.family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0, &ctx, Ctx.socketCreated, Ctx.failed);
+
+    // try io.tick();
+    // try testing.expect(ctx.socket > 0);
+    // try testing.expect(ctx.err == null);
+
+    // _ = try io.connect(ctx.socket, addr, &ctx, Ctx.connected, Ctx.failed);
+    // try io.tick();
+    // try testing.expectEqual(1, ctx.callback_count);
+
+    while (true) {
+        try io.tick();
+    }
+
+    // try io.tick();
+    //std.debug.print("err: {}\n", .{ctx.err.?});
+    //try testing.expect(ctx.err == null);
+    //try testing.expectEqual(2, ctx.callback_count);
+}
+
+test "read file" {
+    const allocator = testing.allocator;
+
+    var file = try std.fs.cwd().openFile("/home/ianic/Code/tls.zig/example/cert/pg2600.txt", .{});
+    defer file.close();
+
+    const book = try file.readToEndAlloc(allocator, 1024 * 1024 * 1024);
+    defer allocator.free(book);
+
+    const buf = book[0 .. 1024 * 16 + 28 + 10];
+
+    var iter = BufferSizeIterator{ .buf = buf, .size = 504 };
+    while (iter.next()) |b| {
+        std.debug.print("------\n{s}------\n", .{b});
+    }
+    try testing.expect(iter.done());
+
+    // var start: usize = 0;
+    // const max_len: usize = 508;
+
+    // while (start <= buf.len) {
+    //     const end = @min(start + max_len, buf.len);
+    //     if (std.mem.lastIndexOfScalar(u8, buf[start..end], '\n')) |len| {
+    //         const split = buf[start..][0 .. len + 1];
+    //         std.debug.print("{} {s}", .{ split.len, split });
+    //         start += split.len;
+    //         continue;
+    //     }
+    //     const split = buf[start..];
+    //     std.debug.print("leftover {} {s}", .{ split.len, split });
+    //     break;
+    // }
+}
+
+const BufferSizeIterator = struct {
+    buf: []const u8,
+    pos: usize = 0,
+    size: usize,
+
+    const Self = @This();
+
+    pub fn next(self: *Self) ?[]const u8 {
+        const end = @min(self.pos + self.size, self.buf.len);
+
+        if (std.mem.lastIndexOfScalar(u8, self.buf[self.pos..end], '\n')) |sep| {
+            const split = self.buf[self.pos..][0 .. sep + 1];
+            self.pos += split.len;
+            return split;
+        }
+        self.pos = self.buf.len;
+        return null;
+    }
+
+    pub fn done(self: Self) bool {
+        return self.pos == self.buf.len;
+    }
+};
