@@ -64,6 +64,20 @@ pub const Options = struct {
         /// Length of each receive buffer in bytes
         recv_buffer_len: u32 = 64 * 1024,
     } = .{},
+
+    /// statsd
+    statsd: Statsd = .{},
+
+    pub const Statsd = struct {
+        /// statsd daemon for pushing stats
+        address: ?std.net.Address = null,
+        /// duration between pushing to statsd (in milliseconds)
+        interval: u16 = 5 * 1000,
+        /// prefix used for keys sent to statsd (%s for host replacement) (default "nsq.%s")
+        prefix: []const u8 = "nsq.%s",
+        /// the size in bytes of statsd UDP packets (default 508)
+        udp_packet_size: u16 = 508,
+    };
 };
 
 const MessageTag = enum {

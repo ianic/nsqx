@@ -21,15 +21,15 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = if (builtin.mode == .ReleaseFast) std.heap.c_allocator else gpa.allocator();
 
-    const options: Options = .{};
+    const options: Options = .{
+        .statsd = .{ .address = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 8125) },
+    };
 
     const tcp_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.tcp_port);
     const tcp_socket = (try tcp_addr.listen(.{ .reuse_address = true })).stream.handle;
 
     const http_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.http_port);
     const http_socket = (try http_addr.listen(.{ .reuse_address = true })).stream.handle;
-
-    const statsd_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 8125);
 
     var io = Io{ .allocator = allocator };
     try io.init(
@@ -64,13 +64,8 @@ pub fn main() !void {
     defer http_listener.deinit();
     try http_listener.accept(http_socket);
 
-    var statsd_connector = statsd.Connector{
-        .io = &io,
-        .server = &server,
-        .allocator = allocator,
-        .address = statsd_addr,
-    };
-    try statsd_connector.start();
+    var statsd_connector: ?statsd.Connector = statsd.Connector.init(allocator, &io, &server, options.statsd);
+    if (statsd_connector) |*sc| try sc.start();
 
     catchSignals();
     while (true) {
@@ -89,7 +84,7 @@ pub fn main() !void {
     }
 
     log.info("draining", .{});
-    try statsd_connector.close();
+    if (statsd_connector) |*sc| try sc.close();
     try server.stopTimers();
     try lookup_connector.close();
     try http_listener.close();

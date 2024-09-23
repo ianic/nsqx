@@ -8,26 +8,39 @@ const testing = std.testing;
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
-
+const Options = @import("protocol.zig").Options.Statsd;
 const Server = @import("tcp.zig").Server;
 
 const log = std.log.scoped(.statsd);
 
 pub const Connector = struct {
+    allocator: mem.Allocator,
     io: *Io,
     server: *Server,
-    allocator: mem.Allocator,
+    options: Options,
     address: std.net.Address,
     socket: socket_t = 0,
     send_op: ?*Op = null,
     ticker_op: ?*Op = null,
-    iter: BufferSizeIterator = .{ .buf = &.{}, .pos = 0, .size = 0 },
-    send_interval: i64 = 5 * 1000, // in milliseconds
+    iter: BufferSizeIterator = .{},
 
     const Self = @This();
 
+    pub fn init(allocator: mem.Allocator, io: *Io, server: *Server, options: Options) ?Self {
+        return if (options.address) |address|
+            .{
+                .allocator = allocator,
+                .io = io,
+                .server = server,
+                .options = options,
+                .address = address,
+            }
+        else
+            null;
+    }
+
     pub fn start(self: *Self) !void {
-        self.ticker_op = try self.io.ticker(self.send_interval, self, tick, tickerFailed);
+        self.ticker_op = try self.io.ticker(self.options.interval, self, tick, tickerFailed);
     }
 
     fn tick(self: *Self) Error!void {
@@ -87,10 +100,11 @@ pub const Connector = struct {
             return;
         };
         const book = try writer.toOwned();
-        self.iter = BufferSizeIterator{ .buf = book, .size = 504, .pos = 0 };
+        self.iter = BufferSizeIterator{ .buf = book, .size = self.options.udp_packet_size };
     }
 
     fn send(self: *Self) !void {
+        assert(self.send_op == null);
         if (self.iter.next()) |buf| {
             self.send_op = try self.io.send(self.socket, buf, self, sent, sendFailed);
         }
@@ -101,7 +115,7 @@ pub const Connector = struct {
         if (self.iter.done()) {
             log.debug("sent {} bytes", .{self.iter.buf.len});
             self.allocator.free(self.iter.buf);
-            self.iter = .{ .buf = &.{}, .pos = 0, .size = 0 };
+            self.iter = .{};
         } else {
             try self.send();
         }
@@ -114,13 +128,14 @@ pub const Connector = struct {
 
     pub fn close(self: *Self) !void {
         if (self.ticker_op) |op| try op.cancel();
+        if (self.send_op) |op| op.unsubscribe(self);
     }
 };
 
 const BufferSizeIterator = struct {
-    buf: []const u8,
+    buf: []const u8 = &.{},
     pos: usize = 0,
-    size: usize,
+    size: usize = 0,
 
     const Self = @This();
 
