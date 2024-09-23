@@ -27,7 +27,7 @@ pub const Io = struct {
     timestamp: u64 = 0,
     recv_buf_grp: IoUring.BufferGroup = undefined,
     metric: Metric = .{},
-    prev_metric: Metric = .{},
+    metric_prev: Metric = .{},
 
     const Metric = struct {
         loops: usize = 0,
@@ -91,6 +91,13 @@ pub const Io = struct {
                     .{ self.active(), self.max_active, self.submitted, self.restarted, self.completed },
                 );
             }
+
+            fn write(prefix: []const u8, cur: Counter, prev: Counter, writer: anytype) !void {
+                try writer.counter(prefix, "submitted", cur.submitted, prev.submitted);
+                try writer.counter(prefix, "completed", cur.completed, prev.completed);
+                try writer.counter(prefix, "restarted", cur.restarted, prev.restarted);
+                try writer.gauge(prefix, "active", cur.active());
+            }
         };
 
         fn submit(self: *Metric, op: *Op) void {
@@ -137,69 +144,28 @@ pub const Io = struct {
     };
 
     pub fn writeMetrics(self: *Io, writer: anytype) !void {
-        // c - current value
-        // p - previous value
-        {
-            const c = self.metric.all;
-            const p = &self.prev_metric.all;
-            try writer.counter("io.op.all.submitted", c.submitted, p.submitted);
-            try writer.counter("io.op.all.completed", c.completed, p.completed);
-            try writer.counter("io.op.all.restarted", c.restarted, p.restarted);
-            try writer.gauge("io.op.all.active", self.metric.all.active());
-        }
-        {
-            const c = self.metric.sendv;
-            const p = &self.prev_metric.sendv;
-            try writer.counter("io.op.send.submitted", c.submitted, p.submitted);
-            try writer.counter("io.op.send.completed", c.completed, p.completed);
-            try writer.counter("io.op.send.restarted", c.restarted, p.restarted);
-            try writer.gauge("io.op.send.active", self.metric.sendv.active());
-        }
-        {
-            const c = self.metric.recv;
-            const p = &self.prev_metric.recv;
-            try writer.counter("io.op.recv.submitted", c.submitted, p.submitted);
-            try writer.counter("io.op.recv.completed", c.completed, p.completed);
-            try writer.counter("io.op.recv.restarted", c.restarted, p.restarted);
-            try writer.gauge("io.op.recv.active", self.metric.recv.active());
-        }
-        {
-            const c = self.metric.accept;
-            const p = &self.prev_metric.accept;
-            try writer.counter("io.op.accept.submitted", c.submitted, p.submitted);
-            try writer.counter("io.op.accept.completed", c.completed, p.completed);
-            try writer.counter("io.op.accept.restarted", c.restarted, p.restarted);
-            try writer.gauge("io.op.accept.active", self.metric.accept.active());
-        }
-        {
-            const c = self.metric.connect;
-            const p = &self.prev_metric.connect;
-            try writer.counter("io.op.connect.submitted", c.submitted, p.submitted);
-            try writer.counter("io.op.connect.completed", c.completed, p.completed);
-            try writer.counter("io.op.connect.restarted", c.restarted, p.restarted);
-            try writer.gauge("io.op.connect.active", self.metric.connect.active());
-        }
-        {
-            const c = self.metric.ticker;
-            const p = &self.prev_metric.ticker;
-            try writer.counter("io.op.ticker.submitted", c.submitted, p.submitted);
-            try writer.counter("io.op.ticker.completed", c.completed, p.completed);
-            try writer.counter("io.op.ticker.restarted", c.restarted, p.restarted);
-            try writer.gauge("io.op.ticker.active", self.metric.ticker.active());
-        }
-        {
-            const c = self.metric;
-            const p = &self.prev_metric;
-            try writer.counter("io.loops", c.loops, p.loops);
-            try writer.counter("io.cqes", c.cqes, p.cqes);
+        const cur = self.metric;
+        const prev = self.metric_prev;
+        const write = Metric.Counter.write;
 
-            try writer.counter("io.send_bytes", c.send_bytes, p.send_bytes);
-            try writer.counter("io.recv_bytes", c.recv_bytes, p.recv_bytes);
+        try write("io.op.all", cur.all, prev.all, writer);
+        try write("io.op.send", cur.sendv, prev.sendv, writer);
+        try write("io.op.recv", cur.recv, prev.recv, writer);
+        try write("io.op.accept", cur.accept, prev.accept, writer);
+        try write("io.op.connect", cur.connect, prev.connect, writer);
+        try write("io.op.ticker", cur.ticker, prev.ticker, writer);
+        {
+            try writer.counter("io", "loops", cur.loops, prev.loops);
+            try writer.counter("io", "cqes", cur.cqes, prev.cqes);
 
-            try writer.counter("io.recv_buf_grp.success", c.recv_buf_grp.success, p.recv_buf_grp.success);
-            try writer.counter("io.recv_buf_grp.no_bufs", c.recv_buf_grp.no_bufs, p.recv_buf_grp.no_bufs);
+            try writer.counter("io", "send_bytes", cur.send_bytes, prev.send_bytes);
+            try writer.counter("io", "recv_bytes", cur.recv_bytes, prev.recv_bytes);
         }
-        self.prev_metric = self.metric;
+        {
+            try writer.counter("io.recv_buf_grp", "success", cur.recv_buf_grp.success, prev.recv_buf_grp.success);
+            try writer.counter("io.recv_buf_grp", "no_bufs", cur.recv_buf_grp.no_bufs, prev.recv_buf_grp.no_bufs);
+        }
+        self.metric_prev = cur;
     }
 
     pub fn init(self: *Io, ring_entries: u16, recv_buffers: u16, recv_buffer_len: u32) !void {

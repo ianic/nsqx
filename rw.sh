@@ -25,9 +25,9 @@ nsqd_pid=$!
 
 sleep 1
 
-sh -c 'while ~/Code/go/nsq/bench/bench_writer/bench_writer ; do : ; done' &
+sh -c 'while ~/Code/go/nsq/bench/bench_writer/bench_writer --size 32 --runfor 10s ; do : ; done' &
 writer_pid=$!
-sh -c 'while ~/Code/go/nsq/bench/bench_reader/bench_reader ; do : ; done' &
+sh -c 'while ~/Code/go/nsq/bench/bench_reader/bench_reader --size 32 --runfor 10s; do : ; done' &
 reader_pid=$!
 
 ~/Code/go/nsq/apps/nsqadmin/nsqadmin --nsqd-http-address localhost:4151 >> /dev/null 2>&1 &

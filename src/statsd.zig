@@ -15,6 +15,7 @@ const log = std.log.scoped(.statsd);
 
 pub const Connector = struct {
     io: *Io,
+    server: *Server,
     allocator: mem.Allocator,
     address: std.net.Address,
     socket: socket_t = 0,
@@ -77,8 +78,12 @@ pub const Connector = struct {
 
     fn generate(self: *Self) Error!void {
         var writer = MetricWriter.init(self.allocator);
+        self.server.writeMetrics(&writer) catch |err| {
+            log.err("server write metrics error {}", .{err});
+            return;
+        };
         self.io.writeMetrics(&writer) catch |err| {
-            log.err("io.writeMetrics error {}", .{err});
+            log.err("io write metrics error {}", .{err});
             return;
         };
         const book = try writer.toOwned();
@@ -146,13 +151,13 @@ pub const MetricWriter = struct {
         };
     }
 
-    pub fn counter(self: *Self, name: []const u8, current: usize, previous: usize) !void {
+    pub fn counter(self: *Self, prefix: []const u8, metric: []const u8, current: usize, previous: usize) !void {
         const writer = self.list.writer().any();
-        try writer.print("{s}:{d}|c\n", .{ name, current -| previous });
+        try writer.print("{s}.{s}:{d}|c\n", .{ prefix, metric, current -| previous });
     }
-    pub fn gauge(self: *Self, name: []const u8, value: u64) !void {
+    pub fn gauge(self: *Self, prefix: []const u8, metric: []const u8, value: u64) !void {
         const writer = self.list.writer().any();
-        try writer.print("{s}:{d}|g\n", .{ name, value });
+        try writer.print("{s}.{s}:{d}|g\n", .{ prefix, metric, value });
     }
 
     pub fn toOwned(self: *Self) ![]const u8 {

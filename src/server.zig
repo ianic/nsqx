@@ -164,6 +164,41 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             }
         }
 
+        pub fn writeMetrics(self: *Server, writer: anytype) !void {
+            var ti = self.topics.valueIterator();
+            while (ti.next()) |topic_ptr| {
+                const topic = topic_ptr.*;
+                {
+                    const cur = topic.metric;
+                    const prev = topic.metric_prev;
+                    const prefix = try std.fmt.allocPrint(self.allocator, "topic.{s}", .{topic.name});
+                    defer self.allocator.free(prefix);
+                    try writer.gauge(prefix, "depth", cur.depth);
+                    try writer.gauge(prefix, "depth_bytes", cur.depth_bytes);
+                    try writer.counter(prefix, "message_count", cur.total, prev.total);
+                    try writer.counter(prefix, "message_bytes", cur.total_bytes, prev.total_bytes);
+                }
+                var ci = topic.channels.valueIterator();
+                while (ci.next()) |channel_ptr| {
+                    const channel = channel_ptr.*;
+                    const cur = channel.metric;
+                    const prev = channel.metric_prev;
+                    const prefix = try std.fmt.allocPrint(self.allocator, "topic.{s}.channel.{s}", .{ topic.name, channel.name });
+                    defer self.allocator.free(prefix);
+                    try writer.gauge(prefix, "clients", channel.consumers.items.len);
+                    try writer.gauge(prefix, "deferred_count", channel.deferred.count());
+                    try writer.gauge(prefix, "in_flight_count", channel.in_flight.count());
+                    try writer.gauge(prefix, "depth", cur.depth);
+                    try writer.counter(prefix, "message_count", cur.pull, prev.pull);
+                    try writer.counter(prefix, "finish_count", cur.finish, prev.finish);
+                    try writer.counter(prefix, "timeout_count", cur.timeout, prev.timeout);
+                    try writer.counter(prefix, "requeue_count", cur.requeue, prev.requeue);
+                    channel.metric_prev = cur;
+                }
+                topic.metric_prev = topic.metric;
+            }
+        }
+
         fn TopicType() type {
             return struct {
                 const Msg = struct {
@@ -237,7 +272,10 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 // Week pointer to the end of linked list of topic messages
                 last: ?*Msg = null,
                 paused: bool = false,
-                metric: struct {
+                metric: Metric = .{},
+                metric_prev: Metric = .{},
+
+                const Metric = struct {
                     // Current number of messages in the topic linked list.
                     depth: usize = 0,
                     // Size in bytes of the current messages.
@@ -246,7 +284,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     total: usize = 0,
                     // Total size of all messages.
                     total_bytes: usize = 0,
-                } = .{},
+                };
 
                 pub fn init(server: *Server, name: []const u8) Topic {
                     const allocator = server.allocator;
@@ -531,7 +569,11 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 // Round robin consumers iterator. Preserves last consumer index
                 // between init's.
                 iterator: ConsumersIterator = .{},
-                metric: struct {
+                metric: Metric = .{},
+                metric_prev: Metric = .{},
+                paused: bool = false,
+
+                const Metric = struct {
                     // Total number of messages ...
                     // ... pulled from topic
                     pull: usize = 0, //  counter
@@ -544,8 +586,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     // Current number of messages published to the topic but not processed
                     // by this channel.
                     depth: usize = 0, // gauge
-                } = .{},
-                paused: bool = false,
+                };
 
                 // Init/deinit -----------------
 

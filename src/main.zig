@@ -64,7 +64,12 @@ pub fn main() !void {
     defer http_listener.deinit();
     try http_listener.accept(http_socket);
 
-    var statsd_connector = statsd.Connector{ .io = &io, .allocator = allocator, .address = statsd_addr };
+    var statsd_connector = statsd.Connector{
+        .io = &io,
+        .server = &server,
+        .allocator = allocator,
+        .address = statsd_addr,
+    };
     try statsd_connector.start();
 
     catchSignals();
