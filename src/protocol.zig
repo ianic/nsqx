@@ -1,6 +1,8 @@
 const std = @import("std");
 const mem = std.mem;
 const fmt = std.fmt;
+const net = std.net;
+const Options = @import("options.zig");
 
 pub const Message = union(MessageTag) {
     version: void,
@@ -44,40 +46,6 @@ pub const Message = union(MessageTag) {
     pub fn parseIdentify(self: @This(), allocator: std.mem.Allocator, opt: Options) !Identify {
         return try Identify.parse(self.identify, allocator, opt);
     }
-};
-
-pub const Options = struct {
-    /// Duration to wait before auto-requeing a message
-    msg_timeout: u32 = 60000, // milliseconds
-    /// Duration of time between client heartbeats
-    heartbeat_interval: u32 = 60000, // milliseconds
-
-    tcp_port: u16 = 4150,
-    http_port: u16 = 4151,
-
-    /// io_uring configuration
-    ring: struct {
-        /// Number of io_uring sqe entries
-        entries: u16 = 16 * 1024,
-        /// Number of receive buffers
-        recv_buffers: u16 = 1024,
-        /// Length of each receive buffer in bytes
-        recv_buffer_len: u32 = 64 * 1024,
-    } = .{},
-
-    /// statsd
-    statsd: Statsd = .{},
-
-    pub const Statsd = struct {
-        /// statsd daemon for pushing stats
-        address: ?std.net.Address = null,
-        /// duration between pushing to statsd (in milliseconds)
-        interval: u16 = 5 * 1000,
-        /// prefix used for keys sent to statsd (%s for host replacement) (default "nsq.%s")
-        prefix: []const u8 = "nsq.%s",
-        /// the size in bytes of statsd UDP packets (default 508)
-        udp_packet_size: u16 = 508,
-    };
 };
 
 const MessageTag = enum {
@@ -444,8 +412,16 @@ pub const Identify = struct {
             .client_id = try allocator.dupe(u8, v.client_id),
             .hostname = try allocator.dupe(u8, v.hostname),
             .user_agent = try allocator.dupe(u8, v.user_agent),
-            .heartbeat_interval = if (v.heartbeat_interval == 0) opt.heartbeat_interval else v.heartbeat_interval,
-            .msg_timeout = if (v.msg_timeout == 0) opt.msg_timeout else v.msg_timeout,
+            .heartbeat_interval = if (v.heartbeat_interval == 0 or v.heartbeat_interval > opt.max_heartbeat_interval)
+                opt.max_heartbeat_interval
+            else
+                v.heartbeat_interval,
+            .msg_timeout = if (v.msg_timeout == 0)
+                opt.msg_timeout
+            else if (v.msg_timeout > opt.max_msg_timeout)
+                opt.max_msg_timeout
+            else
+                v.msg_timeout,
         };
     }
 

@@ -6,7 +6,7 @@ const socket_t = std.posix.socket_t;
 const fd_t = std.posix.fd_t;
 
 const protocol = @import("protocol.zig");
-const Options = protocol.Options;
+const Options = @import("options.zig");
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
@@ -199,10 +199,10 @@ fn jsonInfo(writer: anytype, server: *Server, options: Options) !void {
     const info = Info{
         .broadcast_address = "localhost",
         .hostname = hostname,
-        .http_port = options.http_port,
-        .tcp_port = options.tcp_port,
+        .http_port = options.http_address.getPort(),
+        .tcp_port = options.tcp_address.getPort(),
         .start_time = start_time,
-        .max_heartbeat_interval = options.heartbeat_interval,
+        .max_heartbeat_interval = options.max_heartbeat_interval,
     };
 
     try std.json.stringify(info, .{}, writer);

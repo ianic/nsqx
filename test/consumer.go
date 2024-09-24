@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
-	"math/rand/v2"
+	//"math/rand/v2"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,17 +14,17 @@ import (
 
 func main() {
 	cfg := nsq.NewConfig()
-	cfg.MaxInFlight = 16
+	cfg.MaxInFlight = 1
 	// cfg.HeartbeatInterval = 5 * time.Second
 	cfg.MsgTimeout = 2 * time.Second
 	cfg.LookupdPollInterval = 5 * time.Second
 
-	consumer, err := nsq.NewConsumer("topic", "channel", cfg)
+	consumer, err := nsq.NewConsumer("topic-001", "001", cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	//consumer.AddHandler(&Handler{})
-	consumer.AddConcurrentHandlers(&Handler{}, 16)
+	consumer.AddHandler(&Handler{})
+	//consumer.AddConcurrentHandlers(&Handler{}, 16)
 
 	err = consumer.ConnectToNSQD("127.0.0.1:4150")
 	if err != nil {
@@ -46,9 +46,9 @@ type Handler struct {
 }
 
 func (th *Handler) HandleMessage(m *nsq.Message) error {
-	log.Printf("%s attempts: %d", m.Body, m.Attempts)
-	sleep := rand.IntN(10)
-	time.Sleep(time.Duration(sleep) * time.Second)
+	log.Printf("%d attempts: %d", len(m.Body), m.Attempts)
+	//sleep := rand.IntN(10)
+	//time.Sleep(time.Duration(sleep) * time.Second)
 	return nil
 }
 

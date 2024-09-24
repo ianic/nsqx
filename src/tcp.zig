@@ -6,7 +6,7 @@ const socket_t = std.posix.socket_t;
 const fd_t = std.posix.fd_t;
 
 const protocol = @import("protocol.zig");
-const Options = protocol.Options;
+const Options = @import("options.zig");
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
@@ -141,7 +141,7 @@ pub const Conn = struct {
     fn recv(self: *Conn) !void {
         try self.send_vec.init(self.allocator);
         self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
-        try self.initTicker(self.listener.options.heartbeat_interval);
+        try self.initTicker(self.listener.options.max_heartbeat_interval);
     }
 
     fn initTicker(self: *Conn, heartbeat_interval: i64) !void {
@@ -248,7 +248,7 @@ pub const Conn = struct {
         switch (msg) {
             .identify => {
                 self.identify = try msg.parseIdentify(self.allocator, options);
-                if (self.identify.heartbeat_interval != options.heartbeat_interval)
+                if (self.identify.heartbeat_interval != options.max_heartbeat_interval)
                     try self.initTicker(self.identify.heartbeat_interval);
                 try self.respond(.ok);
                 log.debug("{} identify {}", .{ self.socket, self.identify });
@@ -259,11 +259,13 @@ pub const Conn = struct {
                 log.debug("{} subscribe: {s} {s}", .{ self.socket, arg.topic, arg.channel });
             },
             .publish => |arg| {
+                if (arg.data.len > options.max_msg_size) return error.MessageSizeOverflow;
                 try server.publish(arg.topic, arg.data);
                 try self.respond(.ok);
                 log.debug("{} publish: {s}", .{ self.socket, arg.topic });
             },
             .multi_publish => |arg| {
+                if (arg.data.len / arg.msgs > options.max_msg_size) return error.MessageSizeOverflow;
                 try server.multiPublish(arg.topic, arg.msgs, arg.data);
                 try self.respond(.ok);
                 log.debug("{} multi publish: {s} messages: {}", .{ self.socket, arg.topic, arg.msgs });
@@ -274,7 +276,7 @@ pub const Conn = struct {
                 log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });
             },
             .ready => |count| {
-                self.ready_count = count;
+                self.ready_count = if (count > options.max_rdy_count) options.max_rdy_count else count;
                 ready_changed.* = true;
                 log.debug("{} ready: {}", .{ self.socket, count });
             },
@@ -289,7 +291,11 @@ pub const Conn = struct {
             .requeue => |arg| {
                 var channel = self.channel orelse return error.NotSubscribed;
                 self.in_flight -|= 1;
-                const res = try channel.requeue(arg.msg_id, arg.delay);
+                const delay = if (arg.delay > options.max_req_timeout)
+                    options.max_req_timeout
+                else
+                    arg.delay;
+                const res = try channel.requeue(arg.msg_id, delay);
                 if (res) self.metric.requeue += 1;
                 log.debug("{} requeue {} {}", .{ self.socket, Msg.seqFromId(arg.msg_id), res });
             },

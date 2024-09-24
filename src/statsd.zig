@@ -8,7 +8,7 @@ const testing = std.testing;
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
-const Options = @import("protocol.zig").Options.Statsd;
+const Options = @import("options.zig").Statsd;
 const Server = @import("tcp.zig").Server;
 
 const log = std.log.scoped(.statsd);
@@ -27,16 +27,14 @@ pub const Connector = struct {
     const Self = @This();
 
     pub fn init(allocator: mem.Allocator, io: *Io, server: *Server, options: Options) ?Self {
-        return if (options.address) |address|
-            .{
-                .allocator = allocator,
-                .io = io,
-                .server = server,
-                .options = options,
-                .address = address,
-            }
-        else
-            null;
+        const address = options.address orelse return null;
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .server = server,
+            .options = options,
+            .address = address,
+        };
     }
 
     pub fn start(self: *Self) !void {

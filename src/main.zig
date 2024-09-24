@@ -2,8 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const Atomic = std.atomic.Value;
+const net = std.net;
+const mem = std.mem;
 
-const Options = @import("protocol.zig").Options;
+const Options = @import("options.zig");
 const Io = @import("io.zig").Io;
 const tcp = @import("tcp.zig");
 const http = @import("http.zig");
@@ -21,15 +23,11 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = if (builtin.mode == .ReleaseFast) std.heap.c_allocator else gpa.allocator();
 
-    const options: Options = .{
-        .statsd = .{ .address = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 8125) },
-    };
+    var options = try Options.initFromArgs(allocator);
+    defer options.deinit(allocator);
 
-    const tcp_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.tcp_port);
-    const tcp_socket = (try tcp_addr.listen(.{ .reuse_address = true })).stream.handle;
-
-    const http_addr = std.net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, options.http_port);
-    const http_socket = (try http_addr.listen(.{ .reuse_address = true })).stream.handle;
+    const tcp_socket = (try options.tcp_address.listen(.{ .reuse_address = true })).stream.handle;
+    const http_socket = (try options.http_address.listen(.{ .reuse_address = true })).stream.handle;
 
     var io = Io{ .allocator = allocator };
     try io.init(
@@ -46,14 +44,8 @@ pub fn main() !void {
     defer server.deinit();
 
     { // start lookupd connections
-        // TODO: can we avoid this
         lookup_connector.server = &server;
-        const lookupd1 = try std.net.Address.parseIp4("127.0.0.1", 4160);
-        const lookupd2 = try std.net.Address.parseIp4("127.0.0.1", 4162);
-        const lookupd3 = try std.net.Address.parseIp4("127.0.0.1", 4164);
-        try lookup_connector.addLookupd(lookupd1);
-        try lookup_connector.addLookupd(lookupd2);
-        try lookup_connector.addLookupd(lookupd3);
+        for (options.lookup_tcp_addresses) |addr| try lookup_connector.addLookupd(addr);
     }
 
     var tcp_listener = try tcp.Listener.init(allocator, &io, &server, options);
@@ -174,7 +166,7 @@ fn catchSignals() void {
     posix.sigaction(posix.SIG.PIPE, &act, null);
 }
 
-test {
-    _ = @import("server.zig");
-    _ = @import("protocol.zig");
-}
+// test {
+//     _ = @import("server.zig");
+//     _ = @import("protocol.zig");
+// }

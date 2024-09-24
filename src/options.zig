@@ -46,64 +46,64 @@ const usage =
     \\
 ;
 
-pub const Options = struct {
-    tcp_address: net.Address = net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, 4150),
-    http_address: net.Address = net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, 4151),
+tcp_address: net.Address = net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, 4150),
+http_address: net.Address = net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, 4151),
 
-    hostname: []const u8,
-    broadcast_address: ?[]const u8 = null,
-    broadcast_tcp_port: u16 = 0,
-    broadcast_http_port: u16 = 0,
+hostname: []const u8,
+broadcast_address: ?[]const u8 = null,
+broadcast_tcp_port: u16 = 0,
+broadcast_http_port: u16 = 0,
 
-    lookup_tcp_addresses: []net.Address = &.{},
+lookup_tcp_addresses: []net.Address = &.{},
 
-    max_rdy_count: u16 = 2500,
-    max_msg_size: u32 = 1048576,
+max_rdy_count: u16 = 2500,
+max_msg_size: u32 = 1048576,
 
-    // duration values in milliseconds
-    max_heartbeat_interval: u32 = 60000, // 1m
-    max_msg_timeout: u32 = 60000 * 15, // 15m
-    max_req_timeout: u32 = 60000 * 60, // 1h
-    msg_timeout: u32 = 60000, // 1m
+// duration values in milliseconds
+max_heartbeat_interval: u32 = 60000, // 1m
+max_msg_timeout: u32 = 60000 * 15, // 15m
+max_req_timeout: u32 = 60000 * 60, // 1h
+msg_timeout: u32 = 60000, // 1m
 
-    /// io_uring configuration
-    ring: struct {
-        /// Number of io_uring sqe entries
-        entries: u16 = 16 * 1024,
-        /// Number of receive buffers
-        recv_buffers: u16 = 1024,
-        /// Length of each receive buffer in bytes
-        recv_buffer_len: u32 = 64 * 1024,
-    } = .{},
+/// io_uring configuration
+ring: struct {
+    /// Number of io_uring sqe entries
+    entries: u16 = 16 * 1024,
+    /// Number of receive buffers
+    recv_buffers: u16 = 1024,
+    /// Length of each receive buffer in bytes
+    recv_buffer_len: u32 = 64 * 1024,
+} = .{},
 
-    /// statsd
-    statsd: Statsd = .{},
+/// statsd
+statsd: Statsd = .{},
 
-    pub const Statsd = struct {
-        /// statsd daemon for pushing stats
-        address: ?std.net.Address = null,
-        /// duration between pushing to statsd (in milliseconds)
-        interval: u16 = 5 * 1000,
-        /// prefix used for keys sent to statsd (%s for host replacement) (default "nsq.%s")
-        prefix: []const u8 = &.{},
-        /// the size in bytes of statsd UDP packets (default 508)
-        udp_packet_size: u16 = 508,
-    };
+const Options = @This();
 
-    pub fn broadcastAddress(self: Options) []const u8 {
-        if (self.broadcast_address) |ba| return ba;
-        return self.hostname;
-    }
-
-    pub fn deinit(self: *Options, allocator: mem.Allocator) void {
-        allocator.free(self.hostname);
-        if (self.broadcast_address) |ba| allocator.free(ba);
-        if (self.lookup_tcp_addresses.len > 0) allocator.free(self.lookup_tcp_addresses);
-        allocator.free(self.statsd.prefix);
-    }
+pub const Statsd = struct {
+    /// statsd daemon for pushing stats
+    address: ?std.net.Address = null,
+    /// duration between pushing to statsd (in milliseconds)
+    interval: u16 = 5 * 1000,
+    /// prefix used for keys sent to statsd (%s for host replacement) (default "nsq.%s")
+    prefix: []const u8 = &.{},
+    /// the size in bytes of statsd UDP packets (default 508)
+    udp_packet_size: u16 = 508,
 };
 
-fn parseArgs(allocator: mem.Allocator) !Options {
+pub fn broadcastAddress(self: Options) []const u8 {
+    if (self.broadcast_address) |ba| return ba;
+    return self.hostname;
+}
+
+pub fn deinit(self: *Options, allocator: mem.Allocator) void {
+    allocator.free(self.hostname);
+    if (self.broadcast_address) |ba| allocator.free(ba);
+    if (self.lookup_tcp_addresses.len > 0) allocator.free(self.lookup_tcp_addresses);
+    allocator.free(self.statsd.prefix);
+}
+
+pub fn initFromArgs(allocator: mem.Allocator) !Options {
     var iter = try ArgIterator.init(allocator);
     defer iter.deinit();
 
@@ -317,7 +317,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var opt = try parseArgs(allocator);
+    var opt = try Options.initFromArgs(allocator);
     defer opt.deinit(allocator);
 
     std.debug.print("tcp_address: {}\n", .{opt.tcp_address});
