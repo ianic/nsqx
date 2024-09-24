@@ -8,7 +8,7 @@ const testing = std.testing;
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
-const Options = @import("options.zig").Statsd;
+const Options = @import("Options.zig").Statsd;
 const Server = @import("tcp.zig").Server;
 
 const log = std.log.scoped(.statsd);

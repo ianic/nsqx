@@ -2,7 +2,7 @@ const std = @import("std");
 const mem = std.mem;
 const fmt = std.fmt;
 const net = std.net;
-const Options = @import("options.zig");
+const Options = @import("Options.zig");
 
 pub const Message = union(MessageTag) {
     version: void,

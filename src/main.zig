@@ -5,7 +5,7 @@ const Atomic = std.atomic.Value;
 const net = std.net;
 const mem = std.mem;
 
-const Options = @import("options.zig");
+const Options = @import("Options.zig");
 const Io = @import("io.zig").Io;
 const tcp = @import("tcp.zig");
 const http = @import("http.zig");
