@@ -446,7 +446,9 @@ pub const Identify = struct {
 
 test "identify parse json" {
     {
-        const opt = Options{};
+        const opt = Options{
+            .hostname = "host",
+        };
         const data =
             \\ {"client_id":"io","deflate":false,"deflate_level":6,"feature_negotiation":true,"heartbeat_interval":34567,"hostname":"io.local","long_id":"io","msg_timeout":12345,"output_buffer_size":16384,"output_buffer_timeout":250,"sample_rate":0,"short_id":"io","snappy":false,"tls_v1":false,"user_agent":"go-nsq/1.1.0"}
         ;
@@ -460,8 +462,9 @@ test "identify parse json" {
     }
     {
         const opt = Options{
+            .hostname = "host",
             .msg_timeout = 111,
-            .heartbeat_interval = 222,
+            .max_heartbeat_interval = 222,
         };
         const data =
             \\ {"client_id":"client_id","heartbeat_interval":0}
@@ -470,7 +473,7 @@ test "identify parse json" {
         defer idf.deinit(testing.allocator);
 
         try testing.expectEqualStrings("client_id", idf.client_id);
-        try testing.expectEqual(opt.heartbeat_interval, idf.heartbeat_interval);
+        try testing.expectEqual(opt.max_heartbeat_interval, idf.heartbeat_interval);
         try testing.expectEqual(opt.msg_timeout, idf.msg_timeout);
     }
 }

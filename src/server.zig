@@ -3,8 +3,8 @@ const assert = std.debug.assert;
 const mem = std.mem;
 const posix = std.posix;
 const math = std.math;
-const testing = std.testing;
 const socket_t = posix.socket_t;
+const testing = std.testing;
 
 const log = std.log.scoped(.server);
 const Error = @import("io.zig").Error;

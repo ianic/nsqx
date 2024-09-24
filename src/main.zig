@@ -166,7 +166,13 @@ fn catchSignals() void {
     posix.sigaction(posix.SIG.PIPE, &act, null);
 }
 
-// test {
-//     _ = @import("server.zig");
-//     _ = @import("protocol.zig");
-// }
+test {
+    _ = @import("server.zig");
+    _ = @import("protocol.zig");
+    _ = @import("Options.zig");
+    _ = @import("io.zig");
+    _ = @import("tcp.zig");
+    _ = @import("http.zig");
+    _ = @import("lookup.zig");
+    _ = @import("statsd.zig");
+}

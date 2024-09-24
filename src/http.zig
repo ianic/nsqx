@@ -5,12 +5,10 @@ const posix = std.posix;
 const socket_t = std.posix.socket_t;
 const fd_t = std.posix.fd_t;
 
-const protocol = @import("protocol.zig");
 const Options = @import("Options.zig");
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
-const Timer = @import("io.zig").Timer;
 const Server = @import("tcp.zig").Server;
 pub const Listener = @import("tcp.zig").ListenerType(Conn);
 
