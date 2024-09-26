@@ -38,7 +38,7 @@ const usage =
     \\  --statsd-address string
     \\        UDP <addr>:<port> of a statsd daemon for pushing stats
     \\  --statsd-interval duration
-    \\        duration between pushing to statsd (default 1m0s)
+    \\        duration between pushing to statsd (default 5s)
     \\  --statsd-prefix string
     \\        prefix used for keys sent to statsd (%s for host replacement) (default "nsq.%s")
     \\  --statsd-udp-packet-size int
@@ -84,7 +84,7 @@ pub const Statsd = struct {
     /// statsd daemon for pushing stats
     address: ?std.net.Address = null,
     /// duration between pushing to statsd (in milliseconds)
-    interval: u16 = 5 * 1000,
+    interval: u32 = 5 * 1000,
     /// prefix used for keys sent to statsd (%s for host replacement) (default "nsq.%s")
     prefix: []const u8 = &.{},
     /// the size in bytes of statsd UDP packets (default 508)
@@ -115,6 +115,7 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
 
     var opt: Options = .{
         .hostname = hostname,
+        .statsd = .{ .prefix = "nsq.%s" },
     };
 
     outer: while (iter.next()) |arg| {
@@ -160,9 +161,11 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
         } else if (iter.address("statsd-address", 8125)) |addr| {
             opt.statsd.address = addr;
         } else if (iter.string("statsd-prefix")) |str| {
-            opt.statsd.prefix = try allocator.dupe(u8, str);
+            opt.statsd.prefix = str;
         } else if (iter.int("statsd-udp-packet-size", u16)) |size| {
             opt.statsd.udp_packet_size = size;
+        } else if (iter.durationMs("statsd-interval")) |d| {
+            opt.statsd.interval = d;
 
             // Allow unchanged nsqd configuration to be used with nsql. Skip
             // nsqd arguments not used in nsql.
@@ -186,7 +189,7 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
     if (opt.broadcast_tcp_port == 0) opt.broadcast_tcp_port = opt.tcp_address.getPort();
     if (opt.broadcast_http_port == 0) opt.broadcast_http_port = opt.http_address.getPort();
     if (lookup_tcp_addresses.items.len > 0) opt.lookup_tcp_addresses = try lookup_tcp_addresses.toOwnedSlice();
-    if (opt.statsd.prefix.len == 0) opt.statsd.prefix = try allocator.dupe(u8, "nsq.%s");
+    opt.statsd.prefix = try allocator.dupe(u8, opt.statsd.prefix);
 
     return opt;
 }

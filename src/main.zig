@@ -56,8 +56,9 @@ pub fn main() !void {
     defer http_listener.deinit();
     try http_listener.accept(http_socket);
 
-    var statsd_connector: ?statsd.Connector = statsd.Connector.init(allocator, &io, &server, options.statsd);
+    var statsd_connector: ?statsd.Connector = try statsd.Connector.init(allocator, &io, &server, options);
     if (statsd_connector) |*sc| try sc.start();
+    defer if (statsd_connector) |*sc| sc.deinit();
 
     catchSignals();
     while (true) {
@@ -68,7 +69,11 @@ pub fn main() !void {
             signal.store(0, .release);
             switch (sig) {
                 posix.SIG.USR1 => try showStat(&tcp_listener, &io, &server),
-                posix.SIG.USR2 => mallocTrim(),
+                posix.SIG.USR2 => {
+                    mallocInfo();
+                    mallocTrim();
+                    mallocInfo();
+                },
                 posix.SIG.TERM, posix.SIG.INT => break,
                 else => {},
             }
@@ -86,10 +91,21 @@ pub fn main() !void {
 
 fn mallocTrim() void {
     const c = @cImport(@cInclude("malloc.h"));
-    c.malloc_stats();
+    //c.malloc_stats();
     const ret = c.malloc_trim(0);
     log.info("malloc_trim: {}", .{ret});
-    c.malloc_stats();
+    //c.malloc_stats();
+}
+
+fn mallocInfo() void {
+    const c = @cImport(@cInclude("malloc.h"));
+    // const mi = c.mallinfo2();
+    // std.debug.print("mi: {}\n", .{mi});
+    // c.malloc_stats();
+    _ = c.malloc_info(0, c.stdout);
+    //log.info("malloc_info: {}", .{ret});
+    _ = c.fflush(c.stdout);
+    //c.malloc_stats();
 }
 
 fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
