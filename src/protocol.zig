@@ -81,7 +81,7 @@ pub const Parser = struct {
         while (true) {
             const msg = p.parse() catch |err| switch (err) {
                 error.SplitBuffer => return null,
-                error.Invalid => |e| return e,
+                else => return err,
             };
             if (msg != .version) return msg;
         }
@@ -109,14 +109,14 @@ pub const Parser = struct {
             'S' => {
                 // SUB <topic_name> <channel_name>\n
                 try p.matchString("SUB ");
-                const topic = try p.readString(' ');
-                const channel = try p.readString('\n');
+                const topic = try validateName(try p.readString(' '));
+                const channel = try validateName(try p.readString('\n'));
                 return .{ .subscribe = .{ .topic = topic, .channel = channel } };
             },
             'P' => {
                 // PUB <topic_name>\n[ 4-byte size in bytes ][ N-byte binary data ]
                 try p.matchString("PUB ");
-                const topic = try p.readString('\n');
+                const topic = try validateName(try p.readString('\n'));
                 const data = try p.readBytes(try p.readInt());
                 return .{ .publish = .{ .topic = topic, .data = data } };
             },
@@ -124,7 +124,7 @@ pub const Parser = struct {
                 // MPUB <topic_name>\n[ 4-byte body size ][ 4-byte num messages ]
                 // [ 4-byte message #1 size ][ N-byte binary data ]
                 try p.matchString("MPUB ");
-                const topic = try p.readString('\n');
+                const topic = try validateName(try p.readString('\n'));
                 const size = try p.readInt();
                 if (size < 4) return error.Invalid;
                 const msgs = try p.readInt();
@@ -144,7 +144,7 @@ pub const Parser = struct {
                 // DPUB <topic_name> <defer_time>\n
                 // [ 4-byte size in bytes ][ N-byte binary data ]
                 try p.matchString("DPUB ");
-                const topic = try p.readString(' ');
+                const topic = try validateName(try p.readString(' '));
                 const delay = try p.readStringInt('\n');
                 const size = try p.readInt();
                 const data = try p.readBytes(size);
@@ -476,4 +476,28 @@ test "identify parse json" {
         try testing.expectEqual(opt.max_heartbeat_interval, idf.heartbeat_interval);
         try testing.expectEqual(opt.msg_timeout, idf.msg_timeout);
     }
+}
+
+// Valid topic and channel names are characters [.a-zA-Z0-9_-] and 1 <= length <= 64
+fn validateName(name: []const u8) ![]const u8 {
+    const ephemeral_suffix = "#ephemeral";
+    const chars = if (std.mem.endsWith(u8, name, ephemeral_suffix)) name[0 .. name.len - ephemeral_suffix.len] else name;
+    if (chars.len < 1 or chars.len > 64) return error.InvalidName;
+
+    for (chars) |c| {
+        switch (c) {
+            '0'...'9', 'A'...'Z', 'a'...'z' => {},
+            '.', '_', '-' => {},
+            else => return error.InvalidNameCharacter,
+        }
+    }
+    return name;
+}
+
+test "validate name" {
+    _ = try validateName("foo.bar");
+    _ = try validateName("foo.bar#ephemeral");
+    try testing.expectError(error.InvalidName, validateName("#ephemeral"));
+    try testing.expectError(error.InvalidName, validateName("a" ** 65));
+    try testing.expectError(error.InvalidNameCharacter, validateName("foo%bar"));
 }
