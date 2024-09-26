@@ -31,9 +31,9 @@ pub fn main() !void {
 
     var io = Io{ .allocator = allocator };
     try io.init(
-        options.ring.entries,
-        options.ring.recv_buffers,
-        options.ring.recv_buffer_len,
+        options.io.entries,
+        options.io.recv_buffers,
+        options.io.recv_buffer_len,
     );
     defer io.deinit();
 

@@ -44,6 +44,16 @@ const usage =
     \\  --statsd-udp-packet-size int
     \\        the size in bytes of statsd UDP packets (default 508)
     \\
+    \\  io_uring:
+    \\  --io-entries
+    \\        number of entries in io_uring submission queue (default 16k)
+    \\        must be a power of two between 1 and 32768
+    \\  --io-recv-buffers
+    \\        number of buffers in io_uring provided buffer pool (default 1024)
+    \\        buffers are shared among all receive operations
+    \\  --io-recv-buffer-len
+    \\        byte size of each io_uring provided buffer (default 64k)
+    \\
 ;
 
 tcp_address: net.Address = net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, 4150),
@@ -66,7 +76,7 @@ max_req_timeout: u32 = 60000 * 60, // 1h
 msg_timeout: u32 = 60000, // 1m
 
 /// io_uring configuration
-ring: struct {
+io: struct {
     /// Number of io_uring sqe entries
     entries: u16 = 16 * 1024,
     /// Number of receive buffers
@@ -166,6 +176,14 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
             opt.statsd.udp_packet_size = size;
         } else if (iter.durationMs("statsd-interval")) |d| {
             opt.statsd.interval = d;
+
+            // io_uring
+        } else if (iter.int("io-entries", u16)) |i| {
+            opt.io.entries = i;
+        } else if (iter.int("io-recv-buffers", u16)) |i| {
+            opt.io.recv_buffers = i;
+        } else if (iter.int("io-recv-buffer-len", u32)) |i| {
+            opt.io.recv_buffer_len = i;
 
             // Allow unchanged nsqd configuration to be used with nsql. Skip
             // nsqd arguments not used in nsql.
