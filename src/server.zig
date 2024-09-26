@@ -25,6 +25,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
         io: *Io,
         notifier: *Notifier,
         started_at: u64,
+        metric: Topic.Metric = .{},
+        metric_prev: Topic.Metric = .{},
 
         // Init/deinit -----------------
 
@@ -168,7 +170,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             var ti = self.topics.valueIterator();
             while (ti.next()) |topic_ptr| {
                 const topic = topic_ptr.*;
-                {
+                { // Topic metrics
                     const cur = topic.metric;
                     const prev = topic.metric_prev;
                     const prefix = try std.fmt.allocPrint(self.allocator, "topic.{s}", .{topic.name});
@@ -180,6 +182,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
                 var ci = topic.channels.valueIterator();
                 while (ci.next()) |channel_ptr| {
+                    // Channel metrics
                     const channel = channel_ptr.*;
                     const cur = channel.metric;
                     const prev = channel.metric_prev;
@@ -196,6 +199,16 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     channel.metric_prev = cur;
                 }
                 topic.metric_prev = topic.metric;
+            }
+            { // Server metrics (sum of all topics)
+                const cur = self.metric;
+                const prev = self.metric_prev;
+                const prefix = "server";
+                try writer.gauge(prefix, "depth", cur.depth);
+                try writer.gauge(prefix, "depth_bytes", cur.depth_bytes);
+                try writer.counter(prefix, "message_count", cur.total, prev.total);
+                try writer.counter(prefix, "message_bytes", cur.total_bytes, prev.total_bytes);
+                self.metric_prev = self.metric;
             }
         }
 
@@ -284,6 +297,17 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     total: usize = 0,
                     // Total size of all messages.
                     total_bytes: usize = 0,
+
+                    fn inc(self: *Metric, bytes: usize) void {
+                        self.depth +%= 1;
+                        self.total +%= 1;
+                        self.depth_bytes +%= bytes;
+                        self.total_bytes +%= bytes;
+                    }
+                    fn dec(self: *Metric, bytes: usize) void {
+                        self.depth -= 1;
+                        self.depth_bytes -|= bytes;
+                    }
                 };
 
                 pub fn init(server: *Server, name: []const u8) Topic {
@@ -385,12 +409,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         };
                         break :brk msg;
                     };
-                    { // Update metrics
-                        self.metric.depth += 1;
-                        self.metric.depth_bytes +%= data.len;
-                        self.metric.total +%= 1;
-                        self.metric.total_bytes +%= data.len;
-                    }
+                    self.metric.inc(data.len);
+                    self.server.metric.inc(data.len);
                     { // Update last pointer
                         if (self.last) |prev| {
                             assert(prev.sequence + 1 == msg.sequence);
@@ -407,8 +427,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
 
                 fn destroyMessage(self: *Topic, msg: *Msg) void {
-                    self.metric.depth -= 1;
-                    self.metric.depth_bytes -|= msg.body.len;
+                    self.metric.dec(msg.body.len);
+                    self.server.metric.dec(msg.body.len);
                     self.allocator.free(msg.body);
                     self.allocator.destroy(msg);
                 }
