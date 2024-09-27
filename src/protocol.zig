@@ -479,7 +479,7 @@ test "identify parse json" {
 }
 
 // Valid topic and channel names are characters [.a-zA-Z0-9_-] and 1 <= length <= 64
-fn validateName(name: []const u8) ![]const u8 {
+pub fn validateName(name: []const u8) ![]const u8 {
     const ephemeral_suffix = "#ephemeral";
     const chars = if (std.mem.endsWith(u8, name, ephemeral_suffix)) name[0 .. name.len - ephemeral_suffix.len] else name;
     if (chars.len < 1 or chars.len > 64) return error.InvalidName;

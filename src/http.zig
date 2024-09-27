@@ -97,14 +97,18 @@ pub const Conn = struct {
         switch (cmd) {
             .stats => return try jsonStat(self.gpa, writer, server),
             .info => return try jsonInfo(writer, server, self.listener.options),
-            .channel_delete => |arg| try server.deleteChannel(arg.topic_name, arg.name),
+
+            .topic_create => |name| try server.createTopic(name),
             .topic_delete => |name| try server.deleteTopic(name),
-            .channel_pause => |arg| try server.pauseChannel(arg.topic_name, arg.name),
-            .channel_unpause => |arg| try server.unpauseChannel(arg.topic_name, arg.name),
+            .topic_empty => |name| try server.emptyTopic(name),
             .topic_pause => |name| try server.pauseTopic(name),
             .topic_unpause => |name| try server.unpauseTopic(name),
-            .topic_empty => |name| try server.emptyTopic(name),
+
+            .channel_create => |arg| try server.createChannel(arg.topic_name, arg.name),
+            .channel_delete => |arg| try server.deleteChannel(arg.topic_name, arg.name),
             .channel_empty => |arg| try server.emptyChannel(arg.topic_name, arg.name),
+            .channel_pause => |arg| try server.pauseChannel(arg.topic_name, arg.name),
+            .channel_unpause => |arg| try server.unpauseChannel(arg.topic_name, arg.name),
         }
     }
 
@@ -353,14 +357,18 @@ fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
 }
 
 const Command = union(enum) {
+    topic_create: []const u8,
+    topic_delete: []const u8,
     topic_empty: []const u8,
     topic_pause: []const u8,
     topic_unpause: []const u8,
-    topic_delete: []const u8,
+
+    channel_create: Channel,
+    channel_delete: Channel,
     channel_empty: Channel,
     channel_pause: Channel,
     channel_unpause: Channel,
-    channel_delete: Channel,
+
     stats: void,
     info: void,
 
@@ -375,16 +383,28 @@ fn parse(target: []const u8) !Command {
     if (mem.startsWith(u8, target, "/info")) return .{ .info = {} };
 
     if (mem.startsWith(u8, target, "/topic")) {
+        if (mem.startsWith(u8, target[6..], "/create?topic="))
+            return .{ .topic_create = target[20..] };
+        if (mem.startsWith(u8, target[6..], "/delete?topic="))
+            return .{ .topic_delete = target[20..] };
         if (mem.startsWith(u8, target[6..], "/empty?topic="))
             return .{ .topic_empty = target[19..] };
         if (mem.startsWith(u8, target[6..], "/pause?topic="))
             return .{ .topic_pause = target[19..] };
         if (mem.startsWith(u8, target[6..], "/unpause?topic="))
             return .{ .topic_unpause = target[21..] };
-        if (mem.startsWith(u8, target[6..], "/delete?topic="))
-            return .{ .topic_delete = target[20..] };
     }
     if (mem.startsWith(u8, target, "/channel")) {
+        if (mem.startsWith(u8, target[8..], "/create?"))
+            return .{ .channel_create = .{
+                .topic_name = try findValue(target[16..], "topic"),
+                .name = try findValue(target[16..], "channel"),
+            } };
+        if (mem.startsWith(u8, target[8..], "/delete?"))
+            return .{ .channel_delete = .{
+                .topic_name = try findValue(target[16..], "topic"),
+                .name = try findValue(target[16..], "channel"),
+            } };
         if (mem.startsWith(u8, target[8..], "/empty?"))
             return .{ .channel_empty = .{
                 .topic_name = try findValue(target[15..], "topic"),
@@ -400,12 +420,17 @@ fn parse(target: []const u8) !Command {
                 .topic_name = try findValue(target[17..], "topic"),
                 .name = try findValue(target[17..], "channel"),
             } };
-        if (mem.startsWith(u8, target[8..], "/delete?"))
-            return .{ .channel_delete = .{
+    }
+    if (mem.startsWith(u8, target, "/create")) {
+        if (mem.startsWith(u8, target[7..], "_topic?topic="))
+            return .{ .topic_create = target[20..] };
+        if (mem.startsWith(u8, target[7..], "_channel?"))
+            return .{ .channel_create = .{
                 .topic_name = try findValue(target[16..], "topic"),
                 .name = try findValue(target[16..], "channel"),
             } };
     }
+
     return error.UnknownCommand;
 }
 
@@ -431,6 +456,8 @@ test parse {
     try testing.expectEqualStrings("topic-002", (try parse("/topic/pause?topic=topic-002")).topic_pause);
     try testing.expectEqualStrings("topic-003", (try parse("/topic/delete?topic=topic-003")).topic_delete);
     try testing.expectEqualStrings("topic-004", (try parse("/topic/unpause?topic=topic-004")).topic_unpause);
+    try testing.expectEqualStrings("topic-005", (try parse("/topic/create?topic=topic-005")).topic_create);
+    try testing.expectEqualStrings("topic-006", (try parse("/create_topic?topic=topic-006")).topic_create);
 
     var cmd = try parse("/channel/delete?topic=topic-004&channel=005");
     try testing.expectEqualStrings("topic-004", cmd.channel_delete.topic_name);
@@ -447,6 +474,14 @@ test parse {
     cmd = try parse("/channel/unpause?topic=topic-008&channel=009");
     try testing.expectEqualStrings("topic-008", cmd.channel_unpause.topic_name);
     try testing.expectEqualStrings("009", cmd.channel_unpause.name);
+
+    cmd = try parse("/channel/create?topic=topic-010&channel=011");
+    try testing.expectEqualStrings("topic-010", cmd.channel_create.topic_name);
+    try testing.expectEqualStrings("011", cmd.channel_create.name);
+
+    cmd = try parse("/create_channel?topic=topic-012&channel=013");
+    try testing.expectEqualStrings("topic-012", cmd.channel_create.topic_name);
+    try testing.expectEqualStrings("013", cmd.channel_create.name);
 }
 
 test findValue {

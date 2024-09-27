@@ -8,6 +8,7 @@ const testing = std.testing;
 
 const log = std.log.scoped(.server);
 const Error = @import("io.zig").Error;
+const validateName = @import("protocol.zig").validateName;
 
 const ns_per_ms = std.time.ns_per_ms;
 fn nsFromMs(ms: u32) u64 {
@@ -104,10 +105,19 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
         // Http interface actions -----------------
 
+        pub fn createTopic(self: *Server, name: []const u8) !void {
+            _ = try self.getOrCreateTopic(try validateName(name));
+        }
+
         pub fn deleteTopic(self: *Server, name: []const u8) !void {
             const kv = self.topics.fetchRemove(name) orelse return error.NotFound;
             self.deinitTopic(kv.value);
             log.debug("deleted topic {s}", .{name});
+        }
+
+        pub fn createChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
+            const topic = try self.getOrCreateTopic(try validateName(topic_name));
+            _ = try topic.getOrCreateChannel(try validateName(name));
         }
 
         pub fn deleteChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
@@ -335,11 +345,19 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
 
                 fn subscribe(self: *Topic, consumer: *Consumer, name: []const u8) !*Channel {
-                    if (self.channels.get(name)) |channel| {
-                        try channel.subscribe(consumer);
-                        return channel;
-                    }
                     const is_first = self.channels.count() == 0;
+                    const channel = try self.getOrCreateChannel(name);
+                    try channel.subscribe(consumer);
+                    if (is_first) { // First channel gets all messages from the topic
+                        channel.next = self.first;
+                        channel.metric.depth = self.metric.depth;
+                        self.first = null;
+                    }
+                    return channel;
+                }
+
+                fn getOrCreateChannel(self: *Topic, name: []const u8) !*Channel {
+                    if (self.channels.get(name)) |channel| return channel;
 
                     const channel = try self.allocator.create(Channel);
                     errdefer self.allocator.destroy(channel);
@@ -350,16 +368,10 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     channel.* = Channel.init(self, key);
                     channel.initTimer(self.server.io);
                     errdefer channel.deinit();
-                    try channel.subscribe(consumer);
                     self.channels.putAssumeCapacityNoClobber(key, channel);
 
-                    if (is_first) { // First channel gets all messages from the topic
-                        channel.next = self.first;
-                        channel.metric.depth = self.metric.depth;
-                        self.first = null;
-                    }
-                    self.server.notifier.channelCreated(self.name, channel.name);
                     log.debug("topic '{s}' channel '{s}' created", .{ self.name, key });
+                    self.server.notifier.channelCreated(self.name, channel.name);
                     return channel;
                 }
 

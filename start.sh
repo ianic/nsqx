@@ -34,7 +34,12 @@ admin_pid=$!
 
 # daemon
 cd ~/Code/nsql
-./zig-out/bin/nsql &
+./zig-out/bin/nsql \
+  --lookupd-tcp-address localhost:4160 \
+  --lookupd-tcp-address localhost:4162 \
+  --lookupd-tcp-address localhost:4164 \
+  --statsd-address localhost:8125 \
+  --statsd-prefix "" &
 nsql_pid=$!
 
 nsq_tail -nsqd-tcp-address localhost:4150 -channel channel1 -topic topic1  | sed "s/^/[channel1] /" &
