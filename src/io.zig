@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
+const net = std.net;
 
 const posix = std.posix;
 const linux = std.os.linux;
@@ -207,7 +208,7 @@ pub const Io = struct {
         self: *Io,
         socket: socket_t,
         context: anytype,
-        comptime accepted: fn (@TypeOf(context), socket_t, std.net.Address) Error!void,
+        comptime accepted: fn (@TypeOf(context), socket_t, net.Address) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
     ) !*Op {
         const op = try self.acquire();
@@ -219,7 +220,7 @@ pub const Io = struct {
     pub fn connect(
         self: *Io,
         socket: socket_t,
-        addr: std.net.Address,
+        addr: *net.Address,
         context: anytype,
         comptime connected: fn (@TypeOf(context)) Error!void,
         comptime failed: fn (@TypeOf(context), anyerror) Error!void,
@@ -512,7 +513,7 @@ pub const Op = struct {
         },
         connect: struct {
             socket: socket_t,
-            addr: std.net.Address,
+            addr: *net.Address,
         },
         close: socket_t,
         recv: socket_t,
@@ -583,7 +584,7 @@ pub const Op = struct {
         io: *Io,
         socket: socket_t,
         context: anytype,
-        comptime accepted: fn (@TypeOf(context), socket_t, std.net.Address) Error!void,
+        comptime accepted: fn (@TypeOf(context), socket_t, net.Address) Error!void,
         comptime fail: fn (@TypeOf(context), anyerror) Error!void,
     ) Op {
         const Context = @TypeOf(context);
@@ -600,7 +601,7 @@ pub const Op = struct {
                         // connection.
                         // Ref: https://man7.org/linux/man-pages/man3/io_uring_prep_multishot_accept.3.html
 
-                        const addr = std.net.Address.initPosix(&op.args.accept.addr);
+                        const addr = net.Address.initPosix(&op.args.accept.addr);
                         try accepted(ctx, @intCast(cqe.res), addr);
                     },
                     .CONNABORTED, .INTR => {}, // continue
@@ -623,7 +624,7 @@ pub const Op = struct {
     fn connect(
         io: *Io,
         socket: socket_t,
-        addr: std.net.Address,
+        addr: *net.Address,
         context: anytype,
         comptime connected: fn (@TypeOf(context)) Error!void,
         comptime fail: fn (@TypeOf(context), anyerror) Error!void,
@@ -1041,4 +1042,38 @@ fn unixMilli() i64 {
         error.UnsupportedClock, error.Unexpected => return 0, // "Precision of timing depends on hardware and OS".
     };
     return ts.sec * 1000 + @divTrunc(ts.nsec, ns_per_ms);
+}
+
+test "size" {
+    const Accept = struct {
+        socket: socket_t,
+        addr: posix.sockaddr align(4) = undefined,
+        addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
+    };
+    const Connect = struct {
+        socket: socket_t,
+        addr: *net.Address,
+    };
+    const Writev = struct {
+        socket: socket_t,
+        vec: []posix.iovec_const,
+    };
+    const Sendv = struct {
+        socket: socket_t,
+        msghdr: *posix.msghdr_const,
+    };
+    const Send = struct {
+        socket: socket_t,
+        buf: []const u8,
+    };
+
+    try testing.expectEqual(56, @sizeOf(Op));
+    try testing.expectEqual(32, @sizeOf(Op.Args));
+    try testing.expectEqual(24, @sizeOf(Accept));
+    try testing.expectEqual(16, @sizeOf(Connect));
+    try testing.expectEqual(24, @sizeOf(Writev));
+    try testing.expectEqual(16, @sizeOf(Sendv));
+    try testing.expectEqual(24, @sizeOf(Send));
+    try testing.expectEqual(112, @sizeOf(net.Address));
+    try testing.expectEqual(16, @sizeOf(linux.kernel_timespec));
 }

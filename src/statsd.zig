@@ -80,7 +80,7 @@ pub const Connector = struct {
 
     fn socketCreated(self: *Self, socket: socket_t) Error!void {
         self.socket = socket;
-        _ = try self.io.connect(self.socket, self.address, self, connected, connectFailed);
+        _ = try self.io.connect(self.socket, &self.address, self, connected, connectFailed);
     }
 
     fn connectFailed(self: *Self, err: anyerror) Error!void {
