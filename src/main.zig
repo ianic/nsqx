@@ -87,6 +87,7 @@ pub fn main() !void {
     try http_listener.close();
     try tcp_listener.close();
     try io.drain();
+    log.info("drain finished", .{});
 }
 
 fn mallocTrim() void {

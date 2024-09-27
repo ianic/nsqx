@@ -211,7 +211,7 @@ pub const Conn = struct {
     fn tickerFailed(self: *Conn, err: anyerror) Error!void {
         self.ticker_op = null;
         switch (err) {
-            error.Canceled => {},
+            error.OperationCanceled => {},
             else => log.err("{} ticker failed {}", .{ self.socket, err }),
         }
     }

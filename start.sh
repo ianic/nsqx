@@ -1,11 +1,12 @@
 #!/bin/bash
 
 # set -u
-# set -m
+set -m
 
 killall nsql  >> /dev/null 2>&1
 killall nsqadmin  >> /dev/null 2>&1
-killall nsqlookup >> /dev/null 2>&1
+killall nsqlookupd >> /dev/null 2>&1
+
 set -e
 
 cd ~/Code/nsql
@@ -13,7 +14,7 @@ zig build
 
 # lookup for monitoring registrations
 cd ~/Code/nsql && zig run test/lookup.zig > tmp/registrations 2>&1 &
-
+lookupd3_pid=$!
 
 # default lookupd
 ~/Code/go/nsq/apps/nsqlookupd/nsqlookupd > tmp/lookupd1 2>&1 &
@@ -53,13 +54,19 @@ nsq_tail -nsqd-tcp-address localhost:4150 -channel channel3 -topic topic1  | sed
 
 cleanup() {
     set +e
-    killall nsq_tila >> /dev/null 2>&1
-    kill $nsql_pid >> /dev/null
+    killall nsq_tail >> /dev/null 2>&1
     kill $admin_pid >> /dev/null
     kill $lookupd_pid >> /dev/null
     kill $lookupd2_pid >> /dev/null
+    kill $lookupd3_pid >> /dev/null
+    kill $nsql_pid >> /dev/null
 }
 trap cleanup INT TERM #EXIT
+
+echo pids:
+echo admin: $admin_pid
+echo lookupd: $lookupd_pid $lookupd2_pid $lookupd3_pid
+echo nsql: $nsql_pid
 
 wait $nsql_pid
 wait $lookupd_pid

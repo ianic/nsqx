@@ -134,7 +134,7 @@ pub const Conn = struct {
     fn sendFailed(self: *Conn, err: anyerror) Error!void {
         self.sendDeinit();
         switch (err) {
-            error.Canceled, error.BrokenPipe, error.ConnectionResetByPeer => {},
+            error.OperationCanceled, error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.err("{} send failed {}", .{ self.socket, err }),
         }
         try self.close();
