@@ -28,24 +28,20 @@ pub const Connector = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !?Self {
-        const address = options.statsd.address orelse return null;
-        return .{
+    pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !void {
+        self.* = .{
             .allocator = allocator,
             .io = io,
             .server = server,
             .options = options.statsd,
-            .address = address,
+            .address = options.statsd.address.?,
             .prefix = try fmtPrefix(allocator, options.statsd.prefix, options.broadcastAddress(), options.broadcast_tcp_port),
         };
+        try self.io.ticker(self.options.interval, self, tick, tickerFailed, &self.ticker_op);
     }
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.prefix);
-    }
-
-    pub fn start(self: *Self) !void {
-        try self.io.ticker(self.options.interval, self, tick, tickerFailed, &self.ticker_op);
     }
 
     fn tick(self: *Self) Error!void {

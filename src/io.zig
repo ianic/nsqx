@@ -10,6 +10,7 @@ const socket_t = std.posix.socket_t;
 const fd_t = std.posix.fd_t;
 const errFromErrno = @import("errno.zig").toError;
 const Atomic = std.atomic.Value;
+const Options = @import("Options.zig").Io;
 
 const ns_per_ms = std.time.ns_per_ms;
 const ns_per_s = std.time.ns_per_s;
@@ -169,15 +170,18 @@ pub const Io = struct {
         self.metric_prev = cur;
     }
 
-    pub fn init(self: *Io, ring_entries: u16, recv_buffers: u16, recv_buffer_len: u32) !void {
-        self.ring = try IoUring.init(ring_entries, linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER);
-        self.timestamp = timestamp();
-        if (recv_buffers > 0) {
-            self.recv_buf_grp = try self.initBufferGroup(1, recv_buffers, recv_buffer_len);
+    pub fn init(self: *Io, allocator: mem.Allocator, opt: Options) !void {
+        self.* = .{
+            .allocator = allocator,
+            .ring = try IoUring.init(opt.entries, linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER),
+            .timestamp = timestamp(),
+            .op_pool = try std.heap.MemoryPool(Op).initPreheated(self.allocator, 1024),
+        };
+        if (opt.recv_buffers > 0) {
+            self.recv_buf_grp = try self.initBufferGroup(1, opt.recv_buffers, opt.recv_buffer_len);
         } else {
             self.recv_buf_grp.buffers_count = 0;
         }
-        self.op_pool = try std.heap.MemoryPool(Op).initPreheated(self.allocator, 1024);
     }
 
     fn initBufferGroup(self: *Io, id: u16, count: u16, size: u32) !IoUring.BufferGroup {
@@ -1041,9 +1045,8 @@ test "resize iovec" {
 
 test "ticker" {
     const allocator = testing.allocator;
-
-    var io = Io{ .allocator = allocator };
-    try io.init(4, 0, 0);
+    var io: Io = undefined;
+    try io.init(allocator, .{ .entries = 4, .recv_buffers = 0, .recv_buffer_len = 0 });
     defer io.deinit();
 
     const Ctx = struct {
@@ -1069,8 +1072,8 @@ test "ticker" {
 
 test "timer" {
     const allocator = testing.allocator;
-    var io = Io{ .allocator = allocator };
-    try io.init(4, 0, 0);
+    var io: Io = undefined;
+    try io.init(allocator, .{ .entries = 4, .recv_buffers = 0, .recv_buffer_len = 0 });
     defer io.deinit();
 
     const Ctx = struct {

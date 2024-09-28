@@ -26,60 +26,55 @@ pub fn main() !void {
     var options = try Options.initFromArgs(allocator);
     defer options.deinit(allocator);
 
-    const tcp_socket = (try options.tcp_address.listen(.{ .reuse_address = true })).stream.handle;
-    const http_socket = (try options.http_address.listen(.{ .reuse_address = true })).stream.handle;
-
-    var io = Io{ .allocator = allocator };
-    try io.init(
-        options.io.entries,
-        options.io.recv_buffers,
-        options.io.recv_buffer_len,
-    );
+    var io: Io = undefined;
+    try io.init(allocator, options.io);
     defer io.deinit();
 
-    var lookup_connector = lookup.Connector.init(allocator, &io);
-    defer lookup_connector.deinit();
-
+    var lookup_connector: lookup.Connector = undefined;
     var server = tcp.Server.init(allocator, &io, &lookup_connector);
     defer server.deinit();
 
-    { // start lookupd connections
-        lookup_connector.server = &server;
-        for (options.lookup_tcp_addresses) |addr| try lookup_connector.addLookupd(addr);
-    }
+    try lookup_connector.init(allocator, &io, &server, options.lookup_tcp_addresses);
+    defer lookup_connector.deinit();
 
-    var tcp_listener = try tcp.Listener.init(allocator, &io, &server, options);
+    var tcp_listener: tcp.Listener = undefined;
+    try tcp_listener.init(allocator, &io, &server, options, try socket(options.tcp_address));
     defer tcp_listener.deinit();
-    try tcp_listener.accept(tcp_socket);
 
-    var http_listener = try http.Listener.init(allocator, &io, &server, options);
+    var http_listener: http.Listener = undefined;
+    try http_listener.init(allocator, &io, &server, options, try socket(options.http_address));
     defer http_listener.deinit();
-    try http_listener.accept(http_socket);
 
-    var statsd_connector: ?statsd.Connector = try statsd.Connector.init(allocator, &io, &server, options);
-    if (statsd_connector) |*sc| try sc.start();
+    var statsd_connector: ?statsd.Connector = if (options.statsd.address) |_| brk: {
+        var sc: statsd.Connector = undefined;
+        try sc.init(allocator, &io, &server, options);
+        break :brk sc;
+    } else null;
     defer if (statsd_connector) |*sc| sc.deinit();
 
-    catchSignals();
-    while (true) {
-        try io.tick();
+    { // Run loop
+        catchSignals();
+        while (true) {
+            try io.tick();
 
-        const sig = signal.load(.monotonic);
-        if (sig != 0) {
-            signal.store(0, .release);
-            switch (sig) {
-                posix.SIG.USR1 => try showStat(&tcp_listener, &io, &server),
-                posix.SIG.USR2 => {
-                    mallocInfo();
-                    mallocTrim();
-                    mallocInfo();
-                },
-                posix.SIG.TERM, posix.SIG.INT => break,
-                else => {},
+            const sig = signal.load(.monotonic);
+            if (sig != 0) {
+                signal.store(0, .release);
+                switch (sig) {
+                    posix.SIG.USR1 => try showStat(&tcp_listener, &io, &server),
+                    posix.SIG.USR2 => {
+                        mallocInfo();
+                        mallocTrim();
+                        mallocInfo();
+                    },
+                    posix.SIG.TERM, posix.SIG.INT => break,
+                    else => {},
+                }
             }
         }
     }
 
+    // Cleanup
     log.info("draining", .{});
     if (statsd_connector) |*sc| try sc.close();
     try server.stopTimers();
@@ -88,6 +83,10 @@ pub fn main() !void {
     try tcp_listener.close();
     try io.drain();
     log.info("drain finished", .{});
+}
+
+pub fn socket(addr: net.Address) !posix.socket_t {
+    return (try addr.listen(.{ .reuse_address = true })).stream.handle;
 }
 
 fn mallocTrim() void {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
+const net = std.net;
 const posix = std.posix;
 const socket_t = std.posix.socket_t;
 const testing = std.testing;
@@ -29,19 +30,19 @@ pub const Connector = struct {
         closing,
     };
 
-    pub fn init(allocator: mem.Allocator, io: *Io) Self {
+    pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, server: *Server, lookup_tcp_addresses: []net.Address) !void {
         // TODO: create identify from command line arguments, options
         const identify = identifyMessage(allocator, "127.0.0.1", "hydra", 4151, 4150, "0.1.0") catch "";
-
-        return .{
+        self.* = .{
             .allocator = allocator,
             .io = io,
-            .server = undefined,
+            .server = server,
             .connections = std.ArrayList(*Conn).init(allocator),
             .topic = Topic.init(allocator),
             .identify = identify,
             .state = .active,
         };
+        for (lookup_tcp_addresses) |addr| try self.addLookupd(addr);
     }
 
     pub fn close(self: *Self) !void {

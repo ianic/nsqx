@@ -76,19 +76,21 @@ max_req_timeout: u32 = 60000 * 60, // 1h
 msg_timeout: u32 = 60000, // 1m
 
 /// io_uring configuration
-io: struct {
+io: Io = .{},
+
+/// statsd
+statsd: Statsd = .{},
+
+const Options = @This();
+
+pub const Io = struct {
     /// Number of io_uring sqe entries
     entries: u16 = 16 * 1024,
     /// Number of receive buffers
     recv_buffers: u16 = 1024,
     /// Length of each receive buffer in bytes
     recv_buffer_len: u32 = 64 * 1024,
-} = .{},
-
-/// statsd
-statsd: Statsd = .{},
-
-const Options = @This();
+};
 
 pub const Statsd = struct {
     /// statsd daemon for pushing stats

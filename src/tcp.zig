@@ -33,30 +33,34 @@ pub fn ListenerType(comptime ConnType: type) type {
 
         const Self = @This();
 
-        pub fn init(allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !Self {
-            return .{
+        pub fn init(
+            self: *Self,
+            allocator: mem.Allocator,
+            io: *Io,
+            server: *Server,
+            options: Options,
+            socket: socket_t,
+        ) !void {
+            self.* = .{
                 .allocator = allocator,
                 .server = server,
                 .options = options,
                 .io = io,
                 .conns = std.AutoHashMap(socket_t, *ConnType).init(allocator),
             };
+            try self.io.accept(socket, self, accepted, failed, &self.op);
         }
 
         pub fn deinit(self: *Self) void {
             self.conns.deinit();
         }
 
-        pub fn accept(self: *Self, socket: socket_t) !void {
-            try self.io.accept(socket, self, accepted, failed, &self.op);
-        }
-
         fn accepted(self: *Self, socket: socket_t, addr: std.net.Address) Error!void {
             var conn = try self.allocator.create(ConnType);
             errdefer self.allocator.destroy(conn);
-            try self.conns.put(socket, conn);
-            conn.* = ConnType.init(self, socket, addr);
-            try conn.recv();
+            try self.conns.ensureUnusedCapacity(1);
+            try conn.init(self, socket, addr);
+            self.conns.putAssumeCapacityNoClobber(socket, conn);
             self.metric.accept +%= 1;
         }
 
@@ -122,20 +126,17 @@ pub const Conn = struct {
         heartbeat,
     };
 
-    fn init(listener: *Listener, socket: socket_t, addr: std.net.Address) Conn {
-        var conn = Conn{
+    fn init(self: *Conn, listener: *Listener, socket: socket_t, addr: std.net.Address) !void {
+        self.* = .{
             .allocator = listener.allocator,
             .listener = listener,
             .io = listener.io,
             .socket = socket,
             .addr = addr,
             .recv_buf = RecvBuf.init(listener.allocator),
+            .metric = .{ .connected_at = listener.io.now() },
         };
-        conn.metric.connected_at = listener.io.now();
-        return conn;
-    }
 
-    fn recv(self: *Conn) !void {
         try self.send_vec.init(self.allocator);
         errdefer self.send_vec.deinit(self.allocator);
         try self.io.recv(self.socket, self, received, recvFailed, &self.recv_op);
@@ -144,9 +145,9 @@ pub const Conn = struct {
     }
 
     fn initTicker(self: *Conn, heartbeat_interval: i64) !void {
+        if (heartbeat_interval == 0) return;
         log.debug("{} heartbeat interval: {}", .{ self.socket, heartbeat_interval });
         try Op.cancel(self.ticker_op);
-        if (heartbeat_interval == 0) return;
         const msec: i64 = @divTrunc(heartbeat_interval, 2);
         try self.io.ticker(msec, self, tick, tickerFailed, &self.ticker_op);
     }

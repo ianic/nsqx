@@ -28,17 +28,14 @@ pub const Conn = struct {
     send_vec: [2]posix.iovec_const = undefined, // header and body
     send_msghdr: posix.msghdr_const = .{ .iov = undefined, .iovlen = undefined, .name = null, .namelen = 0, .control = null, .controllen = 0, .flags = 0 },
 
-    pub fn init(listener: *Listener, socket: socket_t, addr: std.net.Address) Conn {
-        return .{
+    pub fn init(self: *Conn, listener: *Listener, socket: socket_t, addr: std.net.Address) !void {
+        self.* = .{
             .gpa = listener.allocator,
             .listener = listener,
             .io = listener.io,
             .socket = socket,
             .addr = addr,
         };
-    }
-
-    pub fn recv(self: *Conn) !void {
         try self.io.recv(self.socket, self, received, recvFailed, &self.recv_op);
     }
 
