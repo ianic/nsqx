@@ -39,7 +39,7 @@ pub const Conn = struct {
     }
 
     pub fn recv(self: *Conn) !void {
-        self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
+        try self.io.recv(self.socket, self, received, recvFailed, "recv_op");
     }
 
     fn received(self: *Conn, bytes: []const u8) Error!void {
@@ -116,7 +116,7 @@ pub const Conn = struct {
         assert(self.send_op == null);
         self.send_msghdr.iov = &self.send_vec;
         self.send_msghdr.iovlen = if (self.send_vec[1].len > 0) 2 else 1;
-        self.send_op = try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed);
+        try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed, "send_op");
     }
 
     fn sent(self: *Conn) Error!void {
@@ -124,7 +124,6 @@ pub const Conn = struct {
     }
 
     fn sendDeinit(self: *Conn) void {
-        self.send_op = null;
         if (self.arena) |arena| {
             arena.deinit();
             self.arena = null;
@@ -141,7 +140,6 @@ pub const Conn = struct {
     }
 
     fn recvFailed(self: *Conn, err: anyerror) Error!void {
-        self.recv_op = null;
         switch (err) {
             error.EndOfFile => {},
             error.ConnectionResetByPeer => {},
@@ -153,14 +151,10 @@ pub const Conn = struct {
     pub fn close(self: *Conn) !void {
         if (self.send_op) |op| {
             try op.cancel();
-            return;
+            self.sendDeinit();
         }
         log.debug("{} close", .{self.socket});
-        if (self.recv_op) |op| {
-            try op.cancel();
-            op.unsubscribe(self);
-        }
-
+        if (self.recv_op) |op| try op.cancel();
         try self.io.close(self.socket);
         self.listener.remove(self);
     }
@@ -213,25 +207,25 @@ fn jsonInfo(writer: anytype, server: *Server, options: Options) !void {
 const Stat = struct {
     const Topic = struct {
         topic_name: []const u8,
-        depth: u64 = 0,
-        message_count: u64 = 0,
-        message_bytes: u64 = 0,
+        depth: usize = 0,
+        message_count: usize = 0,
+        message_bytes: usize = 0,
         paused: bool,
         channels: []Channel,
-        e2e_processing_latency: struct { count: u64 = 0 } = .{},
+        e2e_processing_latency: struct { count: usize = 0 } = .{},
     };
     const Channel = struct {
         channel_name: []const u8,
-        depth: u64,
-        in_flight_count: u64,
-        deferred_count: u64,
-        message_count: u64,
-        requeue_count: u64,
-        timeout_count: u64,
-        client_count: u64,
+        depth: usize,
+        in_flight_count: usize,
+        deferred_count: usize,
+        message_count: usize,
+        requeue_count: usize,
+        timeout_count: usize,
+        client_count: usize,
         clients: []Client,
         paused: bool,
-        e2e_processing_latency: struct { count: u64 = 0 } = .{},
+        e2e_processing_latency: struct { count: usize = 0 } = .{},
     };
     const Client = struct {
         client_id: []const u8,
@@ -240,18 +234,18 @@ const Stat = struct {
         version: []const u8 = "V2",
         remote_address: []const u8,
         state: u8 = 3,
-        ready_count: u64,
-        in_flight_count: u64,
-        message_count: u64,
-        finish_count: u64,
-        requeue_count: u64,
-        connect_ts: u64,
-        msg_timeout: u64,
+        ready_count: usize,
+        in_flight_count: usize,
+        message_count: usize,
+        finish_count: usize,
+        requeue_count: usize,
+        connect_ts: usize,
+        msg_timeout: usize,
         pub_counts: []PubCount = &.{},
     };
     const PubCount = struct {
         topic: []const u8,
-        count: u64,
+        count: usize,
     };
 
     version: []const u8 = "0.1.0",

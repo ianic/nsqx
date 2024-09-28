@@ -150,6 +150,7 @@ const Conn = struct {
     io: *Io,
     address: std.net.Address,
     socket: socket_t = 0,
+    connect_op: ?*Op = null,
     send_op: ?*Op = null,
     recv_op: ?*Op = null,
     ticker_op: ?*Op = null,
@@ -191,17 +192,17 @@ const Conn = struct {
     }
 
     pub fn connect(self: *Self) !void {
-        self.ticker_op = try self.io.ticker(ping_interval, self, tick, tickerFailed);
+        try self.io.ticker(ping_interval, self, tick, tickerFailed, "ticker_op");
         try self.reconnect();
     }
 
     fn reconnect(self: *Self) Error!void {
         if (self.send_op) |op| {
-            op.unsubscribe(self);
+            op.unsubscribe();
             self.send_op = null;
         }
         if (self.recv_op) |op| {
-            op.unsubscribe(self);
+            op.unsubscribe();
             self.recv_op = null;
         }
         if (self.socket != 0) {
@@ -209,7 +210,15 @@ const Conn = struct {
             self.socket = 0;
         }
         self.state = .connecting;
-        _ = try self.io.socketCreate(self.address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, self, socketCreated, socketFailed);
+        try self.io.socketCreate(
+            self.address.any.family,
+            posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+            0,
+            self,
+            socketCreated,
+            socketFailed,
+            "connect_op",
+        );
     }
 
     fn tick(self: *Self) Error!void {
@@ -220,8 +229,7 @@ const Conn = struct {
         }
     }
 
-    fn tickerFailed(self: *Self, err: anyerror) Error!void {
-        self.ticker_op = null;
+    fn tickerFailed(_: *Self, err: anyerror) Error!void {
         switch (err) {
             error.OperationCanceled => {},
             else => log.err("ticker failed {}", .{err}),
@@ -231,7 +239,7 @@ const Conn = struct {
     fn socketCreated(self: *Self, socket: socket_t) Error!void {
         self.socket = socket;
         self.state = .connecting;
-        _ = try self.io.connect(self.socket, &self.address, self, connected, connectFailed);
+        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, "connect_op");
     }
 
     fn socketFailed(self: *Self, err: anyerror) Error!void {
@@ -261,7 +269,7 @@ const Conn = struct {
     fn send(self: *Self, buf: []const u8) !void {
         assert(self.send_op == null);
         assert(buf.len > 0);
-        self.send_op = try self.io.send(self.socket, buf, self, sent, sendFailed);
+        try self.io.send(self.socket, buf, self, sent, sendFailed, "send_op");
     }
 
     fn ping(self: *Self) Error!void {
@@ -269,12 +277,10 @@ const Conn = struct {
     }
 
     fn sent(self: *Self) Error!void {
-        self.send_op = null;
         try self.pullTopic();
     }
 
     fn sendFailed(self: *Self, err: anyerror) Error!void {
-        self.send_op = null;
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.err("{} send failed {}", .{ self.address, err }),
@@ -283,7 +289,7 @@ const Conn = struct {
     }
 
     fn recv(self: *Self) !void {
-        self.recv_op = try self.io.recv(self.socket, self, received, recvFailed);
+        try self.io.recv(self.socket, self, received, recvFailed, "recv_op");
     }
 
     fn received(self: *Self, bytes: []const u8) Error!void {
@@ -317,7 +323,6 @@ const Conn = struct {
     }
 
     fn recvFailed(self: *Self, err: anyerror) Error!void {
-        self.recv_op = null;
         switch (err) {
             error.EndOfFile => {},
             error.ConnectionResetByPeer => {},
@@ -328,18 +333,10 @@ const Conn = struct {
 
     pub fn close(self: *Self) !void {
         self.state = .closing;
-        if (self.send_op) |op| {
-            try op.cancel();
-            return;
-        }
-        if (self.recv_op) |op| {
-            try op.cancel();
-            op.unsubscribe(self);
-        }
-        if (self.ticker_op) |op| {
-            try op.cancel();
-            op.unsubscribe(self);
-        }
+        if (self.connect_op) |op| try op.cancel();
+        if (self.send_op) |op| try op.cancel();
+        if (self.recv_op) |op| try op.cancel();
+        if (self.ticker_op) |op| try op.cancel();
         if (self.socket > 0)
             try self.io.close(self.socket);
         self.state = .closed;

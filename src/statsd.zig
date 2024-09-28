@@ -22,6 +22,7 @@ pub const Connector = struct {
     socket: socket_t = 0,
     send_op: ?*Op = null,
     ticker_op: ?*Op = null,
+    connect_op: ?*Op = null,
     iter: BufferSizeIterator = .{},
     prefix: []const u8,
 
@@ -44,7 +45,7 @@ pub const Connector = struct {
     }
 
     pub fn start(self: *Self) !void {
-        self.ticker_op = try self.io.ticker(self.options.interval, self, tick, tickerFailed);
+        try self.io.ticker(self.options.interval, self, tick, tickerFailed, "ticker_op");
     }
 
     fn tick(self: *Self) Error!void {
@@ -56,8 +57,7 @@ pub const Connector = struct {
         try self.send();
     }
 
-    fn tickerFailed(self: *Self, err: anyerror) Error!void {
-        self.ticker_op = null;
+    fn tickerFailed(_: *Self, err: anyerror) Error!void {
         switch (err) {
             error.OperationCanceled => {},
             else => {
@@ -68,19 +68,20 @@ pub const Connector = struct {
     }
 
     fn socketCreate(self: *Self) !void {
-        _ = try self.io.socketCreate(
+        try self.io.socketCreate(
             self.address.any.family,
             posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
             0,
             self,
             socketCreated,
             connectFailed,
+            "connect_op",
         );
     }
 
     fn socketCreated(self: *Self, socket: socket_t) Error!void {
         self.socket = socket;
-        _ = try self.io.connect(self.socket, &self.address, self, connected, connectFailed);
+        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, "connect_op");
     }
 
     fn connectFailed(self: *Self, err: anyerror) Error!void {
@@ -89,9 +90,7 @@ pub const Connector = struct {
         self.socket = 0;
     }
 
-    fn connected(self: *Self) Error!void {
-        _ = self;
-    }
+    fn connected(_: *Self) Error!void {}
 
     fn generate(self: *Self) Error!void {
         var writer = MetricWriter.init(self.allocator, self.prefix);
@@ -118,12 +117,11 @@ pub const Connector = struct {
     fn send(self: *Self) !void {
         assert(self.send_op == null);
         if (self.iter.next()) |buf| {
-            self.send_op = try self.io.send(self.socket, buf, self, sent, sendFailed);
+            try self.io.send(self.socket, buf, self, sent, sendFailed, "send_op");
         }
     }
 
     fn sent(self: *Self) Error!void {
-        self.send_op = null;
         if (self.iter.done()) {
             log.debug("sent {} bytes", .{self.iter.buf.len});
             self.allocator.free(self.iter.buf);
@@ -133,15 +131,15 @@ pub const Connector = struct {
         }
     }
 
-    fn sendFailed(self: *Self, err: anyerror) Error!void {
-        self.send_op = null;
+    fn sendFailed(_: *Self, err: anyerror) Error!void {
         log.err("send failed {}", .{err});
     }
 
     pub fn close(self: *Self) !void {
+        if (self.connect_op) |op| try op.cancel();
         if (self.ticker_op) |op| try op.cancel();
         if (self.send_op) |op| {
-            op.unsubscribe(self);
+            op.unsubscribe();
             self.allocator.free(self.iter.buf);
         }
     }
@@ -190,7 +188,7 @@ pub const MetricWriter = struct {
         else
             try writer.print("{s}.{s}:{d}|c\n", .{ prefix, metric, current -| previous });
     }
-    pub fn gauge(self: *Self, prefix: []const u8, metric: []const u8, value: u64) !void {
+    pub fn gauge(self: *Self, prefix: []const u8, metric: []const u8, value: usize) !void {
         const writer = self.list.writer().any();
         if (self.prefix.len > 0)
             try writer.print("{s}.{s}.{s}:{d}|g\n", .{ self.prefix, prefix, metric, value })

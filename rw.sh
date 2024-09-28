@@ -17,7 +17,7 @@ cd ~/Code/go/nsq/bench/bench_reader/
 go build
 
 cd ~/Code/nsql
-./zig-out/bin/nsql --statsd-address localhost > tmp/nsql 2>&1 &
+./zig-out/bin/nsql --statsd-address localhost --statsd-prefix "" > tmp/nsql 2>&1 &
 nsqd_pid=$!
 
 #sh -c 'while pkill -usr1 nsql; do sleep 10; done' &
