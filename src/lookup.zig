@@ -192,19 +192,13 @@ const Conn = struct {
     }
 
     pub fn connect(self: *Self) !void {
-        try self.io.ticker(ping_interval, self, tick, tickerFailed, "ticker_op");
+        try self.io.ticker(ping_interval, self, tick, tickerFailed, &self.ticker_op);
         try self.reconnect();
     }
 
     fn reconnect(self: *Self) Error!void {
-        if (self.send_op) |op| {
-            op.unsubscribe();
-            self.send_op = null;
-        }
-        if (self.recv_op) |op| {
-            op.unsubscribe();
-            self.recv_op = null;
-        }
+        Op.unsubscribe(self.send_op);
+        Op.unsubscribe(self.recv_op);
         if (self.socket != 0) {
             try self.io.close(self.socket);
             self.socket = 0;
@@ -217,7 +211,7 @@ const Conn = struct {
             self,
             socketCreated,
             socketFailed,
-            "connect_op",
+            &self.connect_op,
         );
     }
 
@@ -239,7 +233,7 @@ const Conn = struct {
     fn socketCreated(self: *Self, socket: socket_t) Error!void {
         self.socket = socket;
         self.state = .connecting;
-        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, "connect_op");
+        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, &self.connect_op);
     }
 
     fn socketFailed(self: *Self, err: anyerror) Error!void {
@@ -269,7 +263,7 @@ const Conn = struct {
     fn send(self: *Self, buf: []const u8) !void {
         assert(self.send_op == null);
         assert(buf.len > 0);
-        try self.io.send(self.socket, buf, self, sent, sendFailed, "send_op");
+        try self.io.send(self.socket, buf, self, sent, sendFailed, &self.send_op);
     }
 
     fn ping(self: *Self) Error!void {
@@ -289,7 +283,7 @@ const Conn = struct {
     }
 
     fn recv(self: *Self) !void {
-        try self.io.recv(self.socket, self, received, recvFailed, "recv_op");
+        try self.io.recv(self.socket, self, received, recvFailed, &self.recv_op);
     }
 
     fn received(self: *Self, bytes: []const u8) Error!void {
@@ -333,10 +327,10 @@ const Conn = struct {
 
     pub fn close(self: *Self) !void {
         self.state = .closing;
-        if (self.connect_op) |op| try op.cancel();
-        if (self.send_op) |op| try op.cancel();
-        if (self.recv_op) |op| try op.cancel();
-        if (self.ticker_op) |op| try op.cancel();
+        try Op.cancel(self.connect_op);
+        try Op.cancel(self.send_op);
+        try Op.cancel(self.recv_op);
+        try Op.cancel(self.ticker_op);
         if (self.socket > 0)
             try self.io.close(self.socket);
         self.state = .closed;

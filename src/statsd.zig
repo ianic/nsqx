@@ -45,7 +45,7 @@ pub const Connector = struct {
     }
 
     pub fn start(self: *Self) !void {
-        try self.io.ticker(self.options.interval, self, tick, tickerFailed, "ticker_op");
+        try self.io.ticker(self.options.interval, self, tick, tickerFailed, &self.ticker_op);
     }
 
     fn tick(self: *Self) Error!void {
@@ -75,13 +75,13 @@ pub const Connector = struct {
             self,
             socketCreated,
             connectFailed,
-            "connect_op",
+            &self.connect_op,
         );
     }
 
     fn socketCreated(self: *Self, socket: socket_t) Error!void {
         self.socket = socket;
-        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, "connect_op");
+        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, &self.connect_op);
     }
 
     fn connectFailed(self: *Self, err: anyerror) Error!void {
@@ -117,7 +117,7 @@ pub const Connector = struct {
     fn send(self: *Self) !void {
         assert(self.send_op == null);
         if (self.iter.next()) |buf| {
-            try self.io.send(self.socket, buf, self, sent, sendFailed, "send_op");
+            try self.io.send(self.socket, buf, self, sent, sendFailed, &self.send_op);
         }
     }
 
@@ -136,12 +136,10 @@ pub const Connector = struct {
     }
 
     pub fn close(self: *Self) !void {
-        if (self.connect_op) |op| try op.cancel();
-        if (self.ticker_op) |op| try op.cancel();
-        if (self.send_op) |op| {
-            op.unsubscribe();
-            self.allocator.free(self.iter.buf);
-        }
+        try Op.cancel(self.connect_op);
+        try Op.cancel(self.ticker_op);
+        if (self.send_op) |_| self.allocator.free(self.iter.buf);
+        Op.unsubscribe(self.send_op);
     }
 };
 

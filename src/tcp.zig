@@ -48,7 +48,7 @@ pub fn ListenerType(comptime ConnType: type) type {
         }
 
         pub fn accept(self: *Self, socket: socket_t) !void {
-            try self.io.accept(socket, self, accepted, failed, "op");
+            try self.io.accept(socket, self, accepted, failed, &self.op);
         }
 
         fn accepted(self: *Self, socket: socket_t, addr: std.net.Address) Error!void {
@@ -68,7 +68,7 @@ pub fn ListenerType(comptime ConnType: type) type {
         }
 
         pub fn close(self: *Self) !void {
-            if (self.op) |op| try op.cancel();
+            try Op.cancel(self.op);
             var iter = self.conns.valueIterator();
             while (iter.next()) |e| {
                 try e.*.close();
@@ -138,17 +138,17 @@ pub const Conn = struct {
     fn recv(self: *Conn) !void {
         try self.send_vec.init(self.allocator);
         errdefer self.send_vec.deinit(self.allocator);
-        try self.io.recv(self.socket, self, received, recvFailed, "recv_op");
-        errdefer if (self.recv_op) |op| op.cancel() catch {};
+        try self.io.recv(self.socket, self, received, recvFailed, &self.recv_op);
+        errdefer Op.cancel(self.recv_op) catch {};
         try self.initTicker(self.listener.options.max_heartbeat_interval);
     }
 
     fn initTicker(self: *Conn, heartbeat_interval: i64) !void {
         log.debug("{} heartbeat interval: {}", .{ self.socket, heartbeat_interval });
-        if (self.ticker_op) |op| try op.cancel();
+        try Op.cancel(self.ticker_op);
         if (heartbeat_interval == 0) return;
         const msec: i64 = @divTrunc(heartbeat_interval, 2);
-        try self.io.ticker(msec, self, tick, tickerFailed, "ticker_op");
+        try self.io.ticker(msec, self, tick, tickerFailed, &self.ticker_op);
     }
 
     // Channel api -----------------
@@ -324,7 +324,7 @@ pub const Conn = struct {
 
     fn send(self: *Conn) !void {
         assert(self.send_op == null);
-        try self.io.sendv(self.socket, self.send_vec.ptr(), self, sent, sendFailed, "send_op");
+        try self.io.sendv(self.socket, self.send_vec.ptr(), self, sent, sendFailed, &self.send_op);
     }
 
     fn sent(self: *Conn) Error!void {
@@ -371,9 +371,9 @@ pub const Conn = struct {
     fn close(self: *Conn) !void {
         log.debug("{} close", .{self.socket});
         if (self.channel) |channel| try channel.unsubscribe(self);
-        if (self.ticker_op) |op| try op.cancel();
-        if (self.recv_op) |op| try op.cancel();
-        if (self.send_op) |op| op.unsubscribe();
+        try Op.cancel(self.ticker_op);
+        try Op.cancel(self.recv_op);
+        Op.unsubscribe(self.send_op);
         try self.io.close(self.socket);
 
         self.recv_buf.free();

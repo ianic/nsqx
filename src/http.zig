@@ -39,7 +39,7 @@ pub const Conn = struct {
     }
 
     pub fn recv(self: *Conn) !void {
-        try self.io.recv(self.socket, self, received, recvFailed, "recv_op");
+        try self.io.recv(self.socket, self, received, recvFailed, &self.recv_op);
     }
 
     fn received(self: *Conn, bytes: []const u8) Error!void {
@@ -116,7 +116,7 @@ pub const Conn = struct {
         assert(self.send_op == null);
         self.send_msghdr.iov = &self.send_vec;
         self.send_msghdr.iovlen = if (self.send_vec[1].len > 0) 2 else 1;
-        try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed, "send_op");
+        try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed, &self.send_op);
     }
 
     fn sent(self: *Conn) Error!void {
@@ -149,14 +149,14 @@ pub const Conn = struct {
     }
 
     pub fn close(self: *Conn) !void {
-        if (self.send_op) |op| {
-            try op.cancel();
+        if (self.send_op) |_| {
+            try Op.cancel(self.send_op);
             self.sendDeinit();
         }
-        log.debug("{} close", .{self.socket});
-        if (self.recv_op) |op| try op.cancel();
+        try Op.cancel(self.recv_op);
         try self.io.close(self.socket);
         self.listener.remove(self);
+        log.debug("{} close", .{self.socket});
     }
 };
 
