@@ -331,6 +331,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
 
                 fn deinit(self: *Topic) void {
+                    if (self.first) |n| n.release();
                     var iter = self.channels.iterator();
                     while (iter.next()) |e| self.deinitChannel(e.value_ptr.*);
                     self.channels.deinit();
@@ -375,7 +376,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     return channel;
                 }
 
-                fn publish(self: *Topic, data: []const u8) !void {
+                fn publish(self: *Topic, data: []const u8) error{OutOfMemory}!void {
                     const msg = try self.append(data);
                     self.notifyChannels(msg, 1);
                 }
@@ -688,7 +689,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     if (max == 0) return true;
                     var n: u32 = 0;
                     while (n < max) : (n += 1) {
-                        var msg = (self.nextMsg(consumer.msgTimeout()) catch null) orelse break;
+                        var msg = (try self.nextMsg(consumer.msgTimeout())) orelse break;
                         msg.sent_at = self.timer.now();
                         msg.in_flight_socket = consumer.socket;
                         try consumer.prepareSend(&msg.header, msg.msg.body, n);
@@ -702,18 +703,17 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 // msg_timeout - consumer message timeout in ms
                 fn nextMsg(self: *Channel, msg_timeout: u32) !?*Msg {
                     if (self.paused) return null;
-                    const now = self.timer.now();
 
                     // First look into deferred messages
+                    const now = self.timer.now();
                     if (self.deferred.peek()) |msg| if (msg.timestamp <= now) {
                         try self.inFlightAppend(msg, msg_timeout);
                         _ = self.deferred.remove();
                         return msg;
                     };
 
-                    if (self.topic.paused) return null;
-
                     // Then try to find next message in topic
+                    if (self.topic.paused) return null;
                     while (true) {
                         if (self.next) |topic_msg| {
                             // Allocate and convert Topic.Msg to Channel.Msg
@@ -839,7 +839,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                 // Consumer interface actions -----------------
 
-                pub fn finish(self: *Channel, msg_id: [16]u8) !bool {
+                pub fn finish(self: *Channel, msg_id: [16]u8) bool {
                     const seq = Msg.seqFromId(msg_id);
                     if (self.in_flight.fetchSwapRemove(seq)) |kv| {
                         self.metric.finish += 1;
@@ -851,7 +851,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 }
 
                 /// Extend message timeout for interval (nanoseconds).
-                pub fn touch(self: *Channel, msg_id: [16]u8, interval: u64) !bool {
+                pub fn touch(self: *Channel, msg_id: [16]u8, interval: u64) bool {
                     const seq = Msg.seqFromId(msg_id);
                     if (self.in_flight.get(seq)) |msg| {
                         msg.timestamp += interval;
@@ -1020,7 +1020,7 @@ test "channel fin req" {
         try testing.expectEqual(2, channel.next.?.sequence);
     }
     { // consumer sends fin, 0 in flight after that
-        try testing.expect(try channel.finish(consumer.lastId())); // fin 1
+        try testing.expect(channel.finish(consumer.lastId())); // fin 1
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(2, channel.metric.depth);
@@ -1047,7 +1047,7 @@ test "channel fin req" {
         try testing.expectEqual(1, channel.deferred.count());
     }
     { // out of order fin, fin seq 3 while 2 is still in flight
-        try testing.expect(try channel.finish(idFromSeq(3))); // fin 3
+        try testing.expect(channel.finish(idFromSeq(3))); // fin 3
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
     }
@@ -1060,7 +1060,7 @@ test "channel fin req" {
     }
     { // fin seq 2
         try testing.expectEqual(1, channel.metric.depth);
-        try testing.expect(try channel.finish(idFromSeq(2))); // fin 2
+        try testing.expect(channel.finish(idFromSeq(2))); // fin 2
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(0, channel.metric.depth);
@@ -1080,14 +1080,18 @@ test "channel fin req" {
 const TestConsumer = struct {
     const Self = @This();
 
+    allocator: mem.Allocator,
     socket: socket_t = 42,
     channel: ?*TestServer.Channel = null,
     sequences: std.ArrayList(u64) = undefined,
     ready_count: usize = 1,
     sent_at: u64 = 0,
 
-    fn init(alloc: mem.Allocator) Self {
-        return .{ .sequences = std.ArrayList(u64).init(alloc) };
+    fn init(allocator: mem.Allocator) Self {
+        return .{
+            .allocator = allocator,
+            .sequences = std.ArrayList(u64).init(allocator),
+        };
     }
 
     fn deinit(self: *Self) void {
@@ -1100,18 +1104,28 @@ const TestConsumer = struct {
 
     fn prepareSend(self: *Self, header: []const u8, body: []const u8, msg_no: u32) !void {
         const sequence = mem.readInt(u64, header[26..34], .big);
-        self.sequences.append(sequence) catch unreachable;
+        try self.sequences.append(sequence);
         _ = msg_no;
         _ = body;
     }
 
     fn sendPrepared(self: *Self, msgs: u32) !void {
+        {
+            // Making this method fallible in check all allocations
+            const buf = try self.allocator.alloc(u8, 8);
+            defer self.allocator.free(buf);
+        }
         self.ready_count -= msgs;
     }
 
     // send fin for the last received message
-    fn fin(self: *Self) !void {
-        assert(try self.channel.?.finish(self.lastId()));
+    fn fin(self: *Self) void {
+        //if (self.sequences.items.len == 0) return;
+        assert(self.channel.?.finish(self.lastId()));
+    }
+
+    fn requeue(self: *Self) !void {
+        assert(try self.channel.?.requeue(self.lastId(), 0));
     }
 
     // pull message from channel
@@ -1122,7 +1136,7 @@ const TestConsumer = struct {
 
     fn pullAndFin(self: *Self) !void {
         try self.pull();
-        try self.fin();
+        self.fin();
     }
 
     fn lastSeq(self: *Self) u64 {
@@ -1303,7 +1317,7 @@ test "first channel gets all messages accumulated in topic" {
     for (0..no) |i| {
         try testing.expectEqual(no - i, channel.metric.depth);
         try consumer.pull();
-        try consumer.fin();
+        consumer.fin();
     }
     try testing.expectEqual(0, channel.metric.depth);
 }
@@ -1358,7 +1372,7 @@ test "timeout messages" {
         try testing.expectEqual(0, channel.metric.finish);
     }
     { // fin last one
-        try consumer.fin();
+        consumer.fin();
         try testing.expectEqual(1, channel.metric.finish);
         try testing.expectEqual(0, channel.in_flight.count());
     }
@@ -1654,4 +1668,78 @@ test "depth" {
         try testing.expectEqual(0, topic.metric.depth);
         try testing.expect(topic.last == null);
     }
+}
+
+test "check allocations" {
+    const allocator = testing.allocator;
+    try publishFinish(allocator);
+
+    try testing.checkAllAllocationFailures(allocator, publishFinish, .{});
+}
+
+fn publishFinish(allocator: mem.Allocator) !void {
+    const topic_name = "topic";
+    var io = TestIo{};
+    var notifier = NoopNotifier{};
+    var server = TestServer.init(allocator, &io, &notifier);
+    defer server.deinit();
+
+    // Create 2 channels
+    const channel1_name = "channel1";
+    const channel2_name = "channel2";
+    try server.createChannel(topic_name, channel1_name);
+    try server.createChannel(topic_name, channel2_name);
+
+    // Publish some messages
+    try server.publish(topic_name, "message 1");
+    try server.publish(topic_name, "message 2");
+    const topic = server.getOrCreateTopic(topic_name) catch unreachable;
+    try testing.expectEqual(2, topic.metric.depth);
+
+    // 1 consumer for channel 1 and 2 consumers for channel 2
+    var channel1_consumer = TestConsumer.init(allocator);
+    defer channel1_consumer.deinit();
+    channel1_consumer.channel = try server.subscribe(&channel1_consumer, topic_name, channel1_name);
+
+    var channel2_consumer1 = TestConsumer.init(allocator);
+    defer channel2_consumer1.deinit();
+    channel2_consumer1.channel = try server.subscribe(&channel2_consumer1, topic_name, channel2_name);
+    var channel2_consumer2 = TestConsumer.init(allocator);
+    defer channel2_consumer2.deinit();
+    channel2_consumer2.channel = try server.subscribe(&channel2_consumer1, topic_name, channel2_name);
+
+    // Consume messages
+    try channel1_consumer.pullAndFin();
+    try channel1_consumer.pullAndFin();
+    try channel2_consumer1.pullAndFin();
+    try channel2_consumer2.pullAndFin();
+    try testing.expectEqual(0, topic.metric.depth);
+    try testing.expectEqual(2, channel1_consumer.sequences.items.len);
+    try testing.expectEqual(1, channel2_consumer1.sequences.items.len);
+    try testing.expectEqual(1, channel2_consumer2.sequences.items.len);
+
+    // Publish some more
+    try server.publish(topic_name, "message 3");
+    try server.publish(topic_name, "message 4");
+    try server.deleteChannel(topic_name, channel1_name);
+
+    // Re-queue from one consumer 1 to consumer 2
+    const channel2 = channel2_consumer2.channel.?;
+    try channel2_consumer1.pull();
+    try testing.expectEqual(3, channel2_consumer1.lastSeq());
+    try channel2_consumer1.requeue();
+    try testing.expectEqual(1, channel2.deferred.count());
+    try channel2_consumer2.pull();
+    try testing.expectEqual(3, channel2_consumer2.lastSeq());
+    // Unsubscribe consumer2
+    try testing.expectEqual(1, channel2.in_flight.count());
+    try channel2.unsubscribe(&channel2_consumer2);
+    try testing.expectEqual(0, channel2.in_flight.count());
+    try testing.expectEqual(1, channel2.deferred.count());
+    try channel2_consumer1.pull();
+    try testing.expectEqual(3, channel2_consumer1.lastSeq());
+
+    try channel2.empty();
+    try testing.expectEqual(1, channel2.in_flight.count());
+    try server.deleteTopic(topic_name);
 }

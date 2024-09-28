@@ -278,7 +278,7 @@ pub const Conn = struct {
             .finish => |msg_id| {
                 var channel = self.channel orelse return error.NotSubscribed;
                 self.in_flight -|= 1;
-                const res = try channel.finish(msg_id);
+                const res = channel.finish(msg_id);
                 if (res) self.metric.finish += 1;
                 ready_changed.* = true;
                 log.debug("{} finish {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
@@ -296,7 +296,7 @@ pub const Conn = struct {
             },
             .touch => |msg_id| {
                 var channel = self.channel orelse return error.NotSubscribed;
-                const res = try channel.touch(msg_id, self.identify.msg_timeout);
+                const res = channel.touch(msg_id, self.identify.msg_timeout);
                 log.debug("{} touch {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
             },
             .close => {
