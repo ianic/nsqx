@@ -177,6 +177,7 @@ pub const Io = struct {
             .timestamp = timestamp(),
             .op_pool = try std.heap.MemoryPool(Op).initPreheated(self.allocator, 1024),
         };
+        errdefer self.deinit();
         if (opt.recv_buffers > 0) {
             self.recv_buf_grp = try self.initBufferGroup(1, opt.recv_buffers, opt.recv_buffer_len);
         } else {

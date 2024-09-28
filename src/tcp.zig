@@ -48,6 +48,7 @@ pub fn ListenerType(comptime ConnType: type) type {
                 .io = io,
                 .conns = std.AutoHashMap(socket_t, *ConnType).init(allocator),
             };
+            errdefer self.deinit();
             try self.io.accept(socket, self, accepted, failed, &self.op);
         }
 

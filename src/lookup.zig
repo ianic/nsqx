@@ -42,7 +42,17 @@ pub const Connector = struct {
             .identify = identify,
             .state = .active,
         };
+        errdefer self.deinit();
+        try self.connections.ensureUnusedCapacity(lookup_tcp_addresses.len);
         for (lookup_tcp_addresses) |addr| try self.addLookupd(addr);
+    }
+
+    fn addLookupd(self: *Self, address: std.net.Address) !void {
+        const conn = try self.allocator.create(Conn);
+        errdefer self.allocator.destroy(conn);
+        try self.connections.ensureUnusedCapacity(1);
+        try conn.init(self, address);
+        self.connections.appendAssumeCapacity(conn);
     }
 
     pub fn close(self: *Self) !void {
@@ -88,14 +98,8 @@ pub const Connector = struct {
 
     fn registerFailable(self: *Self, comptime fmt: []const u8, args: anytype) !void {
         const buf = try std.fmt.allocPrint(self.allocator, fmt, args);
+        errdefer self.allocator.free(buf);
         assert(try self.topic.append(buf));
-    }
-
-    pub fn addLookupd(self: *Self, address: std.net.Address) !void {
-        const conn = try self.allocator.create(Conn);
-        conn.* = Conn.init(self, address);
-        try self.connections.append(conn);
-        try conn.connect();
     }
 
     fn connect(self: *Self, conn: *Conn) !void {
@@ -171,14 +175,18 @@ const Conn = struct {
 
     const Self = @This();
 
-    pub fn init(connector: *Connector, address: std.net.Address) Self {
+    pub fn init(self: *Self, connector: *Connector, address: std.net.Address) !void {
         const allocator = connector.allocator;
-        return .{
+        self.* = .{
             .connector = connector,
             .io = connector.io,
             .address = address,
             .recv_buf = RecvBuf.init(allocator),
         };
+        errdefer self.deinit();
+        try self.io.ticker(ping_interval, self, tick, tickerFailed, &self.ticker_op);
+        errdefer Op.cancel(self.ticker_op) catch {};
+        try self.reconnect();
     }
 
     fn deinit(self: *Self) void {
@@ -190,11 +198,6 @@ const Conn = struct {
         if (self.connector.topic.next(self)) |buf| {
             try self.send(buf);
         }
-    }
-
-    pub fn connect(self: *Self) !void {
-        try self.io.ticker(ping_interval, self, tick, tickerFailed, &self.ticker_op);
-        try self.reconnect();
     }
 
     fn reconnect(self: *Self) Error!void {

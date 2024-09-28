@@ -92,8 +92,8 @@ pub const Conn = struct {
         const server = self.listener.server;
         const cmd = parse(head.target) catch return error.NotFound;
         switch (cmd) {
-            .stats => return try jsonStat(self.gpa, writer, server),
-            .info => return try jsonInfo(writer, server, self.listener.options),
+            .stats => try jsonStat(self.gpa, writer, server),
+            .info => try jsonInfo(writer, server, self.listener.options),
 
             .topic_create => |name| try server.createTopic(name),
             .topic_delete => |name| try server.deleteTopic(name),

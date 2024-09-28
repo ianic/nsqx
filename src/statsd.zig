@@ -37,6 +37,7 @@ pub const Connector = struct {
             .address = options.statsd.address.?,
             .prefix = try fmtPrefix(allocator, options.statsd.prefix, options.broadcastAddress(), options.broadcast_tcp_port),
         };
+        errdefer self.deinit();
         try self.io.ticker(self.options.interval, self, tick, tickerFailed, &self.ticker_op);
     }
 
@@ -111,10 +112,8 @@ pub const Connector = struct {
     }
 
     fn send(self: *Self) !void {
-        assert(self.send_op == null);
-        if (self.iter.next()) |buf| {
+        if (self.iter.next()) |buf|
             try self.io.send(self.socket, buf, self, sent, sendFailed, &self.send_op);
-        }
     }
 
     fn sent(self: *Self) Error!void {
