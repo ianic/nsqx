@@ -426,7 +426,6 @@ pub const Io = struct {
                     switch (res) {
                         .done => self.release(op),
                         .restart => {
-                            log.err("op restart", .{});
                             self.metric.restart(op);
                             try op.prep();
                         },
@@ -722,7 +721,7 @@ pub const Op = struct {
                         op.io.metric.recv_buf_grp.success +%= 1;
                     },
                     .NOBUFS => {
-                        log.info("recv nobufs", .{});
+                        // log.info("recv nobufs", .{});
                         op.io.metric.recv_buf_grp.no_bufs +%= 1;
                     },
                     .INTR => {},
