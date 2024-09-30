@@ -1519,52 +1519,6 @@ test "channel empty" {
     try testing.expectEqual(0, channel.in_flight.count());
 }
 
-const TestNotifier = struct {
-    const Self = @This();
-    const Registration = union(enum) { topic: []const u8, channel: struct {
-        topic_name: []const u8,
-        name: []const u8,
-    } };
-
-    registrations: std.ArrayList(Registration),
-    fn init(allocator: std.mem.Allocator) Self {
-        return .{
-            .registrations = std.ArrayList(Registration).init(allocator),
-        };
-    }
-    fn deinit(self: *Self) void {
-        self.registrations.deinit();
-    }
-    fn topicCreated(self: *Self, name: []const u8) !void {
-        try self.registrations.append(.{ .topic = name });
-    }
-    fn channelCreated(self: *Self, topic_name: []const u8, name: []const u8) !void {
-        try self.registrations.append(.{ .channel = .{ .topic_name = topic_name, .name = name } });
-    }
-    fn topicDeleted(self: *Self, name: []const u8) !void {
-        for (self.registrations.items, 0..) |reg, i| {
-            if (reg == .topic) {
-                if (reg.topic.ptr == name.ptr) {
-                    _ = self.registrations.swapRemove(i);
-                    return;
-                }
-            }
-        }
-    }
-    fn channelDeleted(self: *Self, topic_name: []const u8, name: []const u8) !void {
-        for (self.registrations.items, 0..) |reg, i| {
-            if (reg == .channel) {
-                if (reg.channel.topic_name.ptr == topic_name.ptr and
-                    reg.channel.name.ptr == name.ptr)
-                {
-                    _ = self.registrations.swapRemove(i);
-                    return;
-                }
-            }
-        }
-    }
-};
-
 test "notifier" {
     const allocator = testing.allocator;
 
