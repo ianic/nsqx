@@ -30,6 +30,9 @@ pub const Io = struct {
     recv_buf_grp: IoUring.BufferGroup = undefined,
     metric: Metric = .{},
     metric_prev: Metric = .{},
+    cqe_buf: []linux.io_uring_cqe = undefined,
+    cqe_buf_head: usize = 0,
+    cqe_buf_tail: usize = 0,
 
     const Metric = struct {
         loops: usize = 0,
@@ -171,13 +174,19 @@ pub const Io = struct {
     }
 
     pub fn init(self: *Io, allocator: mem.Allocator, opt: Options) !void {
+        const cqe_buf = try allocator.alloc(linux.io_uring_cqe, opt.entries);
+        errdefer allocator.free(cqe_buf);
+        var op_pool = try std.heap.MemoryPool(Op).initPreheated(allocator, 1024);
+        errdefer op_pool.deinit();
+        var ring = try IoUring.init(opt.entries, linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER);
+        errdefer ring.deinit();
         self.* = .{
             .allocator = allocator,
-            .ring = try IoUring.init(opt.entries, linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER),
+            .ring = ring,
             .timestamp = timestamp(),
-            .op_pool = try std.heap.MemoryPool(Op).initPreheated(self.allocator, 1024),
+            .op_pool = op_pool,
+            .cqe_buf = cqe_buf,
         };
-        errdefer self.deinit();
         if (opt.recv_buffers > 0) {
             self.recv_buf_grp = try self.initBufferGroup(1, opt.recv_buffers, opt.recv_buffer_len);
         } else {
@@ -198,6 +207,7 @@ pub const Io = struct {
         }
         self.ring.deinit();
         self.op_pool.deinit();
+        self.allocator.free(self.cqe_buf);
     }
 
     fn acquire(self: *Io) !*Op {
@@ -205,7 +215,6 @@ pub const Io = struct {
     }
 
     fn release(self: *Io, op: *Op) void {
-        self.metric.complete(op);
         self.op_pool.destroy(op);
     }
 
@@ -370,17 +379,6 @@ pub const Io = struct {
         while (run.load(.monotonic)) try self.tick();
     }
 
-    pub fn tick(self: *Io) !void {
-        var cqes: [256]std.os.linux.io_uring_cqe = undefined;
-        self.metric.loops += 1;
-        const n = try self.readCompletions(&cqes);
-        if (n > 0) {
-            const new_timestamp = timestamp();
-            self.timestamp = if (new_timestamp == self.timestamp) new_timestamp + 1 else new_timestamp;
-            try self.flushCompletions(cqes[0..n]);
-        }
-    }
-
     pub fn drain(self: *Io) !void {
         while (self.metric.all.active() > 0) {
             log.debug("draining active operations: {}", .{self.metric.all.active()});
@@ -388,50 +386,45 @@ pub const Io = struct {
         }
     }
 
-    fn readCompletions(self: *Io, cqes: []linux.io_uring_cqe) !usize {
-        _ = self.ring.submit() catch |err| switch (err) {
-            error.SignalInterrupt => 0,
-            else => return err,
-        };
-        return self.ring.copy_cqes(cqes, 1) catch |err| switch (err) {
-            error.SignalInterrupt => 0,
-            else => return err,
-        };
+    pub fn tick(self: *Io) !void {
+        self.metric.loops += 1;
+        _ = try self.ring.submit();
+        if (self.cqe_buf_tail <= self.cqe_buf_head) {
+            self.cqe_buf_head = 0;
+            self.cqe_buf_tail = 0;
+            const n = try self.ring.copy_cqes(self.cqe_buf, 1);
+            self.cqe_buf_tail = n;
+            self.metric.cqes += n;
+        }
+        if (self.cqe_buf_tail > self.cqe_buf_head) {
+            const new_timestamp = timestamp();
+            self.timestamp = if (new_timestamp == self.timestamp) new_timestamp + 1 else new_timestamp;
+            try self.flushCompletions();
+        }
     }
 
-    fn flushCompletions(self: *Io, cqes: []linux.io_uring_cqe) !void {
-        self.metric.cqes += cqes.len;
-        for (cqes) |cqe| {
-            if (cqe.user_data == 0) continue; // no op for this cqe
+    fn flushCompletions(self: *Io) !void {
+        while (self.cqe_buf_head < self.cqe_buf_tail) : (self.cqe_buf_head += 1) {
+            const cqe = self.cqe_buf[self.cqe_buf_head];
+
+            // There is no op for this cqe
+            if (cqe.user_data == 0) continue;
+
             const op: *Op = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-            if (op.context == 0) {
-                if (!flagMore(cqe)) self.release(op);
-                continue;
-            }
-            while (true) {
-                const res = op.callback(op, cqe) catch |err| {
-                    log.err("callback failed {}", .{err});
-                    switch (err) {
-                        error.SubmissionQueueFull => {
-                            _ = self.ring.submit() catch |submit_err| switch (submit_err) {
-                                error.SignalInterrupt => continue,
-                                else => return submit_err,
-                            };
-                        },
-                        else => return err,
-                    }
-                    return err;
-                };
-                if (!flagMore(cqe)) {
-                    switch (res) {
-                        .done => self.release(op),
-                        .restart => {
-                            self.metric.restart(op);
-                            try op.prep();
-                        },
-                    }
-                }
-                break;
+            const res = if (op.context != 0)
+                try op.callback(op, cqe) // Do operation callback
+            else
+                .done; // There is no callback for this op
+            if (flagMore(cqe)) continue; // Wait for next cqe of the same operation
+            switch (res) {
+                .done => {
+                    self.release(op);
+                    self.metric.complete(op);
+                },
+                .restart => {
+                    try op.prep();
+                    self.metric.restart(op);
+                },
             }
         }
     }
@@ -597,7 +590,6 @@ pub const Op = struct {
     }
 
     fn prep(op: *Op) !void {
-        op.io.metric.submit(op);
         const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
         switch (op.args) {
             .accept => |*arg| _ = try op.io.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),
@@ -611,6 +603,7 @@ pub const Op = struct {
             .timer => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, 0),
             .socket => |*arg| _ = try op.io.ring.socket(@intFromPtr(op), arg.domain, arg.socket_type, arg.protocol, 0),
         }
+        op.io.metric.submit(op);
     }
 
     fn accept(

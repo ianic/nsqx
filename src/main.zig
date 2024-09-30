@@ -55,7 +55,33 @@ pub fn main() !void {
     { // Run loop
         catchSignals();
         while (true) {
-            try io.tick();
+            io.tick() catch |err| {
+                if (err != error.SignalInterrupt) log.err("io.tick failed {}", .{err});
+                switch (err) {
+                    error.OutOfMemory => {
+                        if (builtin.mode == .ReleaseFast) mallocTrim();
+                    },
+                    // Next tick will ring.submit at start
+                    error.SubmissionQueueFull => {},
+
+                    // io_uring enter errors
+                    // ref: https://manpages.debian.org/unstable/liburing-dev/io_uring_enter.2.en.html#RETURN_VALUE
+                    error.SignalInterrupt => {},
+                    // hopefully transient errors
+                    error.SystemResources,
+                    error.CompletionQueueOvercommitted,
+                    => {},
+                    // fatal errors
+                    error.FileDescriptorInvalid,
+                    error.FileDescriptorInBadState,
+                    error.SubmissionQueueEntryInvalid,
+                    error.BufferInvalid,
+                    error.RingShuttingDown,
+                    error.OpcodeNotSupported,
+                    error.Unexpected,
+                    => break,
+                }
+            };
 
             const sig = signal.load(.monotonic);
             if (sig != 0) {
