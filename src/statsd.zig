@@ -91,6 +91,7 @@ pub const Connector = struct {
 
     fn generate(self: *Self) Error!void {
         var writer = MetricWriter.init(self.allocator, self.prefix);
+        errdefer writer.deinit();
         self.server.writeMetrics(&writer) catch |err| {
             log.err("server write metrics error {}", .{err});
             return;
@@ -126,7 +127,9 @@ pub const Connector = struct {
         }
     }
 
-    fn sendFailed(_: *Self, err: anyerror) Error!void {
+    fn sendFailed(self: *Self, err: anyerror) Error!void {
+        self.allocator.free(self.iter.buf);
+        self.iter = .{};
         log.err("send failed {}", .{err});
     }
 
@@ -193,6 +196,10 @@ pub const MetricWriter = struct {
         const buf = try self.list.toOwnedSlice();
         self.list.deinit();
         return buf;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.list.deinit();
     }
 };
 
