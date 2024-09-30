@@ -333,12 +333,13 @@ pub const Io = struct {
         context: anytype,
         comptime ticked: fn (@TypeOf(context)) Error!void,
         comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
-    ) !*Op {
+        op_field: *?*Op,
+    ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
         op.* = Op.timer(self, nsec, context, ticked, failed);
         try op.prep();
-        return op;
+        op_field.* = op;
     }
 
     pub fn socketCreate(
@@ -425,6 +426,7 @@ pub const Io = struct {
                     switch (res) {
                         .done => self.release(op),
                         .restart => {
+                            log.err("op restart", .{});
                             self.metric.restart(op);
                             try op.prep();
                         },
@@ -492,7 +494,7 @@ pub const Io = struct {
 
             const delay = fire_at - now_;
             try self.reset();
-            self.op = try self.io.timer(delay, self, ticked, failed);
+            try self.io.timer(delay, self, ticked, failed, &self.op);
             self.fire_at = fire_at;
         }
 
@@ -507,12 +509,10 @@ pub const Io = struct {
         }
 
         fn ticked(self: *Self) Error!void {
-            self.op = null;
             try self.callback(self);
         }
 
-        fn failed(self: *Self, err: anyerror) Error!void {
-            self.op = null;
+        fn failed(_: *Self, err: anyerror) Error!void {
             log.err("timer failed {}", .{err});
         }
     };
@@ -724,7 +724,9 @@ pub const Op = struct {
                     .NOBUFS => {
                         op.io.metric.recv_buf_grp.no_bufs +%= 1;
                     },
-                    .INTR => {},
+                    .INTR => {
+                        log.err("recv intr", .{});
+                    },
                     else => |errno| {
                         op.op_field.* = null;
                         try failed(ctx, errFromErrno(errno));
@@ -829,7 +831,10 @@ pub const Op = struct {
                         op.op_field.* = null;
                         try sent(ctx);
                     },
-                    .INTR => return .restart,
+                    .INTR => {
+                        log.err("sendv intr", .{});
+                        return .restart;
+                    },
                     else => |errno| {
                         op.op_field.* = null;
                         try failed(ctx, errFromErrno(errno));
@@ -908,7 +913,9 @@ pub const Op = struct {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS, .TIME => try ticked(ctx),
-                    .INTR => {},
+                    .INTR => {
+                        log.err("ticker intr", .{});
+                    },
                     else => |errno| {
                         op.op_field.* = null;
                         if (failed) |f| try f(ctx, errFromErrno(errno));
