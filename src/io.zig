@@ -337,7 +337,7 @@ pub const Io = struct {
     ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.timer(self, nsec, context, ticked, failed);
+        op.* = Op.timer(self, nsec, context, ticked, failed, op_field);
         try op.prep();
         op_field.* = op;
     }
@@ -722,11 +722,10 @@ pub const Op = struct {
                         op.io.metric.recv_buf_grp.success +%= 1;
                     },
                     .NOBUFS => {
+                        log.info("recv nobufs", .{});
                         op.io.metric.recv_buf_grp.no_bufs +%= 1;
                     },
-                    .INTR => {
-                        log.err("recv intr", .{});
-                    },
+                    .INTR => {},
                     else => |errno| {
                         op.op_field.* = null;
                         try failed(ctx, errFromErrno(errno));
@@ -831,10 +830,7 @@ pub const Op = struct {
                         op.op_field.* = null;
                         try sent(ctx);
                     },
-                    .INTR => {
-                        log.err("sendv intr", .{});
-                        return .restart;
-                    },
+                    .INTR => return .restart,
                     else => |errno| {
                         op.op_field.* = null;
                         try failed(ctx, errFromErrno(errno));
@@ -913,9 +909,7 @@ pub const Op = struct {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS, .TIME => try ticked(ctx),
-                    .INTR => {
-                        log.err("ticker intr", .{});
-                    },
+                    .INTR => {},
                     else => |errno| {
                         op.op_field.* = null;
                         if (failed) |f| try f(ctx, errFromErrno(errno));
@@ -942,14 +936,16 @@ pub const Op = struct {
         context: anytype,
         comptime ticked: fn (@TypeOf(context)) Error!void,
         comptime failed: ?fn (@TypeOf(context), anyerror) Error!void,
+        op_field: *?*Op,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
             fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
                 const ctx: Context = @ptrFromInt(op.context);
+                op.op_field.* = null;
                 switch (cqe.err()) {
                     .SUCCESS, .TIME => try ticked(ctx),
-                    //.INTR => return .restart,
+                    .INTR => return .restart,
                     else => |errno| if (failed) |f| try f(ctx, errFromErrno(errno)),
                 }
                 return .done;
@@ -960,7 +956,7 @@ pub const Op = struct {
         return .{
             .io = io,
             .context = @intFromPtr(context),
-            .op_field = undefined,
+            .op_field = op_field,
             .callback = wrapper.complete,
             .args = .{ .timer = .{ .sec = @intCast(sec), .nsec = @intCast(ns) } },
         };

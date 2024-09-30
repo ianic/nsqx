@@ -111,7 +111,7 @@ pub fn broadcastAddress(self: Options) []const u8 {
 pub fn deinit(self: *Options, allocator: mem.Allocator) void {
     allocator.free(self.hostname);
     if (self.broadcast_address) |ba| allocator.free(ba);
-    if (self.lookup_tcp_addresses.len > 0) allocator.free(self.lookup_tcp_addresses);
+    allocator.free(self.lookup_tcp_addresses);
     allocator.free(self.statsd.prefix);
 }
 
