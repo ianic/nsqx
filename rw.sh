@@ -10,6 +10,7 @@ set -e
 
 cd ~/Code/nsql
 zig build -Doptimize=ReleaseFast
+#zig build
 
 cd ~/Code/go/nsq/bench/bench_writer/
 go build
@@ -17,7 +18,9 @@ cd ~/Code/go/nsq/bench/bench_reader/
 go build
 
 cd ~/Code/nsql
-./zig-out/bin/nsql --statsd-address localhost --statsd-prefix "" > tmp/nsql 2>&1 &
+#./zig-out/bin/nsql --statsd-address localhost --statsd-prefix "" > tmp/nsql 2>&1 &
+./zig-out/bin/nsql  > tmp/nsql 2>&1 &
+# ~/Code/go/nsq/apps/nsqd/nsqd --mem-queue-size=100000000 > tmp/nsql 2>&1 &
 nsqd_pid=$!
 
 #sh -c 'while pkill -usr1 nsql; do sleep 10; done' &

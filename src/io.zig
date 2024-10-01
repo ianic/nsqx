@@ -30,7 +30,7 @@ pub const Io = struct {
     recv_buf_grp: IoUring.BufferGroup = undefined,
     metric: Metric = .{},
     metric_prev: Metric = .{},
-    cqe_buf: []linux.io_uring_cqe = undefined,
+    cqe_buf: [256]linux.io_uring_cqe = undefined,
     cqe_buf_head: usize = 0,
     cqe_buf_tail: usize = 0,
 
@@ -174,8 +174,6 @@ pub const Io = struct {
     }
 
     pub fn init(self: *Io, allocator: mem.Allocator, opt: Options) !void {
-        const cqe_buf = try allocator.alloc(linux.io_uring_cqe, opt.entries);
-        errdefer allocator.free(cqe_buf);
         var op_pool = try std.heap.MemoryPool(Op).initPreheated(allocator, 1024);
         errdefer op_pool.deinit();
         var ring = try IoUring.init(opt.entries, linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER);
@@ -185,7 +183,6 @@ pub const Io = struct {
             .ring = ring,
             .timestamp = timestamp(),
             .op_pool = op_pool,
-            .cqe_buf = cqe_buf,
         };
         if (opt.recv_buffers > 0) {
             self.recv_buf_grp = try self.initBufferGroup(1, opt.recv_buffers, opt.recv_buffer_len);
@@ -207,7 +204,6 @@ pub const Io = struct {
         }
         self.ring.deinit();
         self.op_pool.deinit();
-        self.allocator.free(self.cqe_buf);
     }
 
     fn acquire(self: *Io) !*Op {
@@ -389,16 +385,16 @@ pub const Io = struct {
     pub fn tick(self: *Io) !void {
         self.metric.loops += 1;
         _ = try self.ring.submit();
-        if (self.cqe_buf_tail <= self.cqe_buf_head) {
+        if (self.cqe_buf_head >= self.cqe_buf_tail) {
             self.cqe_buf_head = 0;
             self.cqe_buf_tail = 0;
-            const n = try self.ring.copy_cqes(self.cqe_buf, 1);
+            const n = try self.ring.copy_cqes(&self.cqe_buf, 1);
             self.cqe_buf_tail = n;
             self.metric.cqes += n;
         }
-        if (self.cqe_buf_tail > self.cqe_buf_head) {
+        if (self.cqe_buf_head < self.cqe_buf_tail) {
             const new_timestamp = timestamp();
-            self.timestamp = if (new_timestamp == self.timestamp) new_timestamp + 1 else new_timestamp;
+            self.timestamp = if (new_timestamp <= self.timestamp) self.timestamp + 1 else new_timestamp;
             try self.flushCompletions();
         }
     }

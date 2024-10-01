@@ -43,6 +43,8 @@ cd ~/Code/nsql
   --statsd-prefix "" &
 nsql_pid=$!
 
+sleep 1
+
 nsq_tail -nsqd-tcp-address localhost:4150 -channel channel1 -topic topic1  | sed "s/^/[channel1] /" &
 
 nsq_tail -nsqd-tcp-address localhost:4150 -channel channel2 -topic topic1  | sed "s/^/[channel2 conusmer1] /" &
