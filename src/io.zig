@@ -414,8 +414,8 @@ pub const Io = struct {
             if (flagMore(cqe)) continue; // Wait for next cqe of the same operation
             switch (res) {
                 .done => {
-                    self.release(op);
                     self.metric.complete(op);
+                    self.release(op);
                 },
                 .restart => {
                     try op.prep();
