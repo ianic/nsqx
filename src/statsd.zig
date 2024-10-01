@@ -136,8 +136,10 @@ pub const Connector = struct {
     pub fn close(self: *Self) !void {
         try Op.cancel(self.connect_op);
         try Op.cancel(self.ticker_op);
-        if (self.send_op) |_| self.allocator.free(self.iter.buf);
-        Op.unsubscribe(self.send_op);
+        if (self.socket != 0) {
+            try self.io.close(self.socket);
+            self.socket = 0;
+        }
     }
 };
 

@@ -115,7 +115,7 @@ pub const Io = struct {
                 .writev => self.writev.submit(),
                 .send, .sendv => self.sendv.submit(),
                 .ticker, .timer => self.ticker.submit(),
-                .socket => {},
+                .socket, .shutdown => {},
             }
         }
 
@@ -129,7 +129,7 @@ pub const Io = struct {
                 .writev => self.writev.complete(),
                 .send, .sendv => self.sendv.complete(),
                 .ticker, .timer => self.ticker.complete(),
-                .socket => {},
+                .socket, .shutdown => {},
             }
         }
 
@@ -143,7 +143,7 @@ pub const Io = struct {
                 .writev => self.writev.restart(),
                 .send, .sendv => self.sendv.restart(),
                 .ticker, .timer => self.ticker.restart(),
-                .socket => {},
+                .socket, .shutdown => {},
             }
         }
     };
@@ -364,11 +364,48 @@ pub const Io = struct {
         op_field.* = op;
     }
 
+    pub fn shutdownClose(
+        self: *Io,
+        socket: socket_t,
+        context: anytype,
+        comptime closed: fn (@TypeOf(context)) Error!void,
+        op_field: *?*Op,
+    ) !void {
+        const op = try self.acquire();
+        errdefer self.release(op);
+        op.* = Op.shutdownClose(self, socket, context, closed, op_field);
+        try op.prep();
+        op_field.* = op;
+    }
+
+    pub fn close2(
+        self: *Io,
+        socket: socket_t,
+        context: anytype,
+        comptime closed: fn (@TypeOf(context)) Error!void,
+        op_field: *?*Op,
+    ) !void {
+        const op = try self.acquire();
+        errdefer self.release(op);
+        op.* = Op.close2(self, socket, context, closed, op_field);
+        try op.prep();
+        op_field.* = op;
+    }
+
     pub fn close(self: *Io, socket: socket_t) !void {
         const op = try self.acquire();
         errdefer self.release(op);
         op.* = Op.close(self, socket);
         try op.prep();
+    }
+
+    // Prepare cancel operation without callback.
+    // Op will get error OperationCanceled in fail callback.
+    pub fn cancel(self: *Io, op: *Op) !void {
+        switch (op.args) {
+            .timer, .ticker => _ = try self.ring.timeout_remove(0, @intFromPtr(op), 0),
+            else => _ = try self.ring.cancel(0, @intFromPtr(op), 0),
+        }
     }
 
     fn loop(self: *Io, run: Atomic(bool)) !void {
@@ -553,6 +590,7 @@ pub const Op = struct {
             socket_type: u32,
             protocol: u32,
         },
+        shutdown: socket_t,
     };
 
     const Kind = enum {
@@ -566,6 +604,7 @@ pub const Op = struct {
         ticker,
         timer,
         socket,
+        shutdown,
     };
 
     pub fn unsubscribe(maybe_op: ?*Op) void {
@@ -598,6 +637,7 @@ pub const Op = struct {
             .ticker => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, IORING_TIMEOUT_MULTISHOT),
             .timer => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, 0),
             .socket => |*arg| _ = try op.io.ring.socket(@intFromPtr(op), arg.domain, arg.socket_type, arg.protocol, 0),
+            .shutdown => |socket| _ = try op.io.ring.shutdown(@intFromPtr(op), socket, 2),
         }
         op.io.metric.submit(op);
     }
@@ -698,6 +738,7 @@ pub const Op = struct {
                     .SUCCESS => {
                         const n: usize = @intCast(cqe.res);
                         if (n == 0) {
+                            op.op_field.* = null;
                             try failed(ctx, error.EndOfFile);
                             return .done;
                         }
@@ -978,6 +1019,57 @@ pub const Op = struct {
             .op_field = op_field,
             .callback = wrapper.complete,
             .args = .{ .socket = .{ .domain = domain, .socket_type = socket_type, .protocol = protocol } },
+        };
+    }
+
+    fn shutdownClose(
+        io: *Io,
+        socket: socket_t,
+        context: anytype,
+        comptime closed: fn (@TypeOf(context)) Error!void,
+        op_field: *?*Op,
+    ) Op {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
+                _ = cqe;
+                const ctx: Context = @ptrFromInt(op.context);
+                try op.io.close2(op.args.shutdown, ctx, closed, op.op_field);
+                return .done;
+            }
+        };
+        return .{
+            .io = io,
+            .context = @intFromPtr(context),
+            .op_field = op_field,
+            .callback = wrapper.complete,
+            .args = .{ .shutdown = socket },
+        };
+    }
+
+    fn close2(
+        io: *Io,
+        socket: socket_t,
+        context: anytype,
+        comptime closed: fn (@TypeOf(context)) Error!void,
+        op_field: *?*Op,
+    ) Op {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
+                _ = cqe;
+                const ctx: Context = @ptrFromInt(op.context);
+                op.op_field.* = null;
+                try closed(ctx);
+                return .done;
+            }
+        };
+        return .{
+            .io = io,
+            .context = @intFromPtr(context),
+            .op_field = op_field,
+            .callback = wrapper.complete,
+            .args = .{ .close = socket },
         };
     }
 

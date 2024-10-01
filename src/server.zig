@@ -886,7 +886,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     for (self.consumers.items, 0..) |item, i| {
                         if (item == consumer) {
                             _ = self.consumers.swapRemove(i);
-                            return;
+                            break;
                         }
                     }
                 }
