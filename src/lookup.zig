@@ -159,17 +159,15 @@ const Conn = struct {
     send_op: ?*Op = null,
     recv_op: ?*Op = null,
     ticker_op: ?*Op = null,
-    state: State = .init,
+    state: State = .connecting,
 
     const ping_msg = "PING\n";
     const ping_interval = 15 * 1000; // in milliseconds
 
     const State = enum {
-        init,
         connecting,
         connected,
         disconnected,
-        closing,
         closed,
     };
 
@@ -207,7 +205,6 @@ const Conn = struct {
             try self.io.close(self.socket);
             self.socket = 0;
         }
-        self.state = .connecting;
         try self.io.socketCreate(
             self.address.any.family,
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
@@ -217,6 +214,7 @@ const Conn = struct {
             socketFailed,
             &self.connect_op,
         );
+        self.state = .connecting;
     }
 
     fn tick(self: *Self) Error!void {
@@ -227,22 +225,22 @@ const Conn = struct {
         }
     }
 
-    fn tickerFailed(_: *Self, err: anyerror) Error!void {
+    fn tickerFailed(self: *Self, err: anyerror) Error!void {
         switch (err) {
             error.OperationCanceled => {},
-            else => log.err("ticker failed {}", .{err}),
+            else => log.err("{} ticker failed {}", .{ self.address, err }),
         }
     }
 
     fn socketCreated(self: *Self, socket: socket_t) Error!void {
+        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, &self.connect_op);
         self.socket = socket;
         self.state = .connecting;
-        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, &self.connect_op);
     }
 
     fn socketFailed(self: *Self, err: anyerror) Error!void {
         self.disconnect();
-        log.err("socket create failed {}", .{err});
+        log.err("{} socket create failed {}", .{ self.address, err });
     }
 
     fn connectFailed(self: *Self, err: anyerror) Error!void {
@@ -251,10 +249,10 @@ const Conn = struct {
     }
 
     fn connected(self: *Self) Error!void {
-        self.state = .connected;
         try self.send(self.connector.identify);
         try self.recv();
         try self.connector.connect(self);
+        self.state = .connected;
         log.debug("{} connected", .{self.address});
     }
 
@@ -307,7 +305,7 @@ const Conn = struct {
             }
             if (msg[0] == '{' and msg[msg.len - 1] == '}') {
                 // identify response
-                log.debug("{} identify: {s}", .{ self.socket, msg });
+                log.debug("{} identify: {s}", .{ self.address, msg });
                 continue;
             }
             // error
@@ -322,15 +320,13 @@ const Conn = struct {
 
     fn recvFailed(self: *Self, err: anyerror) Error!void {
         switch (err) {
-            error.EndOfFile => {},
-            error.ConnectionResetByPeer => {},
+            error.EndOfFile, error.ConnectionResetByPeer => {},
             else => log.err("{} recv failed {}", .{ self.address, err }),
         }
         if (self.state == .connected) self.disconnect();
     }
 
     pub fn close(self: *Self) !void {
-        self.state = .closing;
         try Op.cancel(self.connect_op);
         try Op.cancel(self.send_op);
         try Op.cancel(self.recv_op);
