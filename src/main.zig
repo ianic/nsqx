@@ -58,7 +58,11 @@ pub fn main() !void {
             io.tick() catch |err| {
                 if (err != error.SignalInterrupt) log.err("io.tick failed {}", .{err});
                 switch (err) {
+                    // OutOfMemory
+                    // SubmissionQueueFull - when unable to prepare io operation
+                    // all other errors are io_uring enter specific
                     error.OutOfMemory => {
+                        // Release glibc malloc memory
                         if (builtin.mode == .ReleaseFast) mallocTrim();
                     },
                     // Next tick will ring.submit at start
@@ -99,16 +103,6 @@ pub fn main() !void {
             }
         }
     }
-
-    // Cleanup
-    log.info("draining", .{});
-    if (statsd_connector) |*sc| try sc.close();
-    try server.stopTimers();
-    try lookup_connector.close();
-    try http_listener.close();
-    try tcp_listener.close();
-    try io.drain();
-    log.info("drain finished", .{});
 }
 
 pub fn socket(addr: net.Address) !posix.socket_t {

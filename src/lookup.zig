@@ -233,9 +233,9 @@ const Conn = struct {
     }
 
     fn socketCreated(self: *Self, socket: socket_t) Error!void {
-        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, &self.connect_op);
         self.socket = socket;
         self.state = .connecting;
+        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, &self.connect_op);
     }
 
     fn socketFailed(self: *Self, err: anyerror) Error!void {
