@@ -628,6 +628,11 @@ pub const Op = struct {
 
     fn prep(op: *Op) !void {
         const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
+
+        // TODO timeout on connect or any other non multishot operation can be implemented like
+        //sqe.flags |= linux.IOSQE_IO_LINK;
+        //_ = try op.io.ring.link_timeout(1, &timeout_ts, linux.IORING_TIMEOUT_ETIME_SUCCESS);
+
         switch (op.args) {
             .accept => |*arg| _ = try op.io.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),
             .connect => |*arg| _ = try op.io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen()),
