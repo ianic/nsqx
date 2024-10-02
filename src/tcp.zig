@@ -111,6 +111,7 @@ pub const Conn = struct {
     pending_response: ?Response = null,
     ready_count: u32 = 0,
     in_flight: u32 = 0,
+    heartbeat_interval: u32 = 0,
     outstanding_heartbeats: u8 = 0,
     send_vec: SendVec = .{},
     recv_buf: RecvBuf, // Unprocessed bytes from previous receive
@@ -140,6 +141,9 @@ pub const Conn = struct {
         heartbeat,
     };
 
+    // Until client set's connection heartbeat interval in identify message.
+    const initial_heartbeat = 10000;
+
     fn init(self: *Conn, listener: *Listener, socket: socket_t, addr: std.net.Address) !void {
         self.* = .{
             .allocator = listener.allocator,
@@ -154,7 +158,10 @@ pub const Conn = struct {
         try self.send_vec.init(self.allocator);
         errdefer self.send_vec.deinit(self.allocator);
         try self.io.recv(self.socket, self, received, recvFailed, &self.recv_op);
-        self.initTicker(self.listener.options.max_heartbeat_interval) catch {};
+        self.initTicker(initial_heartbeat) catch |err| {
+            log.err("{} failed to set initial heartbeat {}", .{ socket, err });
+        };
+        log.debug("{} connected", .{socket});
     }
 
     fn deinit(self: *Conn) void {
@@ -163,12 +170,14 @@ pub const Conn = struct {
         self.send_vec.deinit(self.allocator);
     }
 
-    fn initTicker(self: *Conn, heartbeat_interval: i64) !void {
-        if (heartbeat_interval == 0) return;
-        log.debug("{} heartbeat interval: {}", .{ self.socket, heartbeat_interval });
-        try Op.cancel(self.ticker_op);
-        const msec: i64 = @divTrunc(heartbeat_interval, 2);
+    fn initTicker(self: *Conn, heartbeat_interval: u32) !void {
+        if (self.ticker_op != null and heartbeat_interval == self.heartbeat_interval) return;
+        self.heartbeat_interval = heartbeat_interval;
+        if (self.ticker_op) |op| return try self.io.cancel(op);
+
+        const msec: u32 = @divTrunc(self.heartbeat_interval, 2);
         try self.io.ticker(msec, self, tick, tickerFailed, &self.ticker_op);
+        // log.debug("{} heartbeat interval: {}", .{ self.socket, self.heartbeat_interval });
     }
 
     // Channel api -----------------
@@ -222,7 +231,7 @@ pub const Conn = struct {
             return try self.shutdown();
         }
         if (self.outstanding_heartbeats > 0) {
-            log.debug("{} send heartbeat", .{self.socket});
+            log.debug("{} heartbeat", .{self.socket});
             try self.respond(.heartbeat);
         }
         self.outstanding_heartbeats += 1;
@@ -230,7 +239,9 @@ pub const Conn = struct {
 
     fn tickerFailed(self: *Conn, err: anyerror) Error!void {
         switch (err) {
-            error.OperationCanceled => {},
+            error.OperationCanceled => {
+                if (self.state != .closing) return try self.initTicker(self.heartbeat_interval);
+            },
             else => log.err("{} ticker failed {}", .{ self.socket, err }),
         }
         try self.shutdown();
@@ -268,8 +279,7 @@ pub const Conn = struct {
         switch (msg) {
             .identify => {
                 self.identify = try msg.parseIdentify(self.allocator, options);
-                if (self.identify.heartbeat_interval != options.max_heartbeat_interval or self.ticker_op == null)
-                    try self.initTicker(self.identify.heartbeat_interval);
+                try self.initTicker(self.identify.heartbeat_interval);
                 try self.respond(.ok);
                 log.debug("{} identify {}", .{ self.socket, self.identify });
             },
@@ -394,7 +404,7 @@ pub const Conn = struct {
     }
 
     pub fn shutdown(self: *Conn) !void {
-        log.debug("{} shutdown", .{self.socket});
+        log.debug("{} shutdown state: {s}", .{ self.socket, @tagName(self.state) });
         // Shutdown already in process
         if (self.state == .closing) return try self.closed();
 
@@ -411,13 +421,13 @@ pub const Conn = struct {
 
     fn closed(self: *Conn) Error!void {
         assert(self.state == .closing);
-        log.debug("{} closed recv: {} ticker: {} send: {} close: {}", .{
-            self.socket,
-            self.recv_op == null,
-            self.ticker_op == null,
-            self.send_op == null,
-            self.close_op == null,
-        });
+        // log.debug("{} closed recv: {} ticker: {} send: {} close: {}", .{
+        //     self.socket,
+        //     self.recv_op == null,
+        //     self.ticker_op == null,
+        //     self.send_op == null,
+        //     self.close_op == null,
+        // });
 
         // Ensure that all operations are finished
         if (self.ticker_op) |op| return try self.io.cancel(op);
@@ -427,6 +437,7 @@ pub const Conn = struct {
         // Safe to unsubscribe, no buffers in kernel when send is finished.
         if (self.channel) |channel| try channel.unsubscribe(self);
 
+        log.debug("{} closed", .{self.socket});
         self.deinit();
         self.listener.remove(self);
     }
