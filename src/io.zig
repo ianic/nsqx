@@ -444,11 +444,11 @@ pub const Io = struct {
             if (cqe.user_data == 0) continue;
 
             const op: *Op = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-            const res = if (op.context != 0)
+            var res = if (op.context != 0)
                 try op.callback(op, cqe) // Do operation callback
             else
                 .done; // There is no callback for this op
-            if (flagMore(cqe)) continue; // Wait for next cqe of the same operation
+            if (flagMore(cqe)) res = .has_more;
             switch (res) {
                 .done => {
                     self.metric.complete(op);
@@ -458,6 +458,7 @@ pub const Io = struct {
                     try op.prep();
                     self.metric.restart(op);
                 },
+                .has_more => {},
             }
         }
     }
@@ -557,6 +558,7 @@ pub const Op = struct {
     const CallbackResult = enum {
         done,
         restart,
+        has_more,
     };
 
     const Args = union(Kind) {
