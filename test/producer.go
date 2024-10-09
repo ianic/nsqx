@@ -6,13 +6,13 @@ import (
 	"log"
 	"math/rand/v2"
 	"sync"
-	//"time"
+	"time"
 	// "os"
 	// "os/signal"
 	// "syscall"
 )
 
-func main0() {
+func main() {
 	// cfg := nsq.NewConfig()
 
 	// producer, err := nsq.NewProducer("127.0.0.1:4150", cfg)
@@ -25,7 +25,7 @@ func main0() {
 	// }
 
 	var wg sync.WaitGroup
-	for i := 0; i < 128; i++ {
+	for i := 1; i < 16; i++ {
 		wg.Add(1)
 		go func(j int) {
 			topic := fmt.Sprintf("topic-%03d", j)
@@ -43,12 +43,18 @@ func main0() {
 
 func pub(topic string) {
 	cfg := nsq.NewConfig()
+	cfg.HeartbeatInterval = 1 * time.Second
+	cfg.LookupdPollInterval = 1 * time.Second // reconnection
+	cfg.MaxBackoffDuration = 1 * time.Second
+	cfg.ReadTimeout = 1 * time.Second
+	cfg.WriteTimeout = 1 * time.Second
+
 	producer, err := nsq.NewProducer("127.0.0.1:4150", cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	for j := 0; j < 1024*1024; j++ {
+	for j := 0; j < 128; j++ {
 		size := rand.IntN(1024 * 16)
 		batchSize := rand.IntN(256)
 
@@ -65,10 +71,11 @@ func pub(topic string) {
 			log.Fatal(err)
 		}
 	}
+	print(topic, " done\n")
 	producer.Stop()
 }
 
-func main() {
+func main0() {
 	cfg := nsq.NewConfig()
 
 	producer, err := nsq.NewProducer("127.0.0.1:4150", cfg)
@@ -80,8 +87,8 @@ func main() {
 		log.Fatal(err)
 	}
 	for i := 0; i < 1; i++ {
-		//msg := fmt.Sprintf("%d %d", i, time.Now().Unix())
-		msg := make([]byte, 0)
+		msg := fmt.Sprintf("%d %d", i, time.Now().Unix())
+		//msg := make([]byte, 0)
 
 		if producer.Publish("topic-001", []byte(msg)); err != nil {
 			log.Fatal(err)

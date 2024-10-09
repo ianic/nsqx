@@ -15,11 +15,11 @@ import (
 func main() {
 	cfg := nsq.NewConfig()
 	cfg.MaxInFlight = 1
-	// cfg.HeartbeatInterval = 5 * time.Second
+	cfg.HeartbeatInterval = 5 * time.Second
 	cfg.MsgTimeout = 2 * time.Second
 	cfg.LookupdPollInterval = 5 * time.Second
 
-	consumer, err := nsq.NewConsumer("topic-001", "001", cfg)
+	consumer, err := nsq.NewConsumer("topic", "001", cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
