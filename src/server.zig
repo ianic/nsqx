@@ -339,6 +339,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                 fn deinitChannel(self: *Topic, channel: *Channel) void {
                     const key = channel.name;
+                    // TODO: ovome nije mjesto u deinit, ali je potreban u delete channel
                     self.server.notifier.channelDeleted(self.name, channel.name);
                     channel.deinit();
                     self.allocator.free(key);
@@ -644,6 +645,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                 fn deinit(self: *Channel) void {
                     self.timer.close() catch {};
+                    // TODO: ovo treba kada ga brisem ali ne u deinit
                     for (self.consumers.items) |consumer| consumer.channelClosed();
                     for (self.in_flight.values()) |cm| cm.destroy(self.allocator);
                     while (self.deferred.removeOrNull()) |cm| cm.destroy(self.allocator);
@@ -870,17 +872,10 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     return false;
                 }
 
-                pub fn unsubscribe(self: *Channel, consumer: *Consumer) !void {
-                    { // Remove in_flight messages of that consumer
-                        var msgs = std.ArrayList(*Msg).init(self.allocator);
-                        defer msgs.deinit();
-                        for (self.in_flight.values()) |msg| {
-                            if (msg.in_flight_socket == consumer.socket)
-                                try msgs.append(msg);
-                        }
-                        for (msgs.items) |msg| try self.deffer(msg, 0);
-                        self.metric.requeue += msgs.items.len;
-                    }
+                pub fn unsubscribe(self: *Channel, consumer: *Consumer) void {
+                    self.removeInFlight(consumer.socket) catch |err| {
+                        log.warn("failed to remove in flight messages for socket {}, {}", .{ consumer.socket, err });
+                    };
 
                     // Remove consumer
                     for (self.consumers.items, 0..) |item, i| {
@@ -889,6 +884,17 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                             break;
                         }
                     }
+                }
+
+                fn removeInFlight(self: *Channel, socket: socket_t) !void {
+                    var msgs = std.ArrayList(*Msg).init(self.allocator);
+                    defer msgs.deinit();
+                    for (self.in_flight.values()) |msg| {
+                        if (msg.in_flight_socket == socket)
+                            try msgs.append(msg);
+                    }
+                    for (msgs.items) |msg| try self.deffer(msg, 0);
+                    self.metric.requeue += msgs.items.len;
                 }
 
                 /// Consumer calls this when ready to send more messages.
