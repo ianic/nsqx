@@ -438,11 +438,22 @@ pub const Conn = struct {
         if (self.send_op != null) return;
         if (self.close_op != null) return;
         // Safe to unsubscribe, no buffers in kernel when send is finished.
-        if (self.channel) |channel| try channel.unsubscribe(self);
+        if (self.channel) |channel| channel.unsubscribe(self);
 
         log.debug("{} closed", .{self.socket});
         self.deinit();
         self.listener.remove(self);
+    }
+
+    pub fn printStatus(self: *Conn) void {
+        std.debug.print("  socket {} state: {s}, is done? recv: {} ticker: {} send: {} close: {}\n", .{
+            self.socket,
+            @tagName(self.state),
+            self.recv_op == null,
+            self.ticker_op == null,
+            self.send_op == null,
+            self.close_op == null,
+        });
     }
 };
 
