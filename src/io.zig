@@ -176,7 +176,16 @@ pub const Io = struct {
     pub fn init(self: *Io, allocator: mem.Allocator, opt: Options) !void {
         var op_pool = try std.heap.MemoryPool(Op).initPreheated(allocator, 1024);
         errdefer op_pool.deinit();
-        var ring = try IoUring.init(opt.entries, linux.IORING_SETUP_SQPOLL | linux.IORING_SETUP_SINGLE_ISSUER);
+        // Flags reference: https://nick-black.com/dankwiki/index.php/Io_uring
+        const flags =
+            // Create a kernel thread to poll on the submission queue. If the
+            // submission queue is kept busy, this thread will reap SQEs without
+            // the need for a system call.
+            linux.IORING_SETUP_SQPOLL |
+            // Hint to the kernel that only a single thread will submit
+            // requests, allowing for optimizations.
+            linux.IORING_SETUP_SINGLE_ISSUER;
+        var ring = try IoUring.init(opt.entries, flags);
         errdefer ring.deinit();
         self.* = .{
             .allocator = allocator,
