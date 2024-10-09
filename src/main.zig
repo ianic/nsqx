@@ -32,10 +32,9 @@ pub fn main() !void {
 
     var lookup_connector: lookup.Connector = undefined;
     var server = tcp.Server.init(allocator, &io, &lookup_connector);
-    defer server.deinit();
-
     try lookup_connector.init(allocator, &io, &server, options.lookup_tcp_addresses);
     defer lookup_connector.deinit();
+    defer server.deinit();
 
     var tcp_listener: tcp.Listener = undefined;
     try tcp_listener.init(allocator, &io, &server, options, try socket(options.tcp_address));
@@ -155,9 +154,10 @@ fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
     while (ti.next()) |te| {
         const topic_name = te.key_ptr.*;
         const topic = te.value_ptr.*;
-        print("  {s} depth: {d}  sequence: {}\n", .{
+        print("  {s} depth: {d} bytes: {d} sequence: {}\n", .{
             topic_name,
             topic.metric.depth,
+            topic.metric.depth_bytes,
             topic.sequence,
         });
 
@@ -178,6 +178,13 @@ fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
                 channel.metric.requeue,
             });
         }
+    }
+
+    print("listener connections: {}\n", .{listener.conns.count()});
+    var iter = listener.conns.valueIterator();
+    while (iter.next()) |e| {
+        const conn = e.*;
+        conn.printStatus();
     }
 }
 
