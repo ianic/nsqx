@@ -22,9 +22,10 @@ pub fn ListenerType(comptime ConnType: type) type {
         allocator: mem.Allocator,
         server: *Server,
         options: Options,
+        socket: socket_t,
         io: *Io,
         op: ?*Op = null,
-        conns: std.AutoHashMap(socket_t, *ConnType),
+        conns: std.AutoHashMap(*ConnType, *ConnType),
         metric: struct {
             // Total number of
             accept: usize = 0, // accepted connections
@@ -46,7 +47,9 @@ pub fn ListenerType(comptime ConnType: type) type {
                 .server = server,
                 .options = options,
                 .io = io,
-                .conns = std.AutoHashMap(socket_t, *ConnType).init(allocator),
+                .socket = socket,
+                // TODO: moze li ovo jednostavnije
+                .conns = std.AutoHashMap(*ConnType, *ConnType).init(allocator),
             };
             errdefer self.deinit();
             try self.io.accept(socket, self, accepted, failed, &self.op);
@@ -67,7 +70,7 @@ pub fn ListenerType(comptime ConnType: type) type {
             errdefer self.allocator.destroy(conn);
             try self.conns.ensureUnusedCapacity(1);
             try conn.init(self, socket, addr);
-            self.conns.putAssumeCapacityNoClobber(socket, conn);
+            self.conns.putAssumeCapacityNoClobber(conn, conn);
             self.metric.accept +%= 1;
         }
 
@@ -78,16 +81,16 @@ pub fn ListenerType(comptime ConnType: type) type {
             }
         }
 
-        pub fn close(self: *Self) !void {
-            try Op.cancel(self.op);
-            var iter = self.conns.valueIterator();
-            while (iter.next()) |e| {
-                try e.*.shutdown();
-            }
-        }
+        // pub fn close(self: *Self) !void {
+        //     try Op.cancel(self.op);
+        //     var iter = self.conns.valueIterator();
+        //     while (iter.next()) |e| {
+        //         try e.*.shutdown();
+        //     }
+        // }
 
         pub fn remove(self: *Self, conn: *ConnType) void {
-            assert(self.conns.remove(conn.socket));
+            assert(self.conns.remove(conn));
             self.allocator.destroy(conn);
             self.metric.close +%= 1;
         }
