@@ -408,10 +408,18 @@ pub const Identify = struct {
         );
         defer parsed.deinit();
         const v = parsed.value;
+
+        const client_id = try allocator.dupe(u8, v.client_id);
+        errdefer allocator.free(client_id);
+        const hostname = try allocator.dupe(u8, v.hostname);
+        errdefer allocator.free(hostname);
+        const user_agent = try allocator.dupe(u8, v.user_agent);
+        errdefer allocator.free(user_agent);
+
         return .{
-            .client_id = try allocator.dupe(u8, v.client_id),
-            .hostname = try allocator.dupe(u8, v.hostname),
-            .user_agent = try allocator.dupe(u8, v.user_agent),
+            .client_id = client_id,
+            .hostname = hostname,
+            .user_agent = user_agent,
             .heartbeat_interval = if (v.heartbeat_interval == 0 or v.heartbeat_interval > opt.max_heartbeat_interval)
                 opt.max_heartbeat_interval
             else
@@ -425,7 +433,7 @@ pub const Identify = struct {
         };
     }
 
-    pub fn deinit(self: *Identify, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: Identify, allocator: std.mem.Allocator) void {
         allocator.free(self.client_id);
         allocator.free(self.hostname);
         allocator.free(self.user_agent);
