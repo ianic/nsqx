@@ -51,33 +51,34 @@ pub const Conn = struct {
     }
 
     fn received(self: *Conn, bytes: []const u8) Error!void {
-        if (self.send_op != null) return try self.shutdown();
+        if (self.send_op != null) return self.shutdown();
         assert(self.arena == null);
 
         self.arena = std.heap.ArenaAllocator.init(self.gpa);
         errdefer self.sendDeinit();
         const allocator = self.arena.?.allocator();
 
-        var body_list = std.ArrayList(u8).init(allocator);
-        defer body_list.deinit();
-        const writer = body_list.writer().any();
+        var body_bytes = std.ArrayList(u8).init(allocator);
+        defer body_bytes.deinit();
+        const writer = body_bytes.writer().any();
 
-        self.handle(writer, bytes) catch |err| {
+        if (self.handle(writer, bytes)) {
+            const body = try body_bytes.toOwnedSlice();
+            const header = try std.fmt.allocPrint(allocator, header_template, .{ body.len, "application/json" });
+            self.send_vec[0] = .{ .base = header.ptr, .len = header.len };
+            self.send_vec[1] = .{ .base = body.ptr, .len = body.len };
+        } else |err| {
             log.warn("request failed {}", .{err});
-            const rsp = switch (err) {
+            const header = switch (err) {
                 error.NotFound => not_found,
                 else => bad_request,
             };
-            self.send_vec[0] = .{ .base = rsp.ptr, .len = rsp.len };
+            self.send_vec[0] = .{ .base = header.ptr, .len = header.len };
             self.send_vec[1].len = 0;
-            return self.send();
-        };
+        }
 
-        const body = try body_list.toOwnedSlice();
-        const header = try std.fmt.allocPrint(allocator, header_template, .{ body.len, "text/plain" });
-        self.send_vec[0] = .{ .base = header.ptr, .len = header.len };
-        self.send_vec[1] = .{ .base = body.ptr, .len = body.len };
         try self.send();
+        if (self.recv_op == null) self.shutdown();
     }
 
     fn handle(self: *Conn, writer: std.io.AnyWriter, bytes: []const u8) !void {
@@ -140,26 +141,31 @@ pub const Conn = struct {
     fn sendFailed(self: *Conn, err: anyerror) Error!void {
         self.sendDeinit();
         switch (err) {
-            error.OperationCanceled, error.BrokenPipe, error.ConnectionResetByPeer => {},
+            error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.err("{} send failed {}", .{ self.socket, err }),
         }
-        try self.shutdown();
+        self.shutdown();
     }
 
     fn recvFailed(self: *Conn, err: anyerror) Error!void {
         switch (err) {
-            error.EndOfFile => {},
-            error.ConnectionResetByPeer => {},
+            error.EndOfFile, error.OperationCanceled, error.ConnectionResetByPeer => {},
             else => log.err("{} recv failed {}", .{ self.socket, err }),
         }
-        try self.shutdown();
+        self.shutdown();
     }
 
-    pub fn shutdown(self: *Conn) !void {
+    pub fn shutdown(self: *Conn) void {
         //log.debug("{} shutdown", .{self.socket});
         if (self.state == .closing) return self.closed();
-        try self.io.shutdownClose(self.socket, self, closed, &self.close_op);
+
         self.state = .closing;
+        self.io.shutdownClose(self.socket, self, closed, &self.close_op) catch |err| {
+            log.warn("{} clean shutdown failed {}", .{ self.socket, err });
+            if (self.recv_op) |op| op.detach();
+            if (self.send_op) |op| op.detach();
+            self.closed();
+        };
     }
 
     fn closed(self: *Conn) void {
@@ -167,9 +173,9 @@ pub const Conn = struct {
         if (self.send_op != null) return;
         if (self.close_op != null) return;
 
+        // log.debug("{} closed", .{self.socket});
         self.deinit();
         self.listener.remove(self);
-        //log.debug("{} closed", .{self.socket});
     }
 };
 
