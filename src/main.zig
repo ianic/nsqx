@@ -181,7 +181,7 @@ fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
     }
 
     print("listener connections: {}\n", .{listener.conns.count()});
-    var iter = listener.conns.valueIterator();
+    var iter = listener.conns.keyIterator();
     while (iter.next()) |e| {
         const conn = e.*;
         conn.printStatus();

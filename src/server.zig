@@ -1076,7 +1076,7 @@ test "channel fin req" {
         consumer.ready_count = 1;
         try channel.wakeup();
         try testing.expectEqual(1, channel.in_flight.count());
-        try channel.unsubscribe(&consumer);
+        channel.unsubscribe(&consumer);
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
         try testing.expectEqual(0, channel.consumers.items.len);
@@ -1693,7 +1693,8 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try testing.expectEqual(3, channel2_consumer2.lastSeq());
     // Unsubscribe consumer2
     try testing.expectEqual(1, channel2.in_flight.count());
-    try channel2.unsubscribe(&channel2_consumer2);
+    try channel2.removeInFlight(channel2_consumer2.socket);
+    channel2.unsubscribe(&channel2_consumer2);
     try testing.expectEqual(0, channel2.in_flight.count());
     try testing.expectEqual(1, channel2.deferred.count());
     try channel2_consumer1.pull();

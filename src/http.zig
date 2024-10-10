@@ -157,12 +157,12 @@ pub const Conn = struct {
 
     pub fn shutdown(self: *Conn) !void {
         //log.debug("{} shutdown", .{self.socket});
-        if (self.state == .closing) return try self.closed();
+        if (self.state == .closing) return self.closed();
         try self.io.shutdownClose(self.socket, self, closed, &self.close_op);
         self.state = .closing;
     }
 
-    fn closed(self: *Conn) Error!void {
+    fn closed(self: *Conn) void {
         if (self.recv_op != null) return;
         if (self.send_op != null) return;
         if (self.close_op != null) return;

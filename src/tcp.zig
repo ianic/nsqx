@@ -25,7 +25,7 @@ pub fn ListenerType(comptime ConnType: type) type {
         socket: socket_t,
         io: *Io,
         op: ?*Op = null,
-        conns: std.AutoHashMap(*ConnType, *ConnType),
+        conns: std.AutoHashMap(*ConnType, void),
         metric: struct {
             // Total number of
             accept: usize = 0, // accepted connections
@@ -48,15 +48,14 @@ pub fn ListenerType(comptime ConnType: type) type {
                 .options = options,
                 .io = io,
                 .socket = socket,
-                // TODO: moze li ovo jednostavnije
-                .conns = std.AutoHashMap(*ConnType, *ConnType).init(allocator),
+                .conns = std.AutoHashMap(*ConnType, void).init(allocator),
             };
             errdefer self.deinit();
             try self.io.accept(socket, self, accepted, failed, &self.op);
         }
 
         pub fn deinit(self: *Self) void {
-            var iter = self.conns.valueIterator();
+            var iter = self.conns.keyIterator();
             while (iter.next()) |e| {
                 const conn = e.*;
                 conn.deinit();
@@ -70,15 +69,13 @@ pub fn ListenerType(comptime ConnType: type) type {
             errdefer self.allocator.destroy(conn);
             try self.conns.ensureUnusedCapacity(1);
             try conn.init(self, socket, addr);
-            self.conns.putAssumeCapacityNoClobber(conn, conn);
+            self.conns.putAssumeCapacityNoClobber(conn, {});
             self.metric.accept +%= 1;
         }
 
-        fn failed(_: *Self, err: anyerror) Error!void {
-            switch (err) {
-                error.OperationCanceled => {},
-                else => log.err("accept failed {}", .{err}),
-            }
+        fn failed(self: *Self, err: anyerror) Error!void {
+            log.err("accept failed {}", .{err});
+            try self.io.accept(self.socket, self, accepted, failed, &self.op);
         }
 
         // pub fn close(self: *Self) !void {
@@ -160,7 +157,7 @@ pub const Conn = struct {
 
         try self.send_vec.init(self.allocator);
         errdefer self.send_vec.deinit(self.allocator);
-        try self.io.recv(self.socket, self, received, recvFailed, &self.recv_op);
+        try self.io.recv(self.socket, self, received, receiveFailed, &self.recv_op);
         self.initTicker(initial_heartbeat) catch |err| {
             log.err("{} failed to set initial heartbeat {}", .{ socket, err });
         };
@@ -219,19 +216,16 @@ pub const Conn = struct {
     /// When channel is deleted via web interface
     pub fn channelClosed(self: *Conn) void {
         self.channel = null;
-        self.shutdown() catch |err| {
-            log.warn("{} fail to shutdown on channel close {}", .{ self.socket, err });
-            // Safe to ignore, first operation which requires channel will shutdown connection.
-        };
+        self.shutdown();
     }
 
-    // Channel api -----------------
+    // IO callbacks -----------------
 
     fn tick(self: *Conn) Error!void {
         if (self.state == .closing) return;
         if (self.outstanding_heartbeats > 4) {
             log.debug("{} no heartbeat, closing", .{self.socket});
-            return try self.shutdown();
+            return self.shutdown();
         }
         if (self.outstanding_heartbeats > 0) {
             log.debug("{} heartbeat", .{self.socket});
@@ -242,49 +236,99 @@ pub const Conn = struct {
 
     fn tickerFailed(self: *Conn, err: anyerror) Error!void {
         switch (err) {
-            error.OperationCanceled => {
-                if (self.state != .closing) return try self.initTicker(self.heartbeat_interval);
-            },
+            error.OperationCanceled => if (self.state != .closing)
+                return try self.initTicker(self.heartbeat_interval),
             else => log.err("{} ticker failed {}", .{ self.socket, err }),
         }
-        try self.shutdown();
+        self.shutdown();
     }
 
     fn received(self: *Conn, bytes: []const u8) Error!void {
-        var ready_changed: bool = false;
+        // Any error is lack of resources, free this connection in the case of
+        // any error.
+        self.receivedData(bytes) catch |err| {
+            log.err("{} recv failed {}", .{ self.socket, err });
+            return self.shutdown();
+        };
+        // recv_op is null if no there will be no more multishot receives
+        if (self.recv_op == null) self.shutdown();
+    }
 
+    fn receiveFailed(self: *Conn, err: anyerror) Error!void {
+        switch (err) {
+            error.EndOfFile, error.OperationCanceled, error.ConnectionResetByPeer => {},
+            else => log.err("{} recv failed {}", .{ self.socket, err }),
+        }
+        self.shutdown();
+    }
+
+    fn sent(self: *Conn) Error!void {
+        self.sent_at = self.io.now();
+        if (self.pending_response) |r| {
+            try self.respond(r);
+            self.pending_response = null;
+            return;
+        }
+        if (self.channel) |channel| try channel.ready(self);
+    }
+
+    fn sendFailed(self: *Conn, err: anyerror) Error!void {
+        self.sent_at = self.io.now();
+        switch (err) {
+            error.BrokenPipe, error.ConnectionResetByPeer => {},
+            else => log.err("{} send failed {}", .{ self.socket, err }),
+        }
+        self.shutdown();
+    }
+
+    fn closed(self: *Conn) void {
+        assert(self.state == .closing);
+
+        // Ensure that all operations are finished
+        if (self.ticker_op != null) return;
+        if (self.recv_op != null) return;
+        if (self.send_op != null) return;
+        if (self.close_op != null) return;
+        // Safe to unsubscribe from channel, no buffers in kernel when send is
+        // finished.
+        if (self.channel) |channel| channel.unsubscribe(self);
+
+        log.debug("{} closed", .{self.socket});
+        self.deinit();
+        self.listener.remove(self);
+    }
+
+    // ------------------------------
+
+    fn receivedData(self: *Conn, bytes: []const u8) !void {
         var parser = protocol.Parser{ .buf = try self.recv_buf.append(bytes) };
         while (parser.next() catch |err| {
             log.err(
                 "{} protocol parser failed {}, un-parsed: {d}",
                 .{ self.socket, err, parser.unparsed()[0..@min(128, parser.unparsed().len)] },
             );
-            return try self.shutdown();
-        }) |msg|
-            self.msgRecived(msg, &ready_changed) catch |err| switch (err) {
-                Error.OutOfMemory, Error.SubmissionQueueFull => |e| return e,
-                else => {
-                    log.err("{} message failed {}", .{ self.socket, err });
-                    return try self.shutdown();
-                },
-            };
+            return err;
+        }) |msg| {
+            try self.receivedMsg(msg);
+        }
 
         try self.recv_buf.set(parser.unparsed());
-        if (ready_changed and self.send_op == null)
-            if (self.channel) |channel| try channel.ready(self);
+        if (self.channel) |channel| if (self.ready() > 0) try channel.ready(self);
     }
 
-    fn msgRecived(self: *Conn, msg: protocol.Message, ready_changed: *bool) !void {
+    fn receivedMsg(self: *Conn, msg: protocol.Message) !void {
         const server = self.listener.server;
         const options = self.listener.options;
         self.outstanding_heartbeats = 0;
 
         switch (msg) {
             .identify => {
-                self.identify = try msg.parseIdentify(self.allocator, options);
-                try self.initTicker(self.identify.heartbeat_interval);
+                const identify = try msg.parseIdentify(self.allocator, options);
+                errdefer identify.deinit(self.allocator);
+                try self.initTicker(identify.heartbeat_interval);
                 try self.respond(.ok);
-                log.debug("{} identify {}", .{ self.socket, self.identify });
+                self.identify = identify;
+                log.debug("{} identify {}", .{ self.socket, identify });
             },
             .subscribe => |arg| {
                 self.channel = try server.subscribe(self, arg.topic, arg.channel);
@@ -298,6 +342,7 @@ pub const Conn = struct {
                 log.debug("{} publish: {s}", .{ self.socket, arg.topic });
             },
             .multi_publish => |arg| {
+                if (arg.msgs == 0) return;
                 if (arg.data.len / arg.msgs > options.max_msg_size) return error.MessageSizeOverflow;
                 try server.multiPublish(arg.topic, arg.msgs, arg.data);
                 try self.respond(.ok);
@@ -310,7 +355,6 @@ pub const Conn = struct {
             },
             .ready => |count| {
                 self.ready_count = if (count > options.max_rdy_count) options.max_rdy_count else count;
-                ready_changed.* = true;
                 log.debug("{} ready: {}", .{ self.socket, count });
             },
             .finish => |msg_id| {
@@ -318,7 +362,6 @@ pub const Conn = struct {
                 self.in_flight -|= 1;
                 const res = channel.finish(msg_id);
                 if (res) self.metric.finish += 1;
-                ready_changed.* = true;
                 log.debug("{} finish {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
             },
             .requeue => |arg| {
@@ -352,36 +395,9 @@ pub const Conn = struct {
         }
     }
 
-    fn recvFailed(self: *Conn, err: anyerror) Error!void {
-        switch (err) {
-            error.EndOfFile, error.OperationCanceled, error.ConnectionResetByPeer => {},
-            else => log.err("{} recv failed {}", .{ self.socket, err }),
-        }
-        try self.shutdown();
-    }
-
     fn send(self: *Conn) !void {
         assert(self.send_op == null);
         try self.io.sendv(self.socket, self.send_vec.ptr(), self, sent, sendFailed, &self.send_op);
-    }
-
-    fn sent(self: *Conn) Error!void {
-        self.sent_at = self.io.now();
-        if (self.pending_response) |r| {
-            try self.respond(r);
-            self.pending_response = null;
-            return;
-        }
-        if (self.channel) |channel| try channel.ready(self);
-    }
-
-    fn sendFailed(self: *Conn, err: anyerror) Error!void {
-        self.sent_at = self.io.now();
-        switch (err) {
-            error.BrokenPipe, error.ConnectionResetByPeer => {},
-            else => log.err("{} send failed {}", .{ self.socket, err }),
-        }
-        try self.shutdown();
     }
 
     fn respond(self: *Conn, rsp: Response) !void {
@@ -406,43 +422,34 @@ pub const Conn = struct {
         try self.send();
     }
 
-    pub fn shutdown(self: *Conn) !void {
+    pub fn shutdown(self: *Conn) void {
         log.debug("{} shutdown state: {s}", .{ self.socket, @tagName(self.state) });
-        // Shutdown already in process
-        if (self.state == .closing) return try self.closed();
+        // Shutdown already in process. Closed will wait for all operation to finish.
+        if (self.state == .closing)
+            return self.closed();
 
         // Start shutdown: stop sending, call shutdown/close on socket, stop ticker
         self.ready_count = 0;
         self.pending_response = null;
-        try self.io.shutdownClose(self.socket, self, closed, &self.close_op);
-        if (self.ticker_op) |op| self.io.cancel(op) catch |err| {
-            log.warn("{} fail to cancel ticker in shutdown {}", .{ self.socket, err });
-            // It will be cancelled in closed.
-        };
         self.state = .closing;
+        // Try to start clean shutdown. It will stop ticker and shutdown
+        // connection. Ticker will get OperationCanceled, multishot receive will
+        // be terminated, send (if active also).
+        self.cleanShutdown() catch |err| {
+            // Dirty shutdown. Detach from all io operations. No callback will
+            // be fired after that.
+            log.warn("{} clean shutdown failed {}", .{ self.socket, err });
+            if (self.ticker_op) |op| op.detach();
+            if (self.recv_op) |op| op.detach();
+            if (self.send_op) |op| op.detach();
+            if (self.close_op) |op| op.detach();
+            self.closed();
+        };
     }
 
-    fn closed(self: *Conn) Error!void {
-        assert(self.state == .closing);
-        // log.debug("{} closed recv: {} ticker: {} send: {} close: {}", .{
-        //     self.socket,
-        //     self.recv_op == null,
-        //     self.ticker_op == null,
-        //     self.send_op == null,
-        //     self.close_op == null,
-        // });
-
-        // Ensure that all operations are finished
-        if (self.ticker_op) |op| return try self.io.cancel(op);
-        if (self.recv_op != null) return;
-        if (self.send_op != null) return;
-        if (self.close_op != null) return;
-        // Safe to unsubscribe, no buffers in kernel when send is finished.
-        if (self.channel) |channel| channel.unsubscribe(self);
-
-        log.debug("{} closed", .{self.socket});
-        self.deinit();
-        self.listener.remove(self);
+    fn cleanShutdown(self: *Conn) !void {
+        if (self.ticker_op) |op| try op.cancel2();
+        try self.io.shutdownClose(self.socket, self, closed, &self.close_op);
     }
 
     pub fn printStatus(self: *Conn) void {
