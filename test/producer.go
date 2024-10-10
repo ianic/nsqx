@@ -41,22 +41,23 @@ func main() {
 
 }
 
-func pub(topic string) {
+func mpub(topic string) {
 	cfg := nsq.NewConfig()
 	cfg.HeartbeatInterval = 1 * time.Second
 	cfg.LookupdPollInterval = 1 * time.Second // reconnection
 	cfg.MaxBackoffDuration = 1 * time.Second
-	cfg.ReadTimeout = 1 * time.Second
-	cfg.WriteTimeout = 1 * time.Second
+	cfg.ReadTimeout = 5 * time.Second
+	cfg.WriteTimeout = 5 * time.Second
 
 	producer, err := nsq.NewProducer("127.0.0.1:4150", cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
+	producer.SetLoggerLevel(nsq.LogLevelError)
 
 	for j := 0; j < 128; j++ {
 		size := rand.IntN(1024 * 16)
-		batchSize := rand.IntN(256)
+		batchSize := 256 //rand.IntN(256)
 
 		msg := make([]byte, size)
 		// for i := range msg {
@@ -67,9 +68,49 @@ func pub(topic string) {
 			batch[i] = msg
 		}
 
-		if producer.MultiPublish(topic, batch); err != nil {
+		if err = producer.MultiPublish(topic, batch); err != nil {
 			log.Fatal(err)
 		}
+	}
+	print(topic, " done\n")
+	producer.Stop()
+}
+
+func pub(topic string) {
+	cfg := nsq.NewConfig()
+	cfg.HeartbeatInterval = 1 * time.Second
+	cfg.LookupdPollInterval = 1 * time.Second // reconnection
+	cfg.MaxBackoffDuration = 1 * time.Second
+	cfg.ReadTimeout = 5 * time.Second
+	cfg.WriteTimeout = 5 * time.Second
+
+	producer, err := nsq.NewProducer("127.0.0.1:4150", cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	producer.SetLoggerLevel(nsq.LogLevelError)
+	// if err := producer.Ping(); err != nil {
+	// 	log.Fatal(err)
+	// }
+
+	for j := 0; j < 16*1024; j++ {
+		size := rand.IntN(1024 * 16)
+
+		msg := make([]byte, size)
+		for i := range msg {
+			msg[i] = byte(i % 256)
+		}
+
+		for {
+			if err = producer.Publish(topic, msg); err != nil {
+				// print("publish error ", err.Error(), "\n")
+				//log.Fatal(err)
+				//panic(err)
+				continue
+			}
+			break
+		}
+		// print(topic, " ", j, "\n")
 	}
 	print(topic, " done\n")
 	producer.Stop()
