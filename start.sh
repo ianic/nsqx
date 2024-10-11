@@ -6,6 +6,8 @@ set -m
 killall nsql  >> /dev/null 2>&1
 killall nsqadmin  >> /dev/null 2>&1
 killall nsqlookupd >> /dev/null 2>&1
+killall lookup >> /dev/null 2>&1
+killall nsq_tail >> /dev/null 2>&1
 
 set -e
 
