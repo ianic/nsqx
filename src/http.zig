@@ -43,14 +43,14 @@ pub const Conn = struct {
             .socket = socket,
             .addr = addr,
         };
-        try self.io.recv(self.socket, self, received, recvFailed, &self.recv_op);
+        try self.io.recv(self.socket, self, onRecv, onRecvFail, &self.recv_op);
     }
 
     pub fn deinit(self: *Conn) void {
         self.sendDeinit();
     }
 
-    fn received(self: *Conn, bytes: []const u8) Error!void {
+    fn onRecv(self: *Conn, bytes: []const u8) Error!void {
         if (self.send_op != null) return self.shutdown();
         assert(self.arena == null);
 
@@ -124,10 +124,10 @@ pub const Conn = struct {
         assert(self.send_op == null);
         self.send_msghdr.iov = &self.send_vec;
         self.send_msghdr.iovlen = if (self.send_vec[1].len > 0) 2 else 1;
-        try self.io.sendv(self.socket, &self.send_msghdr, self, sent, sendFailed, &self.send_op);
+        try self.io.sendv(self.socket, &self.send_msghdr, self, onSend, onSendFail, &self.send_op);
     }
 
-    fn sent(self: *Conn) Error!void {
+    fn onSend(self: *Conn) Error!void {
         self.sendDeinit();
     }
 
@@ -138,7 +138,7 @@ pub const Conn = struct {
         }
     }
 
-    fn sendFailed(self: *Conn, err: anyerror) Error!void {
+    fn onSendFail(self: *Conn, err: anyerror) Error!void {
         self.sendDeinit();
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
@@ -147,7 +147,7 @@ pub const Conn = struct {
         self.shutdown();
     }
 
-    fn recvFailed(self: *Conn, err: anyerror) Error!void {
+    fn onRecvFail(self: *Conn, err: anyerror) Error!void {
         switch (err) {
             error.EndOfFile, error.OperationCanceled, error.ConnectionResetByPeer => {},
             else => log.err("{} recv failed {}", .{ self.socket, err }),
@@ -157,25 +157,24 @@ pub const Conn = struct {
 
     pub fn shutdown(self: *Conn) void {
         //log.debug("{} shutdown", .{self.socket});
-        if (self.state == .closing) return self.closed();
+        if (self.state == .closing) {
+            if (self.recv_op != null) return;
+            if (self.send_op != null) return;
+            if (self.close_op != null) return;
+
+            // log.debug("{} closed", .{self.socket});
+            self.deinit();
+            self.listener.remove(self);
+            return;
+        }
 
         self.state = .closing;
-        self.io.shutdownClose(self.socket, self, closed, &self.close_op) catch |err| {
+        self.io.shutdownClose(self.socket, self, shutdown, &self.close_op) catch |err| {
             log.warn("{} clean shutdown failed {}", .{ self.socket, err });
             if (self.recv_op) |op| op.detach();
             if (self.send_op) |op| op.detach();
-            self.closed();
+            self.shutdown();
         };
-    }
-
-    fn closed(self: *Conn) void {
-        if (self.recv_op != null) return;
-        if (self.send_op != null) return;
-        if (self.close_op != null) return;
-
-        // log.debug("{} closed", .{self.socket});
-        self.deinit();
-        self.listener.remove(self);
     }
 };
 

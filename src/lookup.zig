@@ -47,7 +47,7 @@ pub const Connector = struct {
         errdefer self.deinit();
         try self.connections.ensureUnusedCapacity(lookup_tcp_addresses.len);
         for (lookup_tcp_addresses) |addr| try self.addLookupd(addr);
-        try self.io.ticker(ping_interval, self, tick, tickerFailed, &self.ticker_op);
+        try self.io.ticker(ping_interval, self, onTick, onTickerFail, &self.ticker_op);
     }
 
     fn addLookupd(self: *Self, address: std.net.Address) !void {
@@ -74,19 +74,19 @@ pub const Connector = struct {
         self.topic.deinit();
     }
 
-    fn tick(self: *Self) Error!void {
+    fn onTick(self: *Self) Error!void {
         for (self.connections.items) |conn| {
-            conn.tick();
+            conn.onTick();
         }
     }
 
-    fn tickerFailed(self: *Self, err: anyerror) Error!void {
+    fn onTickerFail(self: *Self, err: anyerror) Error!void {
         switch (err) {
             error.OperationCanceled => {},
             else => log.err("ticker failed {}", .{err}),
         }
         if (self.state == .connected)
-            try self.io.ticker(ping_interval, self, tick, tickerFailed, &self.ticker_op);
+            try self.io.ticker(ping_interval, self, onTick, onTickerFail, &self.ticker_op);
     }
 
     pub fn topicCreated(self: *Self, name: []const u8) void {
@@ -207,7 +207,7 @@ const Conn = struct {
         self.recv_buf.free();
     }
 
-    fn tick(self: *Self) void {
+    fn onTick(self: *Self) void {
         switch (self.state) {
             .closed => self.reconnect() catch {},
             .connected => self.ping() catch {},
@@ -231,29 +231,19 @@ const Conn = struct {
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
             0,
             self,
-            socketCreated,
-            socketCreateFailed,
+            onSocketCreate,
+            onSocketCreateFail,
             &self.connect_op,
         );
         self.state = .connecting;
     }
 
-    fn socketCreated(self: *Self, socket: socket_t) Error!void {
+    fn onSocketCreate(self: *Self, socket: socket_t) Error!void {
         self.socket = socket;
-        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, &self.connect_op);
+        try self.io.connect(self.socket, &self.address, self, onConnect, onConnectFail, &self.connect_op);
     }
 
-    fn socketCreateFailed(self: *Self, err: anyerror) Error!void {
-        log.err("{} socket create failed {}", .{ self.address, err });
-        self.shutdown();
-    }
-
-    fn connectFailed(self: *Self, err: anyerror) Error!void {
-        log.info("{} connect failed {}", .{ self.address, err });
-        self.shutdown();
-    }
-
-    fn connected(self: *Self) Error!void {
+    fn onConnect(self: *Self) Error!void {
         self.setup() catch |err| {
             log.warn("{} setup failed {}", .{ self.address, err });
             self.shutdown();
@@ -262,19 +252,29 @@ const Conn = struct {
 
     fn setup(self: *Self) !void {
         try self.send(self.connector.identify);
-        try self.io.recv(self.socket, self, received, receiveFailed, &self.recv_op);
+        try self.io.recv(self.socket, self, onRecv, onRecvFail, &self.recv_op);
         try self.connector.connect(self);
         self.state = .connected;
         log.debug("{} connected", .{self.address});
     }
 
+    fn onSocketCreateFail(self: *Self, err: anyerror) Error!void {
+        log.err("{} socket create failed {}", .{ self.address, err });
+        self.shutdown();
+    }
+
+    fn onConnectFail(self: *Self, err: anyerror) Error!void {
+        log.info("{} connect failed {}", .{ self.address, err });
+        self.shutdown();
+    }
+
     fn send(self: *Self, buf: []const u8) !void {
         assert(self.send_op == null);
         assert(buf.len > 0);
-        try self.io.send(self.socket, buf, self, sent, sendFailed, &self.send_op);
+        try self.io.send(self.socket, buf, self, onSend, onSendFail, &self.send_op);
     }
 
-    fn sent(self: *Self) Error!void {
+    fn onSend(self: *Self) Error!void {
         try self.pullTopic();
     }
 
@@ -285,7 +285,7 @@ const Conn = struct {
         }
     }
 
-    fn sendFailed(self: *Self, err: anyerror) Error!void {
+    fn onSendFail(self: *Self, err: anyerror) Error!void {
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.err("{} send failed {}", .{ self.address, err }),
@@ -293,7 +293,7 @@ const Conn = struct {
         self.shutdown();
     }
 
-    fn received(self: *Self, bytes: []const u8) Error!void {
+    fn onRecv(self: *Self, bytes: []const u8) Error!void {
         if (self.state != .connected) return;
         self.handleResponse(bytes) catch |err| {
             log.err("{} handle reponse failed {}", .{ self.address, err });
@@ -331,7 +331,7 @@ const Conn = struct {
             self.recv_buf.free();
     }
 
-    fn receiveFailed(self: *Self, err: anyerror) Error!void {
+    fn onRecvFail(self: *Self, err: anyerror) Error!void {
         switch (err) {
             error.EndOfFile, error.ConnectionResetByPeer => {},
             else => log.err("{} recv failed {}", .{ self.address, err }),

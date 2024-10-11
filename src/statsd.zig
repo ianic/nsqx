@@ -38,56 +38,56 @@ pub const Connector = struct {
             .prefix = try fmtPrefix(allocator, options.statsd.prefix, options.broadcastAddress(), options.broadcast_tcp_port),
         };
         errdefer self.deinit();
-        try self.io.ticker(self.options.interval, self, tick, tickerFailed, &self.ticker_op);
+        try self.io.ticker(self.options.interval, self, onTick, onTickerFail, &self.ticker_op);
     }
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.prefix);
     }
 
-    fn tick(self: *Self) Error!void {
+    fn onTick(self: *Self) Error!void {
         if (self.socket == 0) {
-            return try self.socketCreate();
+            return try self.connect();
         }
         if (self.send_op != null) return;
         if (self.iter.done()) try self.generate();
         try self.send();
     }
 
-    fn tickerFailed(_: *Self, err: anyerror) Error!void {
+    fn onTickerFail(self: *Self, err: anyerror) Error!void {
         switch (err) {
             error.OperationCanceled => {},
-            else => {
-                log.err("ticker failed {}", .{err});
-                // try self.start();
-            },
+            else => log.err("ticker failed {}", .{err}),
         }
+        try self.io.ticker(self.options.interval, self, onTick, onTickerFail, &self.ticker_op);
     }
 
-    fn socketCreate(self: *Self) !void {
+    fn connect(self: *Self) !void {
         try self.io.socketCreate(
             self.address.any.family,
             posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
             0,
             self,
-            socketCreated,
-            connectFailed,
+            onSocketCreate,
+            onConnectFail,
             &self.connect_op,
         );
     }
 
-    fn socketCreated(self: *Self, socket: socket_t) Error!void {
+    fn onSocketCreate(self: *Self, socket: socket_t) Error!void {
         self.socket = socket;
-        try self.io.connect(self.socket, &self.address, self, connected, connectFailed, &self.connect_op);
+        try self.io.connect(socket, &self.address, self, onConnect, onConnectFail, &self.connect_op);
     }
 
-    fn connectFailed(self: *Self, err: anyerror) Error!void {
+    fn onConnectFail(self: *Self, err: anyerror) Error!void {
         log.err("connect failed {}", .{err});
-        try self.io.close(self.socket);
-        self.socket = 0;
+        if (self.socket != 0) {
+            try self.io.close(self.socket);
+            self.socket = 0;
+        }
     }
 
-    fn connected(_: *Self) Error!void {}
+    fn onConnect(_: *Self) Error!void {}
 
     fn generate(self: *Self) Error!void {
         var writer = MetricWriter.init(self.allocator, self.prefix);
@@ -114,10 +114,10 @@ pub const Connector = struct {
 
     fn send(self: *Self) !void {
         if (self.iter.next()) |buf|
-            try self.io.send(self.socket, buf, self, sent, sendFailed, &self.send_op);
+            try self.io.send(self.socket, buf, self, onSend, onSendFail, &self.send_op);
     }
 
-    fn sent(self: *Self) Error!void {
+    fn onSend(self: *Self) Error!void {
         if (self.iter.done()) {
             log.debug("sent {} bytes", .{self.iter.buf.len});
             self.allocator.free(self.iter.buf);
@@ -127,19 +127,10 @@ pub const Connector = struct {
         }
     }
 
-    fn sendFailed(self: *Self, err: anyerror) Error!void {
+    fn onSendFail(self: *Self, err: anyerror) Error!void {
         self.allocator.free(self.iter.buf);
         self.iter = .{};
         log.err("send failed {}", .{err});
-    }
-
-    pub fn close(self: *Self) !void {
-        try Op.cancel(self.connect_op);
-        try Op.cancel(self.ticker_op);
-        if (self.socket != 0) {
-            try self.io.close(self.socket);
-            self.socket = 0;
-        }
     }
 };
 

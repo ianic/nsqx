@@ -51,7 +51,7 @@ pub fn ListenerType(comptime ConnType: type) type {
                 .conns = std.AutoHashMap(*ConnType, void).init(allocator),
             };
             errdefer self.deinit();
-            try self.io.accept(socket, self, accepted, failed, &self.op);
+            try self.io.accept(socket, self, onAccept, onAcceptFail, &self.op);
         }
 
         pub fn deinit(self: *Self) void {
@@ -64,7 +64,7 @@ pub fn ListenerType(comptime ConnType: type) type {
             self.conns.deinit();
         }
 
-        fn accepted(self: *Self, socket: socket_t, addr: std.net.Address) Error!void {
+        fn onAccept(self: *Self, socket: socket_t, addr: std.net.Address) Error!void {
             var conn = try self.allocator.create(ConnType);
             errdefer self.allocator.destroy(conn);
             try self.conns.ensureUnusedCapacity(1);
@@ -73,18 +73,10 @@ pub fn ListenerType(comptime ConnType: type) type {
             self.metric.accept +%= 1;
         }
 
-        fn failed(self: *Self, err: anyerror) Error!void {
+        fn onAcceptFail(self: *Self, err: anyerror) Error!void {
             log.err("accept failed {}", .{err});
-            try self.io.accept(self.socket, self, accepted, failed, &self.op);
+            try self.io.accept(self.socket, self, onAccept, onAcceptFail, &self.op);
         }
-
-        // pub fn close(self: *Self) !void {
-        //     try Op.cancel(self.op);
-        //     var iter = self.conns.valueIterator();
-        //     while (iter.next()) |e| {
-        //         try e.*.shutdown();
-        //     }
-        // }
 
         pub fn remove(self: *Self, conn: *ConnType) void {
             assert(self.conns.remove(conn));
@@ -157,7 +149,7 @@ pub const Conn = struct {
 
         try self.send_vec.init(self.allocator);
         errdefer self.send_vec.deinit(self.allocator);
-        try self.io.recv(self.socket, self, received, receiveFailed, &self.recv_op);
+        try self.io.recv(self.socket, self, onRecv, onRecvFail, &self.recv_op);
         self.initTicker(initial_heartbeat) catch |err| {
             log.err("{} failed to set initial heartbeat {}", .{ socket, err });
         };
@@ -176,7 +168,7 @@ pub const Conn = struct {
         if (self.ticker_op) |op| return try self.io.cancel(op);
 
         const msec: u32 = @divTrunc(self.heartbeat_interval, 2);
-        try self.io.ticker(msec, self, tick, tickerFailed, &self.ticker_op);
+        try self.io.ticker(msec, self, onTick, onTickerFail, &self.ticker_op);
         // log.debug("{} heartbeat interval: {}", .{ self.socket, self.heartbeat_interval });
     }
 
@@ -221,7 +213,7 @@ pub const Conn = struct {
 
     // IO callbacks -----------------
 
-    fn tick(self: *Conn) Error!void {
+    fn onTick(self: *Conn) Error!void {
         if (self.state == .closing) return;
         if (self.outstanding_heartbeats > 4) {
             log.debug("{} no heartbeat, closing", .{self.socket});
@@ -234,7 +226,7 @@ pub const Conn = struct {
         self.outstanding_heartbeats += 1;
     }
 
-    fn tickerFailed(self: *Conn, err: anyerror) Error!void {
+    fn onTickerFail(self: *Conn, err: anyerror) Error!void {
         switch (err) {
             error.OperationCanceled => if (self.state != .closing)
                 return try self.initTicker(self.heartbeat_interval),
@@ -243,7 +235,7 @@ pub const Conn = struct {
         self.shutdown();
     }
 
-    fn received(self: *Conn, bytes: []const u8) Error!void {
+    fn onRecv(self: *Conn, bytes: []const u8) Error!void {
         // Any error is lack of resources, free this connection in the case of
         // any error.
         self.receivedData(bytes) catch |err| {
@@ -254,7 +246,7 @@ pub const Conn = struct {
         if (self.recv_op == null) self.shutdown();
     }
 
-    fn receiveFailed(self: *Conn, err: anyerror) Error!void {
+    fn onRecvFail(self: *Conn, err: anyerror) Error!void {
         switch (err) {
             error.EndOfFile, error.OperationCanceled, error.ConnectionResetByPeer => {},
             else => log.err("{} recv failed {}", .{ self.socket, err }),
@@ -262,7 +254,7 @@ pub const Conn = struct {
         self.shutdown();
     }
 
-    fn sent(self: *Conn) Error!void {
+    fn onSend(self: *Conn) Error!void {
         self.sent_at = self.io.now();
         if (self.pending_response) |r| {
             try self.respond(r);
@@ -272,7 +264,7 @@ pub const Conn = struct {
         if (self.channel) |channel| try channel.ready(self);
     }
 
-    fn sendFailed(self: *Conn, err: anyerror) Error!void {
+    fn onSendFail(self: *Conn, err: anyerror) Error!void {
         self.sent_at = self.io.now();
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
@@ -281,7 +273,7 @@ pub const Conn = struct {
         self.shutdown();
     }
 
-    fn closed(self: *Conn) void {
+    fn onClose(self: *Conn) void {
         assert(self.state == .closing);
 
         // Ensure that all operations are finished
@@ -397,7 +389,7 @@ pub const Conn = struct {
 
     fn send(self: *Conn) !void {
         assert(self.send_op == null);
-        try self.io.sendv(self.socket, self.send_vec.ptr(), self, sent, sendFailed, &self.send_op);
+        try self.io.sendv(self.socket, self.send_vec.ptr(), self, onSend, onSendFail, &self.send_op);
     }
 
     fn respond(self: *Conn, rsp: Response) !void {
@@ -426,7 +418,7 @@ pub const Conn = struct {
         log.debug("{} shutdown state: {s}", .{ self.socket, @tagName(self.state) });
         // Shutdown already in process. Closed will wait for all operation to finish.
         if (self.state == .closing)
-            return self.closed();
+            return self.onClose();
 
         // Start shutdown: stop sending, call shutdown/close on socket, stop ticker
         self.ready_count = 0;
@@ -443,13 +435,13 @@ pub const Conn = struct {
             if (self.recv_op) |op| op.detach();
             if (self.send_op) |op| op.detach();
             if (self.close_op) |op| op.detach();
-            self.closed();
+            self.onClose();
         };
     }
 
     fn cleanShutdown(self: *Conn) !void {
-        if (self.ticker_op) |op| try op.cancel2();
-        try self.io.shutdownClose(self.socket, self, closed, &self.close_op);
+        if (self.ticker_op) |op| try op.cancel();
+        try self.io.shutdownClose(self.socket, self, onClose, &self.close_op);
     }
 
     pub fn printStatus(self: *Conn) void {
