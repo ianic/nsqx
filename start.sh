@@ -36,24 +36,25 @@ admin_pid=$!
 # daemon
 cd ~/Code/nsql
 ./zig-out/bin/nsql \
-  --io-entries 16 \
-  --statsd-prefix "" > tmp/nsql 2>&1 &
-  #--statsd-address localhost:8125 \
-  #--lookupd-tcp-address localhost:4160 \
-  #--lookupd-tcp-address localhost:4162 \
-  #--lookupd-tcp-address localhost:4164 \
+  --statsd-prefix "" \
+  --statsd-address localhost:8125 \
+  --lookupd-tcp-address localhost:4160 \
+  --lookupd-tcp-address localhost:4162 \
+  --lookupd-tcp-address localhost:4164 \
+  > tmp/nsql 2>&1 &
+# --io-entries 16 \
 nsql_pid=$!
 
 sleep 1
 
-# nsq_tail -nsqd-tcp-address localhost:4150 -channel channel1 -topic topic1  | sed "s/^/[channel1] /" &
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel1 -topic topic1  | sed "s/^/[channel1] /" &
 
-# nsq_tail -nsqd-tcp-address localhost:4150 -channel channel2 -topic topic1  | sed "s/^/[channel2 conusmer1] /" &
-# nsq_tail -nsqd-tcp-address localhost:4150 -channel channel2 -topic topic1  | sed "s/^/[channel2 consumer2] /" &
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel2 -topic topic1  | sed "s/^/[channel2 conusmer1] /" &
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel2 -topic topic1  | sed "s/^/[channel2 consumer2] /" &
 
-# nsq_tail -nsqd-tcp-address localhost:4150 -channel channel3 -topic topic1  | sed "s/^/[channel3 conusmer1] /" &
-# nsq_tail -nsqd-tcp-address localhost:4150 -channel channel3 -topic topic1  | sed "s/^/[channel3 consumer2] /" &
-# nsq_tail -nsqd-tcp-address localhost:4150 -channel channel3 -topic topic1  | sed "s/^/[channel3 consumer3] /" &
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel3 -topic topic1  | sed "s/^/[channel3 conusmer1] /" &
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel3 -topic topic1  | sed "s/^/[channel3 consumer2] /" &
+nsq_tail -nsqd-tcp-address localhost:4150 -channel channel3 -topic topic1  | sed "s/^/[channel3 consumer3] /" &
 
 cleanup() {
     set +e

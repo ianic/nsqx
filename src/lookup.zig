@@ -32,7 +32,7 @@ pub const Connector = struct {
 
     pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, server: *Server, lookup_tcp_addresses: []net.Address) !void {
         // TODO: create identify from command line arguments, options
-        const identify = identifyMessage(allocator, "127.0.0.1", "hydra", 4151, 4150, "0.1.0") catch "";
+        const identify = try identifyMessage(allocator, "127.0.0.1", "hydra", 4151, 4150, "0.1.0");
         self.* = .{
             .allocator = allocator,
             .io = io,
@@ -55,10 +55,10 @@ pub const Connector = struct {
         self.connections.appendAssumeCapacity(conn);
     }
 
-    pub fn close(self: *Self) !void {
-        self.state = .closing;
-        for (self.connections.items) |conn| try conn.close();
-    }
+    // pub fn close(self: *Self) !void {
+    //     self.state = .closing;
+    //     for (self.connections.items) |conn| try conn.close();
+    // }
 
     pub fn deinit(self: *Self) void {
         for (self.connections.items) |conn| {
@@ -88,7 +88,7 @@ pub const Connector = struct {
 
     fn register(self: *Self, comptime fmt: []const u8, args: anytype) void {
         if (self.state != .active or !self.topic.hasConsumers()) return;
-        self.registerFailable(fmt, args) catch |err| {
+        self.tryRegister(fmt, args) catch |err| {
             // Disconnect all connections. On next connect they will get fresh
             // current state.
             for (self.connections.items) |conn| conn.disconnect();
@@ -96,7 +96,7 @@ pub const Connector = struct {
         };
     }
 
-    fn registerFailable(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+    fn tryRegister(self: *Self, comptime fmt: []const u8, args: anytype) !void {
         const buf = try std.fmt.allocPrint(self.allocator, fmt, args);
         errdefer self.allocator.free(buf);
         assert(try self.topic.append(buf));
@@ -183,7 +183,7 @@ const Conn = struct {
         };
         errdefer self.deinit();
         try self.io.ticker(ping_interval, self, tick, tickerFailed, &self.ticker_op);
-        errdefer Op.cancel(self.ticker_op) catch {};
+        errdefer if (self.ticker_op) |op| op.detach();
         try self.reconnect();
     }
 
@@ -196,25 +196,6 @@ const Conn = struct {
         if (self.connector.topic.next(self)) |buf| {
             try self.send(buf);
         }
-    }
-
-    fn reconnect(self: *Self) Error!void {
-        Op.unsubscribe(self.send_op);
-        Op.unsubscribe(self.recv_op);
-        if (self.socket != 0) {
-            try self.io.close(self.socket);
-            self.socket = 0;
-        }
-        try self.io.socketCreate(
-            self.address.any.family,
-            posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-            0,
-            self,
-            socketCreated,
-            socketFailed,
-            &self.connect_op,
-        );
-        self.state = .connecting;
     }
 
     fn tick(self: *Self) Error!void {
@@ -230,6 +211,26 @@ const Conn = struct {
             error.OperationCanceled => {},
             else => log.err("{} ticker failed {}", .{ self.address, err }),
         }
+    }
+
+    fn reconnect(self: *Self) Error!void {
+        if (self.send_op) |op| op.detach();
+        if (self.recv_op) |op| op.detach();
+        self.recv_buf.free();
+        if (self.socket != 0) {
+            try self.io.close(self.socket);
+            self.socket = 0;
+        }
+        try self.io.socketCreate(
+            self.address.any.family,
+            posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+            0,
+            self,
+            socketCreated,
+            socketFailed,
+            &self.connect_op,
+        );
+        self.state = .connecting;
     }
 
     fn socketCreated(self: *Self, socket: socket_t) Error!void {
@@ -250,7 +251,7 @@ const Conn = struct {
 
     fn connected(self: *Self) Error!void {
         try self.send(self.connector.identify);
-        try self.recv();
+        try self.io.recv(self.socket, self, received, receiveFailed, &self.recv_op);
         try self.connector.connect(self);
         self.state = .connected;
         log.debug("{} connected", .{self.address});
@@ -284,11 +285,15 @@ const Conn = struct {
         if (self.state == .connected) self.disconnect();
     }
 
-    fn recv(self: *Self) !void {
-        try self.io.recv(self.socket, self, received, recvFailed, &self.recv_op);
+    fn received(self: *Self, bytes: []const u8) Error!void {
+        if (self.state != .connected) return;
+        self.handleResponse(bytes) catch |err| {
+            log.err("{} handleReponse failed {}", .{ self.address, err });
+            self.disconnect();
+        };
     }
 
-    fn received(self: *Self, bytes: []const u8) Error!void {
+    fn handleResponse(self: *Self, bytes: []const u8) error{OutOfMemory}!void {
         var buf = try self.recv_buf.append(bytes);
 
         while (true) {
@@ -318,7 +323,7 @@ const Conn = struct {
             self.recv_buf.free();
     }
 
-    fn recvFailed(self: *Self, err: anyerror) Error!void {
+    fn receiveFailed(self: *Self, err: anyerror) Error!void {
         switch (err) {
             error.EndOfFile, error.ConnectionResetByPeer => {},
             else => log.err("{} recv failed {}", .{ self.address, err }),
@@ -326,13 +331,12 @@ const Conn = struct {
         if (self.state == .connected) self.disconnect();
     }
 
-    pub fn close(self: *Self) !void {
-        try Op.cancel(self.connect_op);
-        try Op.cancel(self.send_op);
-        try Op.cancel(self.recv_op);
-        try Op.cancel(self.ticker_op);
-        if (self.socket > 0)
-            try self.io.close(self.socket);
+    fn close(self: *Self) void {
+        if (self.send_op) |op| op.detach();
+        if (self.recv_op) |op| op.detach();
+        if (self.connect_op) |op| op.detach();
+        if (self.ticker_op) |op| op.detach();
+        if (self.socket > 0) self.io.close(self.socket) catch {};
         self.state = .closed;
     }
 };
