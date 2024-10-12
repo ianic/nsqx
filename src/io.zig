@@ -242,8 +242,8 @@ pub const Io = struct {
     ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.accept(self, socket, context, success, fail, op_field);
-        try op.prep();
+        op.* = Op.accept(socket, context, success, fail, op_field);
+        try op.prep(self);
         op_field.* = op;
     }
 
@@ -258,8 +258,8 @@ pub const Io = struct {
     ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.connect(self, socket, addr, context, success, fail, op_field);
-        try op.prep();
+        op.* = Op.connect(socket, addr, context, success, fail, op_field);
+        try op.prep(self);
         op_field.* = op;
     }
 
@@ -274,8 +274,8 @@ pub const Io = struct {
     ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.recv(self, socket, context, success, fail, op_field);
-        try op.prep();
+        op.* = Op.recv(socket, context, success, fail, op_field);
+        try op.prep(self);
         op_field.* = op;
     }
 
@@ -291,7 +291,7 @@ pub const Io = struct {
     //     const op = try self.acquire();
     //     errdefer self.release(op);
     //     op.* = Op.writev(self, socket, vec, context, sent, failed);
-    //     try op.prep();
+    //     try op.prep(self);
     //     return op;
     // }
 
@@ -306,8 +306,8 @@ pub const Io = struct {
     ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.sendv(self, socket, msghdr, context, success, fail, op_field);
-        try op.prep();
+        op.* = Op.sendv(socket, msghdr, context, success, fail, op_field);
+        try op.prep(self);
         op_field.* = op;
     }
 
@@ -322,8 +322,8 @@ pub const Io = struct {
     ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.send(self, socket, buf, context, success, fail, op_field);
-        try op.prep();
+        op.* = Op.send(socket, buf, context, success, fail, op_field);
+        try op.prep(self);
         op_field.* = op;
     }
 
@@ -338,8 +338,8 @@ pub const Io = struct {
     ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.ticker(self, msec, context, success, fail, op_field);
-        try op.prep();
+        op.* = Op.ticker(msec, context, success, fail, op_field);
+        try op.prep(self);
         op_field.* = op;
     }
 
@@ -354,8 +354,8 @@ pub const Io = struct {
     ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.timer(self, nsec, context, success, fail, op_field);
-        try op.prep();
+        op.* = Op.timer(nsec, context, success, fail, op_field);
+        try op.prep(self);
         op_field.* = op;
     }
 
@@ -371,8 +371,8 @@ pub const Io = struct {
     ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.socketCreate(self, domain, socket_type, protocol, context, success, fail, op_field);
-        try op.prep();
+        op.* = Op.socketCreate(domain, socket_type, protocol, context, success, fail, op_field);
+        try op.prep(self);
         op_field.* = op;
     }
 
@@ -385,8 +385,8 @@ pub const Io = struct {
     ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.shutdownClose(self, socket, context, done, op_field);
-        try op.prep();
+        op.* = Op.shutdownClose(socket, context, done, op_field);
+        try op.prep(self);
         op_field.* = op;
     }
 
@@ -399,16 +399,16 @@ pub const Io = struct {
     ) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.close2(self, socket, context, done, op_field);
-        try op.prep();
+        op.* = Op.close2(socket, context, done, op_field);
+        try op.prep(self);
         op_field.* = op;
     }
 
     pub fn close(self: *Io, socket: socket_t) !void {
         const op = try self.acquire();
         errdefer self.release(op);
-        op.* = Op.close(self, socket);
-        try op.prep();
+        op.* = Op.close(socket);
+        try op.prep(self);
     }
 
     // Prepare cancel operation without callback.
@@ -451,7 +451,7 @@ pub const Io = struct {
 
     fn restartOp(self: *Io, op: *Op) !void {
         if (op.context != 0) {
-            try op.prep();
+            try op.prep(self);
             op.op_field.* = op;
             self.metric.restart(op);
         }
@@ -469,7 +469,7 @@ pub const Io = struct {
             if (op.context != 0) {
                 if (!has_more and op.args != .shutdown) op.op_field.* = null;
                 // Do operation callback
-                op.callback(op, cqe) catch |err| switch (err) {
+                op.callback(op, self, cqe) catch |err| switch (err) {
                     error.MultishotCanceled, error.ShortSend => {
                         // cqe should not be processed again operation should be restarted
                         self.restartOp(op) catch {
@@ -547,26 +547,26 @@ pub const Io = struct {
             if (self.op != null and self.fire_at <= fire_at) return;
 
             const delay = fire_at - now_;
-            try self.reset();
-            try self.io.timer(delay, self, ticked, failed, &self.op);
+            self.reset();
+            try self.io.timer(delay, self, onTimer, onTimerFail, &self.op);
             self.fire_at = fire_at;
         }
 
-        pub fn reset(self: *Self) !void {
-            if (self.op) |op| try op.cancel();
+        pub fn reset(self: *Self) void {
+            if (self.op) |op| op.detach(self.io);
         }
 
         pub fn close(self: *Self) !void {
             if (self.closed) return;
-            try self.reset();
+            self.reset();
             self.closed = true;
         }
 
-        fn ticked(self: *Self) Error!void {
+        fn onTimer(self: *Self) Error!void {
             try self.callback(self);
         }
 
-        fn failed(_: *Self, err: anyerror) Error!void {
+        fn onTimerFail(_: *Self, err: anyerror) Error!void {
             log.err("timer failed {}", .{err});
         }
     };
@@ -577,10 +577,9 @@ fn flagMore(cqe: linux.io_uring_cqe) bool {
 }
 
 pub const Op = struct {
-    io: *Io,
     context: u64,
     op_field: *?*Op,
-    callback: *const fn (*Op, linux.io_uring_cqe) CallbackError!void = undefined,
+    callback: *const fn (*Op, *Io, linux.io_uring_cqe) CallbackError!void = undefined,
     args: Args,
 
     const Args = union(Kind) {
@@ -631,49 +630,48 @@ pub const Op = struct {
         shutdown,
     };
 
-    pub fn detach(op: *Op) void {
+    pub fn detach(op: *Op, io: *Io) void {
         // try cancel
-        op.cancel() catch |err| {
+        op.cancel(io) catch |err| {
             log.warn("fail to cancel operation {}", .{err});
         };
         op.op_field.* = null;
         op.context = 0;
     }
 
-    pub fn cancel(op: *Op) !void {
+    pub fn cancel(op: *Op, io: *Io) !void {
         switch (op.args) {
-            .timer, .ticker => _ = try op.io.ring.timeout_remove(0, @intFromPtr(op), 0),
-            else => _ = try op.io.ring.cancel(0, @intFromPtr(op), 0),
+            .timer, .ticker => _ = try io.ring.timeout_remove(0, @intFromPtr(op), 0),
+            else => _ = try io.ring.cancel(0, @intFromPtr(op), 0),
         }
     }
 
-    fn prep(op: *Op) !void {
+    fn prep(op: *Op, io: *Io) !void {
         const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
 
         // TODO timeout on connect or any other non multishot operation can be implemented like
         //sqe.flags |= linux.IOSQE_IO_LINK;
-        //_ = try op.io.ring.link_timeout(1, &timeout_ts, linux.IORING_TIMEOUT_ETIME_SUCCESS);
+        //_ = try io.ring.link_timeout(1, &timeout_ts, linux.IORING_TIMEOUT_ETIME_SUCCESS);
 
         switch (op.args) {
-            .accept => |*arg| _ = try op.io.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),
-            .connect => |*arg| _ = try op.io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen()),
-            .close => |socket| _ = try op.io.ring.close(@intFromPtr(op), socket),
-            .recv => |socket| _ = try op.io.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
-            .writev => |*arg| _ = try op.io.ring.writev(@intFromPtr(op), arg.socket, arg.vec, 0),
-            .sendv => |*arg| _ = try op.io.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
-            .send => |*arg| _ = try op.io.ring.send(@intFromPtr(op), arg.socket, arg.buf, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
-            .ticker => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, IORING_TIMEOUT_MULTISHOT),
-            .timer => |*ts| _ = try op.io.ring.timeout(@intFromPtr(op), ts, 0, 0),
-            .socket => |*arg| _ = try op.io.ring.socket(@intFromPtr(op), arg.domain, arg.socket_type, arg.protocol, 0),
-            .shutdown => |socket| _ = try op.io.ring.shutdown(@intFromPtr(op), socket, 2),
+            .accept => |*arg| _ = try io.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),
+            .connect => |*arg| _ = try io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen()),
+            .close => |socket| _ = try io.ring.close(@intFromPtr(op), socket),
+            .recv => |socket| _ = try io.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
+            .writev => |*arg| _ = try io.ring.writev(@intFromPtr(op), arg.socket, arg.vec, 0),
+            .sendv => |*arg| _ = try io.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
+            .send => |*arg| _ = try io.ring.send(@intFromPtr(op), arg.socket, arg.buf, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
+            .ticker => |*ts| _ = try io.ring.timeout(@intFromPtr(op), ts, 0, IORING_TIMEOUT_MULTISHOT),
+            .timer => |*ts| _ = try io.ring.timeout(@intFromPtr(op), ts, 0, 0),
+            .socket => |*arg| _ = try io.ring.socket(@intFromPtr(op), arg.domain, arg.socket_type, arg.protocol, 0),
+            .shutdown => |socket| _ = try io.ring.shutdown(@intFromPtr(op), socket, 2),
         }
-        op.io.metric.submit(op);
+        io.metric.submit(op);
     }
 
     // Multishot operations -----------------
 
     fn accept(
-        io: *Io,
         socket: socket_t,
         context: anytype,
         comptime success: fn (@TypeOf(context), socket_t, net.Address) Error!void,
@@ -682,7 +680,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
@@ -704,7 +702,6 @@ pub const Op = struct {
             }
         };
         return .{
-            .io = io,
             .context = @intFromPtr(context),
             .op_field = op_field,
             .callback = wrapper.complete,
@@ -713,7 +710,6 @@ pub const Op = struct {
     }
 
     fn ticker(
-        io: *Io,
         msec: i64, // milliseconds
         context: anytype,
         comptime success: fn (@TypeOf(context)) Error!void,
@@ -722,7 +718,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS, .TIME => try success(ctx),
@@ -735,7 +731,6 @@ pub const Op = struct {
         const sec: i64 = @divTrunc(msec, 1000);
         const nsec: i64 = (msec - sec * 1000) * ns_per_ms;
         return .{
-            .io = io,
             .context = @intFromPtr(context),
             .op_field = op_field,
             .callback = wrapper.complete,
@@ -744,7 +739,6 @@ pub const Op = struct {
     }
 
     fn recv(
-        io: *Io,
         socket: socket_t,
         context: anytype,
         comptime success: fn (@TypeOf(context), []const u8) Error!void,
@@ -753,7 +747,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
@@ -761,12 +755,12 @@ pub const Op = struct {
                         if (n == 0)
                             return try fail(ctx, error.EndOfFile);
 
-                        op.io.metric.recv_bytes +%= n;
+                        io.metric.recv_bytes +%= n;
                         const buffer_id = cqe.buffer_id() catch unreachable;
-                        const bytes = op.io.recv_buf_grp.get(buffer_id)[0..n];
+                        const bytes = io.recv_buf_grp.get(buffer_id)[0..n];
                         try success(ctx, bytes);
-                        op.io.recv_buf_grp.put(buffer_id);
-                        op.io.metric.recv_buf_grp.success +%= 1;
+                        io.recv_buf_grp.put(buffer_id);
+                        io.metric.recv_buf_grp.success +%= 1;
 
                         // NOTE: recv is not restarted if there is no more
                         // multishot cqe's (like accept, ticker). Check op_field
@@ -775,7 +769,7 @@ pub const Op = struct {
                     },
                     .NOBUFS => {
                         // log.info("recv nobufs", .{});
-                        op.io.metric.recv_buf_grp.no_bufs +%= 1;
+                        io.metric.recv_buf_grp.no_bufs +%= 1;
                     },
                     .INTR => {},
                     else => |errno| return try fail(ctx, errFromErrno(errno)),
@@ -784,7 +778,6 @@ pub const Op = struct {
             }
         };
         return .{
-            .io = io,
             .context = @intFromPtr(context),
             .op_field = op_field,
             .callback = wrapper.complete,
@@ -795,7 +788,6 @@ pub const Op = struct {
     // Single shot operations -----------------
 
     fn connect(
-        io: *Io,
         socket: socket_t,
         addr: *net.Address,
         context: anytype,
@@ -805,7 +797,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => return try success(ctx),
@@ -814,7 +806,6 @@ pub const Op = struct {
             }
         };
         return .{
-            .io = io,
             .context = @intFromPtr(context),
             .op_field = op_field,
             .callback = wrapper.complete,
@@ -860,7 +851,6 @@ pub const Op = struct {
     // }
 
     fn sendv(
-        io: *Io,
         socket: socket_t,
         msghdr: *posix.msghdr_const,
         context: anytype,
@@ -870,12 +860,12 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
                         const n: usize = @intCast(cqe.res);
-                        op.io.metric.send_bytes +%= n;
+                        io.metric.send_bytes +%= n;
 
                         // zero copy send handling
                         // if (cqe.flags & linux.IORING_CQE_F_MORE > 0) {
@@ -913,7 +903,6 @@ pub const Op = struct {
             }
         };
         return .{
-            .io = io,
             .context = @intFromPtr(context),
             .op_field = op_field,
             .callback = wrapper.complete,
@@ -924,7 +913,6 @@ pub const Op = struct {
     }
 
     fn send(
-        io: *Io,
         socket: socket_t,
         buf: []const u8,
         context: anytype,
@@ -934,12 +922,12 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
                         const n: usize = @intCast(cqe.res);
-                        op.io.metric.send_bytes +%= n;
+                        io.metric.send_bytes +%= n;
                         const send_buf = op.args.send.buf;
                         if (n < send_buf.len) {
                             op.args.send.buf = send_buf[n..];
@@ -952,7 +940,6 @@ pub const Op = struct {
             }
         };
         return .{
-            .io = io,
             .context = @intFromPtr(context),
             .op_field = op_field,
             .callback = wrapper.complete,
@@ -963,7 +950,6 @@ pub const Op = struct {
     }
 
     fn timer(
-        io: *Io,
         nsec: u64,
         context: anytype,
         comptime success: fn (@TypeOf(context)) Error!void,
@@ -972,7 +958,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS, .TIME => try success(ctx),
@@ -983,7 +969,6 @@ pub const Op = struct {
         const sec = nsec / ns_per_s;
         const ns = (nsec - sec * ns_per_s);
         return .{
-            .io = io,
             .context = @intFromPtr(context),
             .op_field = op_field,
             .callback = wrapper.complete,
@@ -992,7 +977,6 @@ pub const Op = struct {
     }
 
     fn socketCreate(
-        io: *Io,
         domain: u32,
         socket_type: u32,
         protocol: u32,
@@ -1003,7 +987,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => try success(ctx, @intCast(cqe.res)),
@@ -1012,7 +996,6 @@ pub const Op = struct {
             }
         };
         return .{
-            .io = io,
             .context = @intFromPtr(context),
             .op_field = op_field,
             .callback = wrapper.complete,
@@ -1021,7 +1004,6 @@ pub const Op = struct {
     }
 
     fn shutdownClose(
-        io: *Io,
         socket: socket_t,
         context: anytype,
         comptime done: fn (@TypeOf(context)) void,
@@ -1029,14 +1011,13 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 _ = cqe;
                 const ctx: Context = @ptrFromInt(op.context);
-                try op.io.close2(op.args.shutdown, ctx, done, op.op_field);
+                try io.close2(op.args.shutdown, ctx, done, op.op_field);
             }
         };
         return .{
-            .io = io,
             .context = @intFromPtr(context),
             .op_field = op_field,
             .callback = wrapper.complete,
@@ -1046,7 +1027,6 @@ pub const Op = struct {
 
     // TODO: fix this close / close2
     fn close2(
-        io: *Io,
         socket: socket_t,
         context: anytype,
         comptime done: fn (@TypeOf(context)) void,
@@ -1054,14 +1034,13 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 _ = cqe;
                 const ctx: Context = @ptrFromInt(op.context);
                 done(ctx);
             }
         };
         return .{
-            .io = io,
             .context = @intFromPtr(context),
             .op_field = op_field,
             .callback = wrapper.complete,
@@ -1070,11 +1049,9 @@ pub const Op = struct {
     }
 
     fn close(
-        io: *Io,
         socket: socket_t,
     ) Op {
         return .{
-            .io = io,
             .context = 0,
             .op_field = undefined,
             .callback = undefined,
@@ -1132,16 +1109,17 @@ test "ticker" {
     const Ctx = struct {
         count: usize = 0,
         op: ?*Op = null,
-        pub fn ticked(self: *@This()) Error!void {
+        pub fn onTick(self: *@This()) Error!void {
             self.count += 1;
         }
+        fn onTickerFail(_: *@This(), _: anyerror) Error!void {}
     };
     var ctx = Ctx{};
 
     const delay = 123;
-    const op = try io.ticker(delay, &ctx, Ctx.ticked, null, &ctx.op);
+    try io.ticker(delay, &ctx, Ctx.onTick, Ctx.onTickerFail, &ctx.op);
     try testing.expect(ctx.op != null);
-    _ = op;
+
     const start = unixMilli();
     try io.tick();
     const elapsed = unixMilli() - start;
@@ -1214,7 +1192,7 @@ test "size" {
         buf: []const u8,
     };
 
-    try testing.expectEqual(64, @sizeOf(Op));
+    try testing.expectEqual(56, @sizeOf(Op));
     try testing.expectEqual(32, @sizeOf(Op.Args));
     try testing.expectEqual(24, @sizeOf(Accept));
     try testing.expectEqual(16, @sizeOf(Connect));
@@ -1223,6 +1201,7 @@ test "size" {
     try testing.expectEqual(24, @sizeOf(Send));
     try testing.expectEqual(112, @sizeOf(net.Address));
     try testing.expectEqual(16, @sizeOf(linux.kernel_timespec));
+    try testing.expectEqual(8, @sizeOf(?*Op));
 }
 
 test "pointer" {

@@ -431,16 +431,16 @@ pub const Conn = struct {
             // Dirty shutdown. Detach from all io operations. No callback will
             // be fired after that.
             log.warn("{} clean shutdown failed {}", .{ self.socket, err });
-            if (self.ticker_op) |op| op.detach();
-            if (self.recv_op) |op| op.detach();
-            if (self.send_op) |op| op.detach();
-            if (self.close_op) |op| op.detach();
+            if (self.ticker_op) |op| op.detach(self.io);
+            if (self.recv_op) |op| op.detach(self.io);
+            if (self.send_op) |op| op.detach(self.io);
+            if (self.close_op) |op| op.detach(self.io);
             self.onClose();
         };
     }
 
     fn cleanShutdown(self: *Conn) !void {
-        if (self.ticker_op) |op| try op.cancel();
+        if (self.ticker_op) |op| try op.cancel(self.io);
         try self.io.shutdownClose(self.socket, self, onClose, &self.close_op);
     }
 

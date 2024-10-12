@@ -367,7 +367,7 @@ const Conn = struct {
     }
 
     fn cleanShutdown(self: *Self) !void {
-        if (self.connect_op) |op| try op.cancel();
+        if (self.connect_op) |op| try op.cancel(self.io);
         if (self.socket != 0) {
             try self.io.shutdownClose(self.socket, self, shutdown, &self.close_op);
             self.socket = 0;
@@ -375,9 +375,9 @@ const Conn = struct {
     }
 
     fn dirtyShutdown(self: *Self) void {
-        if (self.connect_op) |op| op.detach();
-        if (self.recv_op) |op| op.detach();
-        if (self.send_op) |op| op.detach();
+        if (self.connect_op) |op| op.detach(self.io);
+        if (self.recv_op) |op| op.detach(self.io);
+        if (self.send_op) |op| op.detach(self.io);
         if (self.socket > 0) {
             self.io.close(self.socket) catch {};
             self.socket = 0;

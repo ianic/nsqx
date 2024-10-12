@@ -171,8 +171,8 @@ pub const Conn = struct {
         self.state = .closing;
         self.io.shutdownClose(self.socket, self, shutdown, &self.close_op) catch |err| {
             log.warn("{} clean shutdown failed {}", .{ self.socket, err });
-            if (self.recv_op) |op| op.detach();
-            if (self.send_op) |op| op.detach();
+            if (self.recv_op) |op| op.detach(self.io);
+            if (self.send_op) |op| op.detach(self.io);
             self.shutdown();
         };
     }
