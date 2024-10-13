@@ -40,7 +40,7 @@ pub const Io = struct {
     cqe_buf: [256]linux.io_uring_cqe = undefined,
     cqe_buf_head: usize = 0,
     cqe_buf_tail: usize = 0,
-    op_to_restart: ?*Op = null,
+    next: ?*Op = null,
 
     const Metric = struct {
         loops: usize = 0,
@@ -113,9 +113,9 @@ pub const Io = struct {
             }
         };
 
-        fn submit(self: *Metric, op: *Op) void {
+        fn submit(self: *Metric, kind: Op.Kind) void {
             self.all.submit();
-            switch (op.args) {
+            switch (kind) {
                 .accept => self.accept.submit(),
                 .connect => self.connect.submit(),
                 .close => self.close.submit(),
@@ -127,9 +127,9 @@ pub const Io = struct {
             }
         }
 
-        fn complete(self: *Metric, op: *Op) void {
+        fn complete(self: *Metric, kind: Op.Kind) void {
             self.all.complete();
-            switch (op.args) {
+            switch (kind) {
                 .accept => self.accept.complete(),
                 .connect => self.connect.complete(),
                 .close => self.close.complete(),
@@ -141,9 +141,9 @@ pub const Io = struct {
             }
         }
 
-        fn restart(self: *Metric, op: *Op) void {
+        fn restart(self: *Metric, kind: Op.Kind) void {
             self.all.restart();
-            switch (op.args) {
+            switch (kind) {
                 .accept => self.accept.restart(),
                 .connect => self.connect.restart(),
                 .close => self.close.restart(),
@@ -434,7 +434,6 @@ pub const Io = struct {
     pub fn tick(self: *Io) !void {
         self.metric.loops += 1;
         _ = try self.ring.submit();
-        if (self.op_to_restart) |op| try self.restartOp(op);
         if (self.cqe_buf_head >= self.cqe_buf_tail) {
             self.cqe_buf_head = 0;
             self.cqe_buf_tail = 0;
@@ -449,15 +448,6 @@ pub const Io = struct {
         }
     }
 
-    fn restartOp(self: *Io, op: *Op) !void {
-        if (op.context != 0) {
-            try op.prep(self);
-            op.op_field.* = op;
-            self.metric.restart(op);
-        }
-        self.op_to_restart = null;
-    }
-
     fn flushCompletions(self: *Io) Error!void {
         while (self.cqe_buf_head < self.cqe_buf_tail) : (self.cqe_buf_head += 1) {
             const cqe = self.cqe_buf[self.cqe_buf_head];
@@ -466,29 +456,36 @@ pub const Io = struct {
             const has_more = flagMore(cqe);
 
             const op: *Op = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
-            if (op.context != 0) {
-                if (!has_more and op.args != .shutdown) op.op_field.* = null;
-                // Do operation callback
-                op.callback(op, self, cqe) catch |err| switch (err) {
-                    error.MultishotCanceled, error.ShortSend => {
-                        // cqe should not be processed again operation should be restarted
-                        self.restartOp(op) catch {
-                            // schedule to restart after ring submit
-                            self.cqe_buf_head += 1;
-                            self.op_to_restart = op;
-                            break;
-                        };
-                        continue;
-                    },
-                    // retry cqe callback
-                    error.OutOfMemory, error.SubmissionQueueFull => |e| return e,
-                };
-            }
-            if (!has_more) {
-                self.metric.complete(op);
-                self.release(op);
-            }
+            if (has_more) op.flags |= Op.flag_has_more else op.flags &= ~Op.flag_has_more;
+            op.flags &= ~Op.flag_submitted;
+            const op_kind: Op.Kind = op.args;
+
+            // Do operation callback
+            op.callback(op, self, cqe) catch |err| switch (err) {
+                error.MultishotCanceled, error.ShortSend => {
+                    self.metric.restart(op_kind);
+                    self.submit(op);
+                    continue;
+                },
+                // retry cqe callback
+                error.OutOfMemory, error.SubmissionQueueFull => |e| return e,
+            };
+            // NOTE: op can be deallocated here
+            if (!has_more) self.metric.complete(op_kind);
         }
+    }
+
+    pub fn submit(self: *Io, op: *Op) void {
+        assert(op.flags & Op.flag_submitted == 0);
+        op.flags |= Op.flag_submitted;
+        op.prep(self) catch |err| {
+            log.debug("fail to submit operation {}", .{err});
+            // add to linked list
+            op.next = self.next;
+            self.next = op;
+            // TODO not parsing that list
+            unreachable;
+        };
     }
 
     pub fn now(self: *Io) u64 {
@@ -501,9 +498,30 @@ pub const Io = struct {
         comptime cb: fn (@TypeOf(context)) Error!void,
     ) Timer {
         return Timer.init(self, context, cb);
+        //return NoopTimer.init(self, context, cb);
     }
 
     pub const Timer = struct {
+        io: *Io,
+        const Self = @This();
+        pub fn init(
+            io: *Io,
+            context: anytype,
+            comptime _: fn (@TypeOf(context)) Error!void,
+        ) Timer {
+            return .{
+                .io = io,
+            };
+        }
+        pub fn now(self: *Self) u64 {
+            return self.io.timestamp;
+        }
+        pub fn set(_: *Self, _: u64) !void {}
+        pub fn reset(_: *Self) void {}
+        pub fn close(_: *Self) !void {}
+    };
+
+    pub const Timer0 = struct {
         io: *Io,
         op: ?*Op = null,
         fire_at: u64 = no_timeout,
@@ -577,10 +595,14 @@ fn flagMore(cqe: linux.io_uring_cqe) bool {
 }
 
 pub const Op = struct {
-    context: u64,
-    op_field: *?*Op,
+    context: u64 = 0,
     callback: *const fn (*Op, *Io, linux.io_uring_cqe) CallbackError!void = undefined,
-    args: Args,
+    args: Args = undefined,
+    next: ?*Op = null,
+    flags: u8 = 0,
+
+    const flag_submitted: u8 = 1 << 0;
+    const flag_has_more: u8 = 1 << 1;
 
     const Args = union(Kind) {
         accept: struct {
@@ -630,6 +652,14 @@ pub const Op = struct {
         shutdown,
     };
 
+    pub fn submitted(op: Op) bool {
+        return op.flags & flag_submitted > 0;
+    }
+
+    pub fn hasMore(op: Op) bool {
+        return op.flags & flag_has_more > 0;
+    }
+
     pub fn detach(op: *Op, io: *Io) void {
         // try cancel
         op.cancel(io) catch |err| {
@@ -666,17 +696,16 @@ pub const Op = struct {
             .socket => |*arg| _ = try io.ring.socket(@intFromPtr(op), arg.domain, arg.socket_type, arg.protocol, 0),
             .shutdown => |socket| _ = try io.ring.shutdown(@intFromPtr(op), socket, 2),
         }
-        io.metric.submit(op);
+        io.metric.submit(op.args);
     }
 
     // Multishot operations -----------------
 
-    fn accept(
+    pub fn accept(
         socket: socket_t,
         context: anytype,
         comptime success: fn (@TypeOf(context), socket_t, net.Address) Error!void,
         comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
@@ -703,7 +732,6 @@ pub const Op = struct {
         };
         return .{
             .context = @intFromPtr(context),
-            .op_field = op_field,
             .callback = wrapper.complete,
             .args = .{ .accept = .{ .socket = socket } },
         };
@@ -738,12 +766,11 @@ pub const Op = struct {
         };
     }
 
-    fn recv(
+    pub fn recv(
         socket: socket_t,
         context: anytype,
         comptime success: fn (@TypeOf(context), []const u8) Error!void,
         comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
@@ -762,6 +789,7 @@ pub const Op = struct {
                         io.recv_buf_grp.put(buffer_id);
                         io.metric.recv_buf_grp.success +%= 1;
 
+                        // TODO ovaj note vise ne stoji
                         // NOTE: recv is not restarted if there is no more
                         // multishot cqe's (like accept, ticker). Check op_field
                         // in callback if null multishot is terminated.
@@ -779,7 +807,6 @@ pub const Op = struct {
         };
         return .{
             .context = @intFromPtr(context),
-            .op_field = op_field,
             .callback = wrapper.complete,
             .args = .{ .recv = socket },
         };
@@ -850,13 +877,12 @@ pub const Op = struct {
     //     };
     // }
 
-    fn sendv(
+    pub fn sendv(
         socket: socket_t,
         msghdr: *posix.msghdr_const,
         context: anytype,
         comptime success: fn (@TypeOf(context)) Error!void,
         comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
@@ -897,14 +923,12 @@ pub const Op = struct {
 
                         try success(ctx);
                     },
-                    // .INTR => return .restart,
                     else => |errno| try fail(ctx, errFromErrno(errno)),
                 }
             }
         };
         return .{
             .context = @intFromPtr(context),
-            .op_field = op_field,
             .callback = wrapper.complete,
             .args = .{
                 .sendv = .{ .socket = socket, .msghdr = msghdr },
@@ -1003,23 +1027,22 @@ pub const Op = struct {
         };
     }
 
-    fn shutdownClose(
+    pub fn shutdownClose(
         socket: socket_t,
         context: anytype,
         comptime done: fn (@TypeOf(context)) void,
-        op_field: *?*Op,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
             fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 _ = cqe;
                 const ctx: Context = @ptrFromInt(op.context);
-                try io.close2(op.args.shutdown, ctx, done, op.op_field);
+                op.* = Op.close2(op.args.shutdown, ctx, done);
+                io.submit(op);
             }
         };
         return .{
             .context = @intFromPtr(context),
-            .op_field = op_field,
             .callback = wrapper.complete,
             .args = .{ .shutdown = socket },
         };
@@ -1030,7 +1053,6 @@ pub const Op = struct {
         socket: socket_t,
         context: anytype,
         comptime done: fn (@TypeOf(context)) void,
-        op_field: *?*Op,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
@@ -1042,7 +1064,6 @@ pub const Op = struct {
         };
         return .{
             .context = @intFromPtr(context),
-            .op_field = op_field,
             .callback = wrapper.complete,
             .args = .{ .close = socket },
         };

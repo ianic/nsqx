@@ -645,8 +645,9 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                 fn deinit(self: *Channel) void {
                     self.timer.close() catch {};
-                    // TODO: ovo treba kada ga brisem ali ne u deinit
-                    for (self.consumers.items) |consumer| consumer.channelClosed();
+                    // TODO: ovo treba kada ga brisem ali ne u deinit cak ne
+                    // smije biti u deinit jer je consumer vec deallocated
+                    // for (self.consumers.items) |consumer| consumer.channelClosed();
                     for (self.in_flight.values()) |cm| cm.destroy(self.allocator);
                     while (self.deferred.removeOrNull()) |cm| cm.destroy(self.allocator);
                     self.in_flight.deinit();
@@ -1204,7 +1205,7 @@ const TestTimer = struct {
     const no_timeout: u64 = @import("io.zig").Io.Timer.no_timeout;
 };
 
-const NoopNotifier = struct {
+pub const NoopNotifier = struct {
     call_count: usize = 0,
     const Self = @This();
     fn topicCreated(self: *Self, _: []const u8) void {
