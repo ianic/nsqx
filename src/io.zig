@@ -31,7 +31,6 @@ pub const CallbackError = error{
 
 pub const Io = struct {
     allocator: mem.Allocator,
-    op_pool: std.heap.MemoryPool(Op) = undefined,
     timer_pool: std.heap.MemoryPool(Timer) = undefined,
     ring: IoUring = undefined,
     timestamp: u64 = 0,
@@ -43,149 +42,7 @@ pub const Io = struct {
     cqe_buf_tail: usize = 0,
     next: ?*Op = null,
 
-    const Metric = struct {
-        loops: usize = 0,
-        cqes: usize = 0,
-        send_bytes: usize = 0,
-        recv_bytes: usize = 0,
-
-        recv_buf_grp: struct {
-            success: usize = 0,
-            no_bufs: usize = 0,
-
-            pub fn noBufs(self: @This()) f64 {
-                const total = self.success + self.no_bufs;
-                if (total == 0) return 0;
-                return @as(f64, @floatFromInt(self.no_bufs)) / @as(f64, @floatFromInt(total)) * 100;
-            }
-        } = .{},
-
-        all: Counter = .{},
-        accept: Counter = .{},
-        connect: Counter = .{},
-        close: Counter = .{},
-        recv: Counter = .{},
-        writev: Counter = .{},
-        sendv: Counter = .{},
-        ticker: Counter = .{},
-
-        // Counter of submitted/completed operations
-        const Counter = struct {
-            submitted: usize = 0,
-            completed: usize = 0,
-            restarted: usize = 0,
-            max_active: usize = 0,
-
-            // Current number of active operations
-            pub fn active(self: Counter) usize {
-                return self.submitted - self.restarted - self.completed;
-            }
-            fn submit(self: *Counter) void {
-                self.submitted += 1;
-                if (self.active() > self.max_active)
-                    self.max_active = self.active();
-            }
-            fn complete(self: *Counter) void {
-                self.completed += 1;
-            }
-            fn restart(self: *Counter) void {
-                self.restarted += 1;
-            }
-            pub fn format(
-                self: Counter,
-                comptime fmt: []const u8,
-                options: std.fmt.FormatOptions,
-                writer: anytype,
-            ) !void {
-                _ = fmt;
-                _ = options;
-
-                try writer.print(
-                    "active: {:>8}, max active: {:>8}, submitted: {:>8}, restarted: {:>8}, completed: {:>8}",
-                    .{ self.active(), self.max_active, self.submitted, self.restarted, self.completed },
-                );
-            }
-
-            fn write(prefix: []const u8, cur: Counter, prev: Counter, writer: anytype) !void {
-                try writer.counter(prefix, "submitted", cur.submitted, prev.submitted);
-                try writer.counter(prefix, "completed", cur.completed, prev.completed);
-                try writer.counter(prefix, "restarted", cur.restarted, prev.restarted);
-                try writer.gauge(prefix, "active", cur.active());
-            }
-        };
-
-        fn submit(self: *Metric, kind: Op.Kind) void {
-            self.all.submit();
-            switch (kind) {
-                .accept => self.accept.submit(),
-                .connect => self.connect.submit(),
-                .close => self.close.submit(),
-                .recv => self.recv.submit(),
-                .writev => self.writev.submit(),
-                .send, .sendv => self.sendv.submit(),
-                .ticker, .timer => self.ticker.submit(),
-                .cancel, .socket, .shutdown => {},
-            }
-        }
-
-        fn complete(self: *Metric, kind: Op.Kind) void {
-            self.all.complete();
-            switch (kind) {
-                .accept => self.accept.complete(),
-                .connect => self.connect.complete(),
-                .close => self.close.complete(),
-                .recv => self.recv.complete(),
-                .writev => self.writev.complete(),
-                .send, .sendv => self.sendv.complete(),
-                .ticker, .timer => self.ticker.complete(),
-                .cancel, .socket, .shutdown => {},
-            }
-        }
-
-        fn restart(self: *Metric, kind: Op.Kind) void {
-            self.all.restart();
-            switch (kind) {
-                .accept => self.accept.restart(),
-                .connect => self.connect.restart(),
-                .close => self.close.restart(),
-                .recv => self.recv.restart(),
-                .writev => self.writev.restart(),
-                .send, .sendv => self.sendv.restart(),
-                .ticker, .timer => self.ticker.restart(),
-                .cancel, .socket, .shutdown => {},
-            }
-        }
-    };
-
-    pub fn writeMetrics(self: *Io, writer: anytype) !void {
-        const cur = self.metric;
-        const prev = self.metric_prev;
-        const write = Metric.Counter.write;
-
-        try write("io.op.all", cur.all, prev.all, writer);
-        try write("io.op.send", cur.sendv, prev.sendv, writer);
-        try write("io.op.recv", cur.recv, prev.recv, writer);
-        try write("io.op.accept", cur.accept, prev.accept, writer);
-        try write("io.op.connect", cur.connect, prev.connect, writer);
-        try write("io.op.ticker", cur.ticker, prev.ticker, writer);
-        {
-            try writer.counter("io", "loops", cur.loops, prev.loops);
-            try writer.counter("io", "cqes", cur.cqes, prev.cqes);
-
-            try writer.counter("io", "send_bytes", cur.send_bytes, prev.send_bytes);
-            try writer.counter("io", "recv_bytes", cur.recv_bytes, prev.recv_bytes);
-        }
-        {
-            try writer.counter("io.recv_buf_grp", "success", cur.recv_buf_grp.success, prev.recv_buf_grp.success);
-            try writer.counter("io.recv_buf_grp", "no_bufs", cur.recv_buf_grp.no_bufs, prev.recv_buf_grp.no_bufs);
-        }
-        self.metric_prev = cur;
-    }
-
     pub fn init(self: *Io, allocator: mem.Allocator, opt: Options) !void {
-        var op_pool = try std.heap.MemoryPool(Op).initPreheated(allocator, 1024);
-        errdefer op_pool.deinit();
-
         var timer_pool = std.heap.MemoryPool(Timer).init(allocator);
         errdefer timer_pool.deinit();
 
@@ -204,7 +61,6 @@ pub const Io = struct {
             .allocator = allocator,
             .ring = ring,
             .timestamp = timestamp(),
-            .op_pool = op_pool,
             .timer_pool = timer_pool,
         };
         if (opt.recv_buffers > 0) {
@@ -225,210 +81,8 @@ pub const Io = struct {
             self.allocator.free(self.recv_buf_grp.buffers);
             self.recv_buf_grp.deinit();
         }
-        self.ring.deinit();
-        self.op_pool.deinit();
         self.timer_pool.deinit();
-    }
-
-    fn acquire(self: *Io) !*Op {
-        return try self.op_pool.create();
-    }
-
-    fn release(self: *Io, op: *Op) void {
-        self.op_pool.destroy(op);
-    }
-
-    /// Multishot accept operation
-    pub fn accept(
-        self: *Io,
-        socket: socket_t,
-        context: anytype,
-        comptime success: fn (@TypeOf(context), socket_t, net.Address) Error!void,
-        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
-    ) !void {
-        const op = try self.acquire();
-        errdefer self.release(op);
-        op.* = Op.accept(socket, context, success, fail, op_field);
-        try op.prep(self);
-        op_field.* = op;
-    }
-
-    pub fn connect(
-        self: *Io,
-        socket: socket_t,
-        addr: *net.Address,
-        context: anytype,
-        comptime success: fn (@TypeOf(context)) Error!void,
-        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
-    ) !void {
-        const op = try self.acquire();
-        errdefer self.release(op);
-        op.* = Op.connect(socket, addr, context, success, fail, op_field);
-        try op.prep(self);
-        op_field.* = op;
-    }
-
-    /// Multishot receive operation
-    pub fn recv(
-        self: *Io,
-        socket: socket_t,
-        context: anytype,
-        comptime success: fn (@TypeOf(context), []const u8) Error!void,
-        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
-    ) !void {
-        const op = try self.acquire();
-        errdefer self.release(op);
-        op.* = Op.recv(socket, context, success, fail, op_field);
-        try op.prep(self);
-        op_field.* = op;
-    }
-
-    // // Unused making it private for now
-    // fn writev(
-    //     self: *Io,
-    //     socket: socket_t,
-    //     vec: []posix.iovec_const,
-    //     context: anytype,
-    //     comptime sent: fn (@TypeOf(context), usize) Error!void,
-    //     comptime failed: fn (@TypeOf(context), anyerror) Error!void,
-    // ) !*Op {
-    //     const op = try self.acquire();
-    //     errdefer self.release(op);
-    //     op.* = Op.writev(self, socket, vec, context, sent, failed);
-    //     try op.prep(self);
-    //     return op;
-    // }
-
-    pub fn sendv(
-        self: *Io,
-        socket: socket_t,
-        msghdr: *posix.msghdr_const,
-        context: anytype,
-        comptime success: fn (@TypeOf(context)) Error!void,
-        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
-    ) !void {
-        const op = try self.acquire();
-        errdefer self.release(op);
-        op.* = Op.sendv(socket, msghdr, context, success, fail, op_field);
-        try op.prep(self);
-        op_field.* = op;
-    }
-
-    pub fn send(
-        self: *Io,
-        socket: socket_t,
-        buf: []const u8,
-        context: anytype,
-        comptime success: fn (@TypeOf(context)) Error!void,
-        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
-    ) !void {
-        const op = try self.acquire();
-        errdefer self.release(op);
-        op.* = Op.send(socket, buf, context, success, fail, op_field);
-        try op.prep(self);
-        op_field.* = op;
-    }
-
-    /// Multi shot
-    pub fn ticker(
-        self: *Io,
-        msec: i64, // miliseconds  TODO: use msec or nsec on both places
-        context: anytype,
-        comptime success: fn (@TypeOf(context)) Error!void,
-        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
-    ) !void {
-        const op = try self.acquire();
-        errdefer self.release(op);
-        op.* = Op.ticker(msec, context, success, fail, op_field);
-        try op.prep(self);
-        op_field.* = op;
-    }
-
-    /// One shot
-    pub fn timer(
-        self: *Io,
-        nsec: u64, // delay in nanoseconds
-        context: anytype,
-        comptime success: fn (@TypeOf(context)) Error!void,
-        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
-    ) !void {
-        const op = try self.acquire();
-        errdefer self.release(op);
-        op.* = Op.timer(nsec, context, success, fail, op_field);
-        try op.prep(self);
-        op_field.* = op;
-    }
-
-    pub fn socketCreate(
-        self: *Io,
-        domain: u32,
-        socket_type: u32,
-        protocol: u32,
-        context: anytype,
-        comptime success: fn (@TypeOf(context), socket_t) Error!void,
-        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
-    ) !void {
-        const op = try self.acquire();
-        errdefer self.release(op);
-        op.* = Op.socketCreate(domain, socket_type, protocol, context, success, fail, op_field);
-        try op.prep(self);
-        op_field.* = op;
-    }
-
-    pub fn shutdownClose(
-        self: *Io,
-        socket: socket_t,
-        context: anytype,
-        comptime done: fn (@TypeOf(context)) void,
-        op_field: *?*Op,
-    ) !void {
-        const op = try self.acquire();
-        errdefer self.release(op);
-        op.* = Op.shutdownClose(socket, context, done, op_field);
-        try op.prep(self);
-        op_field.* = op;
-    }
-
-    pub fn close2(
-        self: *Io,
-        socket: socket_t,
-        context: anytype,
-        comptime done: fn (@TypeOf(context)) void,
-        op_field: *?*Op,
-    ) !void {
-        const op = try self.acquire();
-        errdefer self.release(op);
-        op.* = Op.close2(socket, context, done, op_field);
-        try op.prep(self);
-        op_field.* = op;
-    }
-
-    pub fn close(self: *Io, socket: socket_t) !void {
-        const op = try self.acquire();
-        errdefer self.release(op);
-        op.* = Op.close(socket);
-        try op.prep(self);
-    }
-
-    // Prepare cancel operation without callback.
-    // Op will get error OperationCanceled in fail callback.
-    pub fn cancel(self: *Io, op: *Op) !void {
-        switch (op.args) {
-            .timer, .ticker => _ = try self.ring.timeout_remove(0, @intFromPtr(op), 0),
-            else => _ = try self.ring.cancel(0, @intFromPtr(op), 0),
-        }
-    }
-
-    fn loop(self: *Io, run: Atomic(bool)) !void {
-        while (run.load(.monotonic)) try self.tick();
+        self.ring.deinit();
     }
 
     pub fn drain(self: *Io) !void {
@@ -440,8 +94,11 @@ pub const Io = struct {
 
     pub fn tick(self: *Io) !void {
         self.metric.loops += 1;
+        // Submit prepared sqe-s to the kernel.
         _ = try self.ring.submit();
+        // TODO: submit pending
         if (self.cqe_buf_head >= self.cqe_buf_tail) {
+            // Get completions.
             self.cqe_buf_head = 0;
             self.cqe_buf_tail = 0;
             const n = try self.ring.copy_cqes(&self.cqe_buf, 1);
@@ -449,6 +106,7 @@ pub const Io = struct {
             self.metric.cqes += n;
         }
         if (self.cqe_buf_head < self.cqe_buf_tail) {
+            // Process completions.
             const new_timestamp = timestamp();
             self.timestamp = if (new_timestamp <= self.timestamp) self.timestamp + 1 else new_timestamp;
             try self.flushCompletions();
@@ -474,10 +132,10 @@ pub const Io = struct {
                     self.submit(op);
                     continue;
                 },
-                // retry cqe callback
+                // Retry cqe callback
                 error.OutOfMemory, error.SubmissionQueueFull => |e| return e,
             };
-            // NOTE: op can be deallocated here
+            // NOTE: op can be already deallocated here don't use it after callback
             if (!has_more) self.metric.complete(op_kind);
         }
     }
@@ -509,26 +167,6 @@ pub const Io = struct {
         tmr.* = Timer.init(self, context, cb);
         return tmr;
     }
-
-    pub const Timer0 = struct {
-        io: *Io,
-        const Self = @This();
-        pub fn init(
-            io: *Io,
-            context: anytype,
-            comptime _: fn (@TypeOf(context)) Error!void,
-        ) Self {
-            return .{
-                .io = io,
-            };
-        }
-        pub fn now(self: *Self) u64 {
-            return self.io.timestamp;
-        }
-        pub fn set(_: *Self, _: u64) !void {}
-        pub fn reset(_: *Self) void {}
-        pub fn close(_: *Self) !void {}
-    };
 
     pub const Timer = struct {
         io: *Io,
@@ -680,6 +318,31 @@ pub const Io = struct {
             }
         }
     };
+
+    pub fn writeMetrics(self: *Io, writer: anytype) !void {
+        const cur = self.metric;
+        const prev = self.metric_prev;
+        const write = Metric.Counter.write;
+
+        try write("io.op.all", cur.all, prev.all, writer);
+        try write("io.op.send", cur.sendv, prev.sendv, writer);
+        try write("io.op.recv", cur.recv, prev.recv, writer);
+        try write("io.op.accept", cur.accept, prev.accept, writer);
+        try write("io.op.connect", cur.connect, prev.connect, writer);
+        try write("io.op.timer", cur.timer, prev.timer, writer);
+        {
+            try writer.counter("io", "loops", cur.loops, prev.loops);
+            try writer.counter("io", "cqes", cur.cqes, prev.cqes);
+
+            try writer.counter("io", "send_bytes", cur.send_bytes, prev.send_bytes);
+            try writer.counter("io", "recv_bytes", cur.recv_bytes, prev.recv_bytes);
+        }
+        {
+            try writer.counter("io.recv_buf_grp", "success", cur.recv_buf_grp.success, prev.recv_buf_grp.success);
+            try writer.counter("io.recv_buf_grp", "no_bufs", cur.recv_buf_grp.no_bufs, prev.recv_buf_grp.no_bufs);
+        }
+        self.metric_prev = cur;
+    }
 };
 
 fn flagMore(cqe: linux.io_uring_cqe) bool {
@@ -708,10 +371,6 @@ pub const Op = struct {
         },
         close: socket_t,
         recv: socket_t,
-        writev: struct {
-            socket: socket_t,
-            vec: []posix.iovec_const,
-        },
         sendv: struct {
             socket: socket_t,
             msghdr: *posix.msghdr_const,
@@ -720,7 +379,6 @@ pub const Op = struct {
             socket: socket_t,
             buf: []const u8,
         },
-        ticker: linux.kernel_timespec,
         timer: TimerArgs,
         socket: struct {
             domain: u32,
@@ -741,10 +399,8 @@ pub const Op = struct {
         connect,
         close,
         recv,
-        writev,
         sendv,
         send,
-        ticker,
         timer,
         socket,
         shutdown,
@@ -760,25 +416,7 @@ pub const Op = struct {
         return op.flags & flag_has_more > 0;
     }
 
-    pub fn detach(op: *Op, io: *Io) void {
-        // try cancel
-        op.cancel(io) catch |err| {
-            log.warn("fail to cancel operation {}", .{err});
-        };
-        op.op_field.* = null;
-        op.context = 0;
-    }
-
-    // pub fn cancel(op: *Op, io: *Io) !void {
-    //     switch (op.args) {
-    //         .timer, .ticker => _ = try io.ring.timeout_remove(0, @intFromPtr(op), 0),
-    //         else => _ = try io.ring.cancel(0, @intFromPtr(op), 0),
-    //     }
-    // }
-
     fn prep(op: *Op, io: *Io) !void {
-        const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
-
         // TODO timeout on connect or any other non multishot operation can be implemented like
         //sqe.flags |= linux.IOSQE_IO_LINK;
         //_ = try io.ring.link_timeout(1, &timeout_ts, linux.IORING_TIMEOUT_ETIME_SUCCESS);
@@ -788,15 +426,13 @@ pub const Op = struct {
             .connect => |*arg| _ = try io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen()),
             .close => |socket| _ = try io.ring.close(@intFromPtr(op), socket),
             .recv => |socket| _ = try io.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
-            .writev => |*arg| _ = try io.ring.writev(@intFromPtr(op), arg.socket, arg.vec, 0),
             .sendv => |*arg| _ = try io.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
             .send => |*arg| _ = try io.ring.send(@intFromPtr(op), arg.socket, arg.buf, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
-            .ticker => |*ts| _ = try io.ring.timeout(@intFromPtr(op), ts, 0, IORING_TIMEOUT_MULTISHOT),
             .timer => |*arg| _ = try io.ring.timeout(@intFromPtr(op), &arg.ts, arg.count, arg.flags),
             .socket => |*arg| _ = try io.ring.socket(@intFromPtr(op), arg.domain, arg.socket_type, arg.protocol, 0),
             .shutdown => |socket| _ = try io.ring.shutdown(@intFromPtr(op), socket, 2),
             .cancel => |op_to_cancel| switch (op_to_cancel.args) {
-                .timer, .ticker => _ = try io.ring.timeout_remove(@intFromPtr(op), @intFromPtr(op_to_cancel), 0),
+                .timer => _ = try io.ring.timeout_remove(@intFromPtr(op), @intFromPtr(op_to_cancel), 0),
                 else => _ = try io.ring.cancel(@intFromPtr(op), @intFromPtr(op_to_cancel), 0),
             },
         }
@@ -841,35 +477,6 @@ pub const Op = struct {
         };
     }
 
-    fn ticker(
-        msec: i64, // milliseconds
-        context: anytype,
-        comptime success: fn (@TypeOf(context)) Error!void,
-        comptime fail: ?fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
-    ) Op {
-        const Context = @TypeOf(context);
-        const wrapper = struct {
-            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
-                const ctx: Context = @ptrFromInt(op.context);
-                switch (cqe.err()) {
-                    .SUCCESS, .TIME => try success(ctx),
-                    .INTR => {},
-                    else => |errno| if (fail) |f| return try f(ctx, errFromErrno(errno)),
-                }
-                if (!flagMore(cqe)) return error.MultishotCanceled;
-            }
-        };
-        const sec: i64 = @divTrunc(msec, 1000);
-        const nsec: i64 = (msec - sec * 1000) * ns_per_ms;
-        return .{
-            .context = @intFromPtr(context),
-            .op_field = op_field,
-            .callback = wrapper.complete,
-            .args = .{ .ticker = .{ .sec = sec, .nsec = nsec } },
-        };
-    }
-
     pub fn recv(
         socket: socket_t,
         context: anytype,
@@ -895,7 +502,7 @@ pub const Op = struct {
 
                         // TODO ovaj note vise ne stoji
                         // NOTE: recv is not restarted if there is no more
-                        // multishot cqe's (like accept, ticker). Check op_field
+                        // multishot cqe's (like accept, timer). Check op_field
                         // in callback if null multishot is terminated.
                         return;
                     },
@@ -941,43 +548,6 @@ pub const Op = struct {
             .args = .{ .connect = .{ .socket = socket, .addr = addr } },
         };
     }
-
-    // fn writev(
-    //     io: *Io,
-    //     socket: socket_t,
-    //     vec: []posix.iovec_const,
-    //     context: anytype,
-    //     comptime sent: fn (@TypeOf(context), usize) Error!void,
-    //     comptime failed: fn (@TypeOf(context), anyerror) Error!void,
-    // ) Op {
-    //     const Context = @TypeOf(context);
-    //     const wrapper = struct {
-    //         fn complete(op: *Op, cqe: linux.io_uring_cqe) Error!CallbackResult {
-    //             const ctx: Context = @ptrFromInt(op.context);
-    //             switch (cqe.err()) {
-    //                 .SUCCESS => {
-    //                     const n: usize = @intCast(cqe.res);
-    //                     const v = resizeIovec(op.args.writev.vec, n);
-    //                     if (v.len > 0) { // restart on short send
-    //                         log.warn("short writev {}", .{n}); // TODO: remove
-    //                         op.args.writev.vec = v;
-    //                         return .restart;
-    //                     }
-    //                     try sent(ctx, n);
-    //                 },
-    //                 .INTR => return .restart,
-    //                 else => |errno| try failed(ctx, errFromErrno(errno)),
-    //             }
-    //             return .done;
-    //         }
-    //     };
-    //     return .{
-    //         .io = io,
-    //         .context = @intFromPtr(context),
-    //         .callback = wrapper.complete,
-    //         .args = .{ .writev = .{ .socket = socket, .vec = vec } },
-    //     };
-    // }
 
     pub fn sendv(
         socket: socket_t,
@@ -1089,8 +659,6 @@ pub const Op = struct {
                 }
             }
         };
-        // const sec = nsec / ns_per_s;
-        // const ns = (nsec - sec * ns_per_s);
         return .{
             .context = @intFromPtr(context),
             .callback = wrapper.complete,
@@ -1133,7 +701,7 @@ pub const Op = struct {
             fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 _ = cqe;
                 const ctx: Context = @ptrFromInt(op.context);
-                op.* = Op.close2(op.args.shutdown, ctx, done);
+                op.* = Op.close(op.args.shutdown, ctx, done);
                 io.submit(op);
             }
         };
@@ -1144,8 +712,7 @@ pub const Op = struct {
         };
     }
 
-    // TODO: fix this close / close2
-    fn close2(
+    fn close(
         socket: socket_t,
         context: anytype,
         comptime done: fn (@TypeOf(context)) void,
@@ -1182,16 +749,6 @@ pub const Op = struct {
             .context = @intFromPtr(context),
             .callback = wrapper.complete,
             .args = .{ .cancel = op_to_cancel },
-        };
-    }
-
-    fn close(
-        socket: socket_t,
-    ) Op {
-        return .{
-            .context = 0,
-            .callback = undefined,
-            .args = .{ .close = socket },
         };
     }
 };
@@ -1373,3 +930,114 @@ test "pointer" {
     o.ptr.* = null;
     try testing.expect(ctx.op == null);
 }
+
+const Metric = struct {
+    loops: usize = 0,
+    cqes: usize = 0,
+    send_bytes: usize = 0,
+    recv_bytes: usize = 0,
+
+    recv_buf_grp: struct {
+        success: usize = 0,
+        no_bufs: usize = 0,
+
+        pub fn noBufs(self: @This()) f64 {
+            const total = self.success + self.no_bufs;
+            if (total == 0) return 0;
+            return @as(f64, @floatFromInt(self.no_bufs)) / @as(f64, @floatFromInt(total)) * 100;
+        }
+    } = .{},
+
+    all: Counter = .{},
+    accept: Counter = .{},
+    connect: Counter = .{},
+    close: Counter = .{},
+    recv: Counter = .{},
+    writev: Counter = .{},
+    sendv: Counter = .{},
+    timer: Counter = .{},
+
+    // Counter of submitted/completed operations
+    const Counter = struct {
+        submitted: usize = 0,
+        completed: usize = 0,
+        restarted: usize = 0,
+        max_active: usize = 0,
+
+        // Current number of active operations
+        pub fn active(self: Counter) usize {
+            return self.submitted - self.restarted - self.completed;
+        }
+        fn submit(self: *Counter) void {
+            self.submitted += 1;
+            if (self.active() > self.max_active)
+                self.max_active = self.active();
+        }
+        fn complete(self: *Counter) void {
+            self.completed += 1;
+        }
+        fn restart(self: *Counter) void {
+            self.restarted += 1;
+        }
+        pub fn format(
+            self: Counter,
+            comptime fmt: []const u8,
+            options: std.fmt.FormatOptions,
+            writer: anytype,
+        ) !void {
+            _ = fmt;
+            _ = options;
+
+            try writer.print(
+                "active: {:>8}, max active: {:>8}, submitted: {:>8}, restarted: {:>8}, completed: {:>8}",
+                .{ self.active(), self.max_active, self.submitted, self.restarted, self.completed },
+            );
+        }
+
+        fn write(prefix: []const u8, cur: Counter, prev: Counter, writer: anytype) !void {
+            try writer.counter(prefix, "submitted", cur.submitted, prev.submitted);
+            try writer.counter(prefix, "completed", cur.completed, prev.completed);
+            try writer.counter(prefix, "restarted", cur.restarted, prev.restarted);
+            try writer.gauge(prefix, "active", cur.active());
+        }
+    };
+
+    fn submit(self: *Metric, kind: Op.Kind) void {
+        self.all.submit();
+        switch (kind) {
+            .accept => self.accept.submit(),
+            .connect => self.connect.submit(),
+            .close => self.close.submit(),
+            .recv => self.recv.submit(),
+            .send, .sendv => self.sendv.submit(),
+            .timer => self.timer.submit(),
+            .cancel, .socket, .shutdown => {},
+        }
+    }
+
+    fn complete(self: *Metric, kind: Op.Kind) void {
+        self.all.complete();
+        switch (kind) {
+            .accept => self.accept.complete(),
+            .connect => self.connect.complete(),
+            .close => self.close.complete(),
+            .recv => self.recv.complete(),
+            .send, .sendv => self.sendv.complete(),
+            .timer => self.timer.complete(),
+            .cancel, .socket, .shutdown => {},
+        }
+    }
+
+    fn restart(self: *Metric, kind: Op.Kind) void {
+        self.all.restart();
+        switch (kind) {
+            .accept => self.accept.restart(),
+            .connect => self.connect.restart(),
+            .close => self.close.restart(),
+            .recv => self.recv.restart(),
+            .send, .sendv => self.sendv.restart(),
+            .timer => self.timer.restart(),
+            .cancel, .socket, .shutdown => {},
+        }
+    }
+};

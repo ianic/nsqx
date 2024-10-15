@@ -140,7 +140,7 @@ fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
     print("  all    {}\n", .{io.metric.all});
     print("  recv   {}\n", .{io.metric.recv});
     print("  sendv  {}\n", .{io.metric.sendv});
-    print("  ticker {}\n", .{io.metric.ticker});
+    print("  timer {}\n", .{io.metric.timer});
     print("  close  {}\n", .{io.metric.close});
     print("  accept {}\n", .{io.metric.accept});
 
