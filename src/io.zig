@@ -32,6 +32,7 @@ pub const CallbackError = error{
 pub const Io = struct {
     allocator: mem.Allocator,
     op_pool: std.heap.MemoryPool(Op) = undefined,
+    timer_pool: std.heap.MemoryPool(Timer) = undefined,
     ring: IoUring = undefined,
     timestamp: u64 = 0,
     recv_buf_grp: IoUring.BufferGroup = undefined,
@@ -184,6 +185,10 @@ pub const Io = struct {
     pub fn init(self: *Io, allocator: mem.Allocator, opt: Options) !void {
         var op_pool = try std.heap.MemoryPool(Op).initPreheated(allocator, 1024);
         errdefer op_pool.deinit();
+
+        var timer_pool = std.heap.MemoryPool(Timer).init(allocator);
+        errdefer timer_pool.deinit();
+
         // Flags reference: https://nick-black.com/dankwiki/index.php/Io_uring
         const flags =
             // Create a kernel thread to poll on the submission queue. If the
@@ -200,6 +205,7 @@ pub const Io = struct {
             .ring = ring,
             .timestamp = timestamp(),
             .op_pool = op_pool,
+            .timer_pool = timer_pool,
         };
         if (opt.recv_buffers > 0) {
             self.recv_buf_grp = try self.initBufferGroup(1, opt.recv_buffers, opt.recv_buffer_len);
@@ -221,6 +227,7 @@ pub const Io = struct {
         }
         self.ring.deinit();
         self.op_pool.deinit();
+        self.timer_pool.deinit();
     }
 
     fn acquire(self: *Io) !*Op {
@@ -497,7 +504,7 @@ pub const Io = struct {
         context: anytype,
         comptime cb: fn (@TypeOf(context)) void,
     ) !*Timer {
-        const tmr = try self.allocator.create(Timer);
+        const tmr = try self.timer_pool.create();
         errdefer self.allocator.destroy(tmr);
         tmr.* = Timer.init(self, context, cb);
         return tmr;
@@ -634,7 +641,7 @@ pub const Io = struct {
             self.state = .close;
             if (self.timer_op.active()) return self.cancel_();
             if (self.cancel_op.active()) return;
-            self.io.allocator.destroy(self);
+            self.io.timer_pool.destroy(self);
         }
 
         fn onTimer(self: *Self) Error!void {
