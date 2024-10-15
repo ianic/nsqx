@@ -311,7 +311,7 @@ pub const Io = struct {
             }
         }
 
-        fn onCancel(self: *Self) void {
+        fn onCancel(self: *Self, _: ?anyerror) void {
             switch (self.state) {
                 .close => self.deinit(),
                 else => {},
@@ -365,11 +365,11 @@ pub const Op = struct {
             addr: posix.sockaddr align(4) = undefined,
             addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
         },
-        connect: struct {
+        connect: SocketArgs,
+        close: struct {
             socket: socket_t,
-            addr: *net.Address,
+            err: ?anyerror,
         },
-        close: socket_t,
         recv: socket_t,
         sendv: struct {
             socket: socket_t,
@@ -380,13 +380,17 @@ pub const Op = struct {
             buf: []const u8,
         },
         timer: TimerArgs,
-        socket: struct {
-            domain: u32,
-            socket_type: u32,
-            protocol: u32,
-        },
+        socket: SocketArgs,
         shutdown: socket_t,
         cancel: *Op,
+    };
+
+    const SocketArgs = struct {
+        domain: u32,
+        socket_type: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        protocol: u32 = 0,
+        socket: socket_t = 0,
+        addr: *std.net.Address,
     };
     const TimerArgs = struct {
         ts: linux.kernel_timespec,
@@ -424,7 +428,7 @@ pub const Op = struct {
         switch (op.args) {
             .accept => |*arg| _ = try io.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),
             .connect => |*arg| _ = try io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen()),
-            .close => |socket| _ = try io.ring.close(@intFromPtr(op), socket),
+            .close => |*arg| _ = try io.ring.close(@intFromPtr(op), arg.socket),
             .recv => |socket| _ = try io.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
             .sendv => |*arg| _ = try io.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
             .send => |*arg| _ = try io.ring.send(@intFromPtr(op), arg.socket, arg.buf, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
@@ -524,30 +528,6 @@ pub const Op = struct {
     }
 
     // Single shot operations -----------------
-
-    pub fn connect(
-        socket: socket_t,
-        addr: *net.Address,
-        context: anytype,
-        comptime success: fn (@TypeOf(context)) Error!void,
-        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-    ) Op {
-        const Context = @TypeOf(context);
-        const wrapper = struct {
-            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
-                const ctx: Context = @ptrFromInt(op.context);
-                switch (cqe.err()) {
-                    .SUCCESS => return try success(ctx),
-                    else => |errno| return try fail(ctx, errFromErrno(errno)),
-                }
-            }
-        };
-        return .{
-            .context = @intFromPtr(context),
-            .callback = wrapper.complete,
-            .args = .{ .connect = .{ .socket = socket, .addr = addr } },
-        };
-    }
 
     pub fn sendv(
         socket: socket_t,
@@ -666,42 +646,81 @@ pub const Op = struct {
         };
     }
 
-    pub fn socketCreate(
-        domain: u32,
-        socket_type: u32,
-        protocol: u32,
+    // Create socket and connect.
+    pub fn connect(
+        args: SocketArgs,
         context: anytype,
         comptime success: fn (@TypeOf(context), socket_t) Error!void,
-        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
+        comptime fail: fn (@TypeOf(context), ?anyerror) void,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
-                    .SUCCESS => try success(ctx, @intCast(cqe.res)),
-                    else => |errno| try fail(ctx, errFromErrno(errno)),
+                    .SUCCESS => {
+                        const socket: socket_t = @intCast(cqe.res);
+                        var a = op.args.socket;
+                        a.socket = socket;
+                        op.* = Op.connectSocket(a, ctx, success, fail);
+                        io.submit(op);
+                    },
+                    else => |errno| {
+                        log.err("socket create failed {}", .{errFromErrno(errno)});
+                        fail(ctx, errFromErrno(errno));
+                    },
                 }
             }
         };
         return .{
             .context = @intFromPtr(context),
             .callback = wrapper.complete,
-            .args = .{ .socket = .{ .domain = domain, .socket_type = socket_type, .protocol = protocol } },
+            .args = .{ .socket = args },
         };
     }
 
-    pub fn shutdownClose(
-        socket: socket_t,
+    fn connectSocket(
+        args: SocketArgs,
         context: anytype,
-        comptime done: fn (@TypeOf(context)) void,
+        comptime success: fn (@TypeOf(context), socket_t) Error!void,
+        comptime fail: fn (@TypeOf(context), ?anyerror) void,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
             fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
-                _ = cqe;
                 const ctx: Context = @ptrFromInt(op.context);
-                op.* = Op.close(op.args.shutdown, ctx, done);
+                switch (cqe.err()) {
+                    .SUCCESS => return try success(ctx, op.args.connect.socket),
+                    else => |errno| {
+                        const err = errFromErrno(errno);
+                        op.* = Op.close(op.args.connect.socket, err, ctx, fail);
+                        io.submit(op);
+                    },
+                }
+            }
+        };
+        return .{
+            .context = @intFromPtr(context),
+            .callback = wrapper.complete,
+            .args = .{ .connect = args },
+        };
+    }
+
+    // Shutdown and close socket
+    pub fn shutdown(
+        socket: socket_t,
+        context: anytype,
+        comptime done: fn (@TypeOf(context), ?anyerror) void,
+    ) Op {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+                const err: ?anyerror = switch (cqe.err()) {
+                    .SUCCESS => null,
+                    else => |errno| errFromErrno(errno),
+                };
+                const ctx: Context = @ptrFromInt(op.context);
+                op.* = Op.close(op.args.shutdown, err, ctx, done);
                 io.submit(op);
             }
         };
@@ -714,35 +733,39 @@ pub const Op = struct {
 
     fn close(
         socket: socket_t,
+        err: ?anyerror,
         context: anytype,
-        comptime done: fn (@TypeOf(context)) void,
+        comptime done: fn (@TypeOf(context), ?anyerror) void,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
             fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
                 _ = cqe;
                 const ctx: Context = @ptrFromInt(op.context);
-                done(ctx);
+                done(ctx, op.args.close.err);
             }
         };
         return .{
             .context = @intFromPtr(context),
             .callback = wrapper.complete,
-            .args = .{ .close = socket },
+            .args = .{ .close = .{ .socket = socket, .err = err } },
         };
     }
 
     pub fn cancel(
         op_to_cancel: *Op,
         context: anytype,
-        comptime done: fn (@TypeOf(context)) void,
+        comptime done: fn (@TypeOf(context), ?anyerror) void,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
             fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
-                _ = cqe;
+                const err: ?anyerror = switch (cqe.err()) {
+                    .SUCCESS => null,
+                    else => |errno| errFromErrno(errno),
+                };
                 const ctx: Context = @ptrFromInt(op.context);
-                done(ctx);
+                done(ctx, err);
             }
         };
         return .{
@@ -895,12 +918,21 @@ test "size" {
         buf: []const u8,
     };
 
+    const Socket = struct {
+        domain: u32,
+        socket_type: u32,
+        protocol: u32,
+        socket: socket_t,
+        address: *std.net.Address,
+    };
+
     try testing.expectEqual(64, @sizeOf(Op));
     try testing.expectEqual(32, @sizeOf(Op.Args));
     try testing.expectEqual(24, @sizeOf(Op.TimerArgs));
     try testing.expectEqual(24, @sizeOf(Accept));
     try testing.expectEqual(24, @sizeOf(Writev));
     try testing.expectEqual(24, @sizeOf(Send));
+    try testing.expectEqual(24, @sizeOf(Socket));
     try testing.expectEqual(16, @sizeOf(Connect));
     try testing.expectEqual(16, @sizeOf(Sendv));
     try testing.expectEqual(112, @sizeOf(net.Address));

@@ -156,11 +156,15 @@ pub const Conn = struct {
         self.shutdown();
     }
 
+    fn onClose(self: *Conn, _: ?anyerror) void {
+        self.shutdown();
+    }
+
     pub fn shutdown(self: *Conn) void {
         // log.debug("{} shutdown state: {s}", .{ self.socket, @tagName(self.state) });
         switch (self.state) {
             .connected => {
-                self.close_op = Op.shutdownClose(self.socket, self, shutdown);
+                self.close_op = Op.shutdown(self.socket, self, onClose);
                 self.io.submit(&self.close_op);
                 self.state = .closing;
             },

@@ -222,25 +222,21 @@ const Conn = struct {
         assert(!self.recv_op.active());
         assert(self.socket == 0);
 
-        self.connect_op = Op.socketCreate(
-            self.address.any.family,
-            posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-            0,
+        self.connect_op = Op.connect(
+            .{
+                .domain = self.address.any.family,
+                .addr = &self.address,
+            },
             self,
-            onSocketCreate,
-            onSocketCreateFail,
+            onConnect,
+            onConnectFail,
         );
         self.io.submit(&self.connect_op);
         self.state = .connecting;
     }
 
-    fn onSocketCreate(self: *Self, socket: socket_t) Error!void {
+    fn onConnect(self: *Self, socket: socket_t) Error!void {
         self.socket = socket;
-        self.connect_op = Op.connect(self.socket, &self.address, self, onConnect, onConnectFail);
-        self.io.submit(&self.connect_op);
-    }
-
-    fn onConnect(self: *Self) Error!void {
         self.setup() catch |err| {
             log.warn("{} setup failed {}", .{ self.address, err });
             self.shutdown();
@@ -256,13 +252,9 @@ const Conn = struct {
         log.debug("{} connected", .{self.address});
     }
 
-    fn onSocketCreateFail(self: *Self, err: anyerror) Error!void {
-        log.err("{} socket create failed {}", .{ self.address, err });
-        self.shutdown();
-    }
-
-    fn onConnectFail(self: *Self, err: anyerror) Error!void {
-        log.info("{} connect failed {}", .{ self.address, err });
+    fn onConnectFail(self: *Self, err: ?anyerror) void {
+        if (err) |e|
+            log.info("{} connect failed {}", .{ self.address, e });
         self.shutdown();
     }
 
@@ -338,6 +330,10 @@ const Conn = struct {
         self.shutdown();
     }
 
+    fn onClose(self: *Self, _: ?anyerror) void {
+        self.shutdown();
+    }
+
     fn shutdown(self: *Self) void {
         // log.debug("{} shutdown state: {s}", .{ self.address, @tagName(self.state) });
         switch (self.state) {
@@ -349,11 +345,11 @@ const Conn = struct {
             },
             .closing => {
                 if (self.connect_op.active()) {
-                    self.close_op = Op.cancel(&self.connect_op, self, shutdown);
+                    self.close_op = Op.cancel(&self.connect_op, self, onClose);
                     return self.io.submit(&self.close_op);
                 }
                 if (self.socket != 0) {
-                    self.close_op = Op.shutdownClose(self.socket, self, shutdown);
+                    self.close_op = Op.shutdown(self.socket, self, onClose);
                     self.socket = 0;
                     return self.io.submit(&self.close_op);
                 }

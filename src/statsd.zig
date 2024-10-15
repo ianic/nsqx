@@ -66,35 +66,26 @@ pub const Connector = struct {
 
     fn connect(self: *Self) !void {
         if (self.connect_op.active()) return;
-        self.connect_op = Op.socketCreate(
-            self.address.any.family,
-            posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
-            0,
+        self.connect_op = Op.connect(
+            .{
+                .domain = self.address.any.family,
+                .socket_type = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
+                .addr = &self.address,
+            },
             self,
-            onSocketCreate,
+            onConnect,
             onConnectFail,
         );
         self.io.submit(&self.connect_op);
     }
 
-    fn onSocketCreate(self: *Self, socket: socket_t) Error!void {
+    fn onConnect(self: *Self, socket: socket_t) Error!void {
         self.socket = socket;
-        self.connect_op = Op.connect(socket, &self.address, self, onConnect, onConnectFail);
-        self.io.submit(&self.connect_op);
     }
 
-    fn onConnectFail(self: *Self, err: anyerror) Error!void {
-        log.err("connect failed {}", .{err});
-        if (self.socket != 0) {
-            self.connect_op = Op.shutdownClose(self.socket, self, onClose);
-            self.io.submit(&self.connect_op);
-            self.socket = 0;
-        }
+    fn onConnectFail(_: *Self, err: ?anyerror) void {
+        if (err) |e| log.err("connect failed {}", .{e});
     }
-
-    fn onClose(_: *Self) void {}
-
-    fn onConnect(_: *Self) Error!void {}
 
     fn generate(self: *Self) Error!void {
         var writer = MetricWriter.init(self.allocator, self.prefix);

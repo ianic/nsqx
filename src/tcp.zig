@@ -12,6 +12,7 @@ const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
 const lookup = @import("lookup.zig");
 pub const Server = @import("server.zig").ServerType(Conn, Io, lookup.Connector);
+//pub const Server = @import("server.zig").ServerType(Conn, Io, @import("server.zig").NoopNotifier);
 const Channel = Server.Channel;
 const Msg = Server.Channel.Msg;
 
@@ -381,6 +382,10 @@ pub const Conn = struct {
         self.send();
     }
 
+    fn onClose(self: *Conn, _: ?anyerror) void {
+        self.shutdown();
+    }
+
     pub fn shutdown(self: *Conn) void {
         // log.debug("{} shutdown state: {s}", .{ self.socket, @tagName(self.state) });
 
@@ -392,7 +397,7 @@ pub const Conn = struct {
                 self.state = .closing;
                 self.timer.cancel();
                 if (self.channel) |channel| channel.unsubscribe(self);
-                self.close_op = Op.shutdownClose(self.socket, self, shutdown);
+                self.close_op = Op.shutdown(self.socket, self, onClose);
                 self.io.submit(&self.close_op);
             },
             .closing => {

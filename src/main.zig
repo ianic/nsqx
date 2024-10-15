@@ -30,6 +30,7 @@ pub fn main() !void {
     try io.init(allocator, options.io);
     defer io.deinit();
 
+    // var lookup_connector = @import("server.zig").NoopNotifier{};
     var lookup_connector: lookup.Connector = undefined;
     var server = tcp.Server.init(allocator, &io, &lookup_connector);
     try lookup_connector.init(allocator, &io, &server, options.lookup_tcp_addresses);
