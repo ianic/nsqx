@@ -30,9 +30,6 @@ pub fn main() !void {
     try io.init(allocator, options.io);
     defer io.deinit();
 
-    // TODO: return implementation
-    //var lookup_connector = @import("server.zig").NoopNotifier{};
-
     var lookup_connector: lookup.Connector = undefined;
     var server = tcp.Server.init(allocator, &io, &lookup_connector);
     try lookup_connector.init(allocator, &io, &server, options.lookup_tcp_addresses);
@@ -43,16 +40,16 @@ pub fn main() !void {
     try tcp_listener.init(allocator, &io, &server, options, try socket(options.tcp_address));
     defer tcp_listener.deinit();
 
-    // var http_listener: http.Listener = undefined;
-    // try http_listener.init(allocator, &io, &server, options, try socket(options.http_address));
-    // defer http_listener.deinit();
+    var http_listener: http.Listener = undefined;
+    try http_listener.init(allocator, &io, &server, options, try socket(options.http_address));
+    defer http_listener.deinit();
 
-    // var statsd_connector: ?statsd.Connector = if (options.statsd.address) |_| brk: {
-    //     var sc: statsd.Connector = undefined;
-    //     try sc.init(allocator, &io, &server, options);
-    //     break :brk sc;
-    // } else null;
-    // defer if (statsd_connector) |*sc| sc.deinit();
+    var statsd_connector: ?statsd.Connector = if (options.statsd.address) |_| brk: {
+        var sc: statsd.Connector = undefined;
+        try sc.init(allocator, &io, &server, options);
+        break :brk sc;
+    } else null;
+    defer if (statsd_connector) |*sc| sc.deinit();
 
     { // Run loop
         catchSignals();

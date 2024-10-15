@@ -20,15 +20,18 @@ pub const Connector = struct {
     options: Options.Statsd,
     address: std.net.Address,
     socket: socket_t = 0,
-    send_op: ?*Op = null,
-    ticker_op: ?*Op = null,
-    connect_op: ?*Op = null,
+    connect_op: Op = .{},
+    send_op: Op = .{},
+    timer: *Io.Timer,
+
     iter: BufferSizeIterator = .{},
     prefix: []const u8,
 
     const Self = @This();
 
     pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !void {
+        const timer = try io.initTimer(self, onTick);
+        errdefer timer.deinit();
         self.* = .{
             .allocator = allocator,
             .io = io,
@@ -36,56 +39,60 @@ pub const Connector = struct {
             .options = options.statsd,
             .address = options.statsd.address.?,
             .prefix = try fmtPrefix(allocator, options.statsd.prefix, options.broadcastAddress(), options.broadcast_tcp_port),
+            .timer = timer,
         };
         errdefer self.deinit();
-        try self.io.ticker(self.options.interval, self, onTick, onTickerFail, &self.ticker_op);
+        self.timer.setTicker(self.options.interval);
     }
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.prefix);
+        self.timer.deinit();
     }
 
-    fn onTick(self: *Self) Error!void {
-        if (self.socket == 0) {
-            return try self.connect();
-        }
-        if (self.send_op != null) return;
+    fn onTick(self: *Self) void {
+        self.tick() catch |err| {
+            log.err("tick failed {}", .{err});
+        };
+    }
+
+    fn tick(self: *Self) !void {
+        if (self.socket == 0) return try self.connect();
+        if (self.send_op.active()) return;
+
         if (self.iter.done()) try self.generate();
-        try self.send();
-    }
-
-    fn onTickerFail(self: *Self, err: anyerror) Error!void {
-        switch (err) {
-            error.OperationCanceled => {},
-            else => log.err("ticker failed {}", .{err}),
-        }
-        try self.io.ticker(self.options.interval, self, onTick, onTickerFail, &self.ticker_op);
+        self.send();
     }
 
     fn connect(self: *Self) !void {
-        try self.io.socketCreate(
+        if (self.connect_op.active()) return;
+        self.connect_op = Op.socketCreate(
             self.address.any.family,
             posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
             0,
             self,
             onSocketCreate,
             onConnectFail,
-            &self.connect_op,
         );
+        self.io.submit(&self.connect_op);
     }
 
     fn onSocketCreate(self: *Self, socket: socket_t) Error!void {
         self.socket = socket;
-        try self.io.connect(socket, &self.address, self, onConnect, onConnectFail, &self.connect_op);
+        self.connect_op = Op.connect(socket, &self.address, self, onConnect, onConnectFail);
+        self.io.submit(&self.connect_op);
     }
 
     fn onConnectFail(self: *Self, err: anyerror) Error!void {
         log.err("connect failed {}", .{err});
         if (self.socket != 0) {
-            try self.io.close(self.socket);
+            self.connect_op = Op.shutdownClose(self.socket, self, onClose);
+            self.io.submit(&self.connect_op);
             self.socket = 0;
         }
     }
+
+    fn onClose(_: *Self) void {}
 
     fn onConnect(_: *Self) Error!void {}
 
@@ -112,9 +119,11 @@ pub const Connector = struct {
         self.iter = BufferSizeIterator{ .buf = book, .size = self.options.udp_packet_size };
     }
 
-    fn send(self: *Self) !void {
-        if (self.iter.next()) |buf|
-            try self.io.send(self.socket, buf, self, onSend, onSendFail, &self.send_op);
+    fn send(self: *Self) void {
+        if (self.iter.next()) |buf| {
+            self.send_op = Op.send(self.socket, buf, self, onSend, onSendFail);
+            self.io.submit(&self.send_op);
+        }
     }
 
     fn onSend(self: *Self) Error!void {
@@ -123,7 +132,7 @@ pub const Connector = struct {
             self.allocator.free(self.iter.buf);
             self.iter = .{};
         } else {
-            try self.send();
+            self.send();
         }
     }
 

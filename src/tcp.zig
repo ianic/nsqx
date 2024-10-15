@@ -175,7 +175,7 @@ pub const Conn = struct {
 
     /// Number of messages connection is ready to send
     pub fn ready(self: *Conn) u32 {
-        if (self.send_op.submitted()) return 0;
+        if (self.send_op.active()) return 0;
         if (self.in_flight >= self.ready_count) return 0;
         return @min(
             self.ready_count - self.in_flight,
@@ -360,7 +360,7 @@ pub const Conn = struct {
     }
 
     fn respond(self: *Conn, rsp: Response) !void {
-        if (self.send_op.submitted()) {
+        if (self.send_op.active()) {
             self.pending_response = rsp;
             return;
         }
@@ -382,7 +382,7 @@ pub const Conn = struct {
     }
 
     pub fn shutdown(self: *Conn) void {
-        log.debug("{} shutdown state: {s}", .{ self.socket, @tagName(self.state) });
+        // log.debug("{} shutdown state: {s}", .{ self.socket, @tagName(self.state) });
 
         switch (self.state) {
             .connected => {
@@ -398,9 +398,9 @@ pub const Conn = struct {
             .closing => {
                 // Shutdown already in process.
                 // Wait for all operation to finish.
-                if (self.recv_op.submitted() or
-                    self.send_op.submitted() or
-                    self.close_op.submitted())
+                if (self.recv_op.active() or
+                    self.send_op.active() or
+                    self.close_op.active())
                     return;
 
                 log.debug("{} closed", .{self.socket});
@@ -414,10 +414,10 @@ pub const Conn = struct {
         std.debug.print("  socket {} state: {s}, is done? recv: {} ticker: {} send: {} close: {}\n", .{
             self.socket,
             @tagName(self.state),
-            self.recv_op.submitted(),
+            self.recv_op.active(),
             false,
-            self.send_op.submitted(),
-            self.close_op.submitted(),
+            self.send_op.active(),
+            self.close_op.active(),
         });
     }
 };

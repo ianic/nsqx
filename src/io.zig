@@ -744,12 +744,9 @@ pub const Op = struct {
         cancel,
     };
 
-    pub fn submitted(op: Op) bool {
-        return op.flags & flag_submitted > 0;
-    }
-
     pub fn active(op: Op) bool {
-        return op.flags & flag_submitted > 0 or op.flags & flag_has_more > 0;
+        return op.flags & flag_submitted > 0 or
+            op.flags & flag_has_more > 0;
     }
 
     pub fn hasMore(op: Op) bool {
@@ -1186,7 +1183,6 @@ pub const Op = struct {
     ) Op {
         return .{
             .context = 0,
-            .op_field = undefined,
             .callback = undefined,
             .args = .{ .close = socket },
         };

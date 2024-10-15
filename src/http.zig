@@ -21,9 +21,9 @@ pub const Conn = struct {
     socket: socket_t = 0,
     addr: std.net.Address,
 
-    recv_op: ?*Op = null,
-    send_op: ?*Op = null,
-    close_op: ?*Op = null,
+    recv_op: Op = .{},
+    send_op: Op = .{},
+    close_op: Op = .{},
     arena: ?std.heap.ArenaAllocator = null,
 
     send_vec: [2]posix.iovec_const = undefined, // header and body
@@ -43,7 +43,9 @@ pub const Conn = struct {
             .socket = socket,
             .addr = addr,
         };
-        try self.io.recv(self.socket, self, onRecv, onRecvFail, &self.recv_op);
+        self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
+        self.io.submit(&self.recv_op);
+        self.send_op = Op.sendv(self.socket, &self.send_msghdr, self, onSend, onSendFail);
     }
 
     pub fn deinit(self: *Conn) void {
@@ -51,7 +53,7 @@ pub const Conn = struct {
     }
 
     fn onRecv(self: *Conn, bytes: []const u8) Error!void {
-        if (self.send_op != null) return self.shutdown();
+        if (self.send_op.active()) return self.shutdown();
         assert(self.arena == null);
 
         self.arena = std.heap.ArenaAllocator.init(self.gpa);
@@ -77,8 +79,8 @@ pub const Conn = struct {
             self.send_vec[1].len = 0;
         }
 
-        try self.send();
-        if (self.recv_op == null) self.shutdown();
+        self.send();
+        if (self.recv_op.active()) self.shutdown();
     }
 
     fn handle(self: *Conn, writer: std.io.AnyWriter, bytes: []const u8) !void {
@@ -120,11 +122,10 @@ pub const Conn = struct {
         }
     }
 
-    fn send(self: *Conn) !void {
-        assert(self.send_op == null);
+    fn send(self: *Conn) void {
         self.send_msghdr.iov = &self.send_vec;
         self.send_msghdr.iovlen = if (self.send_vec[1].len > 0) 2 else 1;
-        try self.io.sendv(self.socket, &self.send_msghdr, self, onSend, onSendFail, &self.send_op);
+        self.io.submit(&self.send_op);
     }
 
     fn onSend(self: *Conn) Error!void {
@@ -156,25 +157,24 @@ pub const Conn = struct {
     }
 
     pub fn shutdown(self: *Conn) void {
-        //log.debug("{} shutdown", .{self.socket});
-        if (self.state == .closing) {
-            if (self.recv_op != null) return;
-            if (self.send_op != null) return;
-            if (self.close_op != null) return;
+        // log.debug("{} shutdown state: {s}", .{ self.socket, @tagName(self.state) });
+        switch (self.state) {
+            .connected => {
+                self.close_op = Op.shutdownClose(self.socket, self, shutdown);
+                self.io.submit(&self.close_op);
+                self.state = .closing;
+            },
+            .closing => {
+                if (self.recv_op.active() or
+                    self.send_op.active() or
+                    self.close_op.active())
+                    return;
 
-            // log.debug("{} closed", .{self.socket});
-            self.deinit();
-            self.listener.remove(self);
-            return;
+                log.debug("{} closed", .{self.socket});
+                self.deinit();
+                self.listener.remove(self);
+            },
         }
-
-        self.state = .closing;
-        self.io.shutdownClose(self.socket, self, shutdown, &self.close_op) catch |err| {
-            log.warn("{} clean shutdown failed {}", .{ self.socket, err });
-            if (self.recv_op) |op| op.detach(self.io);
-            if (self.send_op) |op| op.detach(self.io);
-            self.shutdown();
-        };
     }
 };
 

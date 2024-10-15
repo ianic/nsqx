@@ -771,7 +771,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         self.inFlightTimeout(now) catch Io.Timer.no_timeout,
                         self.deferredTimeout(now) catch Io.Timer.no_timeout,
                     );
-                    log.debug("timerTimeout next: {}", .{next_timeout});
+                    // log.debug("timerTimeout next: {}", .{next_timeout});
                     self.setTimeout(next_timeout);
                 }
 
