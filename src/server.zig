@@ -367,9 +367,11 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     errdefer self.allocator.free(key);
                     try self.channels.ensureUnusedCapacity(1);
 
-                    channel.* = Channel.init(self, key);
-                    channel.initTimer(self.server.io);
+                    try channel.init(self, key);
+                    // channel.* = Channel.init(self, key);
                     errdefer channel.deinit();
+                    // try channel.initTimer(self.server.io);
+
                     self.channels.putAssumeCapacityNoClobber(key, channel);
 
                     log.debug("topic '{s}' channel '{s}' created", .{ self.name, key });
@@ -591,7 +593,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 allocator: mem.Allocator,
                 name: []const u8,
                 topic: *Topic,
-                timer: Io.Timer = undefined,
+                timer: *Io.Timer = undefined,
                 consumers: std.ArrayList(*Consumer),
                 // Sent but not jet acknowledged (fin) messages.
                 in_flight: std.AutoArrayHashMap(u64, *Msg),
@@ -624,9 +626,13 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                 // Init/deinit -----------------
 
-                fn init(topic: *Topic, name: []const u8) Channel {
+                // TODO spoji ova dva init nije to tako tesko
+
+                fn init(self: *Channel, topic: *Topic, name: []const u8) !void {
+                    const timer = try topic.server.io.initTimer(self, onTimer);
+                    errdefer timer.deinit();
                     const allocator = topic.allocator;
-                    return .{
+                    self.* = .{
                         .allocator = allocator,
                         .name = name,
                         .topic = topic,
@@ -635,16 +641,12 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         .deferred = std.PriorityQueue(*Msg, void, Msg.less).init(allocator, {}),
                         // Channel starts at the last topic message at the moment of channel creation
                         .next = null,
+                        .timer = timer,
                     };
                 }
 
-                // Need stable self pointer for this part of the init.
-                fn initTimer(self: *Channel, io: *Io) void {
-                    self.timer = io.initTimer(self, timerTimeout);
-                }
-
                 fn deinit(self: *Channel) void {
-                    self.timer.close() catch {};
+                    self.timer.deinit();
                     // TODO: ovo treba kada ga brisem ali ne u deinit cak ne
                     // smije biti u deinit jer je consumer vec deallocated
                     // for (self.consumers.items) |consumer| consumer.channelClosed();
@@ -726,7 +728,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                             const deferred = msg.timestamp > now;
                             if (deferred) {
-                                try self.setTimeout(msg.timestamp);
+                                self.setTimeout(msg.timestamp);
                                 try self.deferred.add(msg);
                             } else {
                                 try self.inFlightAppend(msg, msg_timeout);
@@ -742,7 +744,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                 fn inFlightAppend(self: *Channel, msg: *Msg, msg_timeout: u32) !void {
                     msg.timestamp = self.timer.now() + nsFromMs(msg_timeout);
-                    try self.setTimeout(msg.timestamp);
+                    self.setTimeout(msg.timestamp);
                     try self.in_flight.put(msg.sequence(), msg);
                 }
 
@@ -752,25 +754,25 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     msg.incAttempts();
                     msg.timestamp = if (delay == 0) 0 else self.timer.now() + nsFromMs(delay);
                     if (msg.timestamp > 0)
-                        try self.setTimeout(msg.timestamp);
+                        self.setTimeout(msg.timestamp);
                     try self.deferred.add(msg);
                     assert(self.in_flight.swapRemove(msg.sequence()));
                 }
 
                 // Sets next timer timeout
-                fn setTimeout(self: *Channel, next_timeout: u64) !void {
-                    try self.timer.set(next_timeout);
+                fn setTimeout(self: *Channel, next_timeout: u64) void {
+                    self.timer.setAbs(next_timeout);
                 }
 
                 // Callback when timer timeout if fired
-                fn timerTimeout(self: *Channel) Error!void {
+                fn onTimer(self: *Channel) void {
                     const now = self.timer.now();
                     const next_timeout = @min(
-                        try self.inFlightTimeout(now),
-                        try self.deferredTimeout(now),
+                        self.inFlightTimeout(now) catch Io.Timer.no_timeout,
+                        self.deferredTimeout(now) catch Io.Timer.no_timeout,
                     );
                     log.debug("timerTimeout next: {}", .{next_timeout});
-                    try self.setTimeout(next_timeout);
+                    self.setTimeout(next_timeout);
                 }
 
                 // Returns next timeout of deferred messages

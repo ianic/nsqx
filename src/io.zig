@@ -914,13 +914,12 @@ pub const Op = struct {
 
     // Single shot operations -----------------
 
-    fn connect(
+    pub fn connect(
         socket: socket_t,
         addr: *net.Address,
         context: anytype,
         comptime success: fn (@TypeOf(context)) Error!void,
         comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
@@ -934,7 +933,6 @@ pub const Op = struct {
         };
         return .{
             .context = @intFromPtr(context),
-            .op_field = op_field,
             .callback = wrapper.complete,
             .args = .{ .connect = .{ .socket = socket, .addr = addr } },
         };
@@ -1036,13 +1034,12 @@ pub const Op = struct {
         };
     }
 
-    fn send(
+    pub fn send(
         socket: socket_t,
         buf: []const u8,
         context: anytype,
         comptime success: fn (@TypeOf(context)) Error!void,
         comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
@@ -1065,7 +1062,6 @@ pub const Op = struct {
         };
         return .{
             .context = @intFromPtr(context),
-            .op_field = op_field,
             .callback = wrapper.complete,
             .args = .{
                 .send = .{ .socket = socket, .buf = buf },
@@ -1098,14 +1094,13 @@ pub const Op = struct {
         };
     }
 
-    fn socketCreate(
+    pub fn socketCreate(
         domain: u32,
         socket_type: u32,
         protocol: u32,
         context: anytype,
         comptime success: fn (@TypeOf(context), socket_t) Error!void,
         comptime fail: fn (@TypeOf(context), anyerror) Error!void,
-        op_field: *?*Op,
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
@@ -1119,7 +1114,6 @@ pub const Op = struct {
         };
         return .{
             .context = @intFromPtr(context),
-            .op_field = op_field,
             .callback = wrapper.complete,
             .args = .{ .socket = .{ .domain = domain, .socket_type = socket_type, .protocol = protocol } },
         };

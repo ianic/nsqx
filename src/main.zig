@@ -31,12 +31,12 @@ pub fn main() !void {
     defer io.deinit();
 
     // TODO: return implementation
-    var lookup_connector = @import("server.zig").NoopNotifier{};
+    //var lookup_connector = @import("server.zig").NoopNotifier{};
 
-    // var lookup_connector: lookup.Connector = undefined;
+    var lookup_connector: lookup.Connector = undefined;
     var server = tcp.Server.init(allocator, &io, &lookup_connector);
-    // try lookup_connector.init(allocator, &io, &server, options.lookup_tcp_addresses);
-    // defer lookup_connector.deinit();
+    try lookup_connector.init(allocator, &io, &server, options.lookup_tcp_addresses);
+    defer lookup_connector.deinit();
     defer server.deinit();
 
     var tcp_listener: tcp.Listener = undefined;

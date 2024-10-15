@@ -11,9 +11,7 @@ const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
 const lookup = @import("lookup.zig");
-// TODO remove
-//pub const Server = @import("server.zig").ServerType(Conn, Io, lookup.Connector);
-pub const Server = @import("server.zig").ServerType(Conn, Io, @import("server.zig").NoopNotifier);
+pub const Server = @import("server.zig").ServerType(Conn, Io, lookup.Connector);
 const Channel = Server.Channel;
 const Msg = Server.Channel.Msg;
 
@@ -100,8 +98,8 @@ pub const Conn = struct {
 
     recv_op: Op = .{},
     send_op: Op = .{},
-    ticker_op: Op = .{}, // Heartbeat ticker
     close_op: Op = .{},
+    timer: *Io.Timer = undefined,
     // If send is in process store here response to send later
     pending_response: ?Response = null,
     ready_count: u32 = 0,
@@ -137,7 +135,7 @@ pub const Conn = struct {
     };
 
     // Until client set's connection heartbeat interval in identify message.
-    const initial_heartbeat = 10000;
+    const initial_heartbeat = 2000;
 
     fn init(self: *Conn, listener: *Listener, socket: socket_t, addr: std.net.Address) !void {
         self.* = .{
@@ -152,11 +150,11 @@ pub const Conn = struct {
 
         try self.send_vec.init(self.allocator);
         errdefer self.send_vec.deinit(self.allocator);
-        self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
-        // self.initTicker(initial_heartbeat) catch |err| {
-        //     log.err("{} failed to set initial heartbeat {}", .{ socket, err });
-        // };
+        self.timer = try self.io.initTimer(self, onTimer);
+        errdefer self.timer.deinit();
+        self.timer.setTicker(initial_heartbeat);
         self.send_op = Op.sendv(self.socket, self.send_vec.ptr(), self, onSend, onSendFail);
+        self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
         self.io.submit(&self.recv_op);
         log.debug("{} connected", .{socket});
     }
@@ -165,22 +163,8 @@ pub const Conn = struct {
         self.recv_buf.free();
         self.identify.deinit(self.allocator);
         self.send_vec.deinit(self.allocator);
+        self.timer.deinit();
     }
-
-    // TODO: ticker je problem jer mu treba jos jedan op za cancel
-    // kako bi bilo da umjesto toga imam timer ,a ne ticker pa da ne moram raditi cancel
-    // nego na slijedeci onTimer postavim drugo vrijeme
-    // tako mogu i postavljati vrijeme od zadnjeg send pa onda odluciti treba li uopce slati ping
-    // uglavnom malo ozbiljniji redizajn
-    // fn initTicker(self: *Conn, heartbeat_interval: u32) !void {
-    //     if (self.ticker_op.submited() and heartbeat_interval == self.heartbeat_interval) return;
-    //     self.heartbeat_interval = heartbeat_interval;
-    //     if (self.ticker_op.submited()) return self.io.cancel(self.ticker_op);
-
-    //     const msec: u32 = @divTrunc(self.heartbeat_interval, 2);
-    //     try self.io.ticker(msec, self, onTick, onTickerFail, &self.ticker_op);
-    //     // log.debug("{} heartbeat interval: {}", .{ self.socket, self.heartbeat_interval });
-    // }
 
     // Channel api -----------------
 
@@ -224,27 +208,18 @@ pub const Conn = struct {
 
     // IO callbacks -----------------
 
-    // fn onTick(self: *Conn) Error!void {
-    //     if (self.state == .closing) return;
-    //     if (self.outstanding_heartbeats > 4) {
-    //         log.debug("{} no heartbeat, closing", .{self.socket});
-    //         return self.shutdown();
-    //     }
-    //     if (self.outstanding_heartbeats > 0) {
-    //         log.debug("{} heartbeat", .{self.socket});
-    //         try self.respond(.heartbeat);
-    //     }
-    //     self.outstanding_heartbeats += 1;
-    // }
-
-    // fn onTickerFail(self: *Conn, err: anyerror) Error!void {
-    //     switch (err) {
-    //         error.OperationCanceled => if (self.state != .closing)
-    //             return try self.initTicker(self.heartbeat_interval),
-    //         else => log.err("{} ticker failed {}", .{ self.socket, err }),
-    //     }
-    //     self.shutdown();
-    // }
+    fn onTimer(self: *Conn) void {
+        if (self.state == .closing) return;
+        if (self.outstanding_heartbeats > 4) {
+            log.debug("{} no heartbeat, closing", .{self.socket});
+            return self.shutdown();
+        }
+        if (self.outstanding_heartbeats > 0) {
+            log.debug("{} heartbeat", .{self.socket});
+            self.respond(.heartbeat) catch self.shutdown();
+        }
+        self.outstanding_heartbeats += 1;
+    }
 
     fn onRecv(self: *Conn, bytes: []const u8) Error!void {
         // Any error is lack of resources, free this connection in the case of
@@ -283,23 +258,6 @@ pub const Conn = struct {
         self.shutdown();
     }
 
-    fn onClose(self: *Conn) void {
-        assert(self.state == .closing);
-
-        // Ensure that all operations are finished
-        if (self.ticker_op != null) return;
-        if (self.recv_op != null) return;
-        if (self.send_op != null) return;
-        if (self.close_op != null) return;
-        // Safe to unsubscribe from channel, no buffers in kernel when send is
-        // finished.
-        if (self.channel) |channel| channel.unsubscribe(self);
-
-        log.debug("{} closed", .{self.socket});
-        self.deinit();
-        self.listener.remove(self);
-    }
-
     // ------------------------------
 
     fn receivedData(self: *Conn, bytes: []const u8) !void {
@@ -327,9 +285,8 @@ pub const Conn = struct {
             .identify => {
                 const identify = try msg.parseIdentify(self.allocator, options);
                 errdefer identify.deinit(self.allocator);
-                // TODO
-                // try self.initTicker(identify.heartbeat_interval);
                 try self.respond(.ok);
+                self.timer.setTicker(identify.heartbeat_interval / 2);
                 self.identify = identify;
                 log.debug("{} identify {}", .{ self.socket, identify });
             },
@@ -433,6 +390,7 @@ pub const Conn = struct {
                 self.ready_count = 0;
                 self.pending_response = null;
                 self.state = .closing;
+                self.timer.cancel();
                 if (self.channel) |channel| channel.unsubscribe(self);
                 self.close_op = Op.shutdownClose(self.socket, self, shutdown);
                 self.io.submit(&self.close_op);
@@ -450,33 +408,14 @@ pub const Conn = struct {
                 self.listener.remove(self);
             },
         }
-
-        // // Try to start clean shutdown. It will stop ticker and shutdown
-        // // connection. Ticker will get OperationCanceled, multishot receive will
-        // // be terminated, send (if active also).
-        // self.cleanShutdown() catch |err| {
-        //     // Dirty shutdown. Detach from all io operations. No callback will
-        //     // be fired after that.
-        //     log.warn("{} clean shutdown failed {}", .{ self.socket, err });
-        //     if (self.ticker_op) |op| op.detach(self.io);
-        //     if (self.recv_op) |op| op.detach(self.io);
-        //     if (self.send_op) |op| op.detach(self.io);
-        //     if (self.close_op) |op| op.detach(self.io);
-        //     self.onClose();
-        // };
     }
-
-    // fn cleanShutdown(self: *Conn) !void {
-    //     if (self.ticker_op) |op| try op.cancel(self.io);
-    //     try self.io.shutdownClose(self.socket, self, onClose, &self.close_op);
-    // }
 
     pub fn printStatus(self: *Conn) void {
         std.debug.print("  socket {} state: {s}, is done? recv: {} ticker: {} send: {} close: {}\n", .{
             self.socket,
             @tagName(self.state),
             self.recv_op.submitted(),
-            false, //self.ticker_op.submited(),
+            false,
             self.send_op.submitted(),
             self.close_op.submitted(),
         });
