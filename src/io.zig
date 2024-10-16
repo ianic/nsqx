@@ -7,27 +7,16 @@ const posix = std.posix;
 const linux = std.os.linux;
 const IoUring = linux.IoUring;
 const socket_t = std.posix.socket_t;
-const fd_t = std.posix.fd_t;
 const errFromErrno = @import("errno.zig").toError;
-const Atomic = std.atomic.Value;
 const Options = @import("Options.zig").Io;
+const Fifo = @import("fifo.zig").Fifo;
 
 const ns_per_ms = std.time.ns_per_ms;
 const ns_per_s = std.time.ns_per_s;
 
 const log = std.log.scoped(.io);
 
-pub const Error = error{
-    OutOfMemory,
-    SubmissionQueueFull,
-};
-
-pub const CallbackError = error{
-    OutOfMemory,
-    SubmissionQueueFull,
-    MultishotCanceled,
-    ShortSend, // TODO treat short sends as error because we have msg.wait_all flag set
-};
+pub const Error = error{OutOfMemory};
 
 pub const Io = struct {
     allocator: mem.Allocator,
@@ -40,7 +29,7 @@ pub const Io = struct {
     cqe_buf: [256]linux.io_uring_cqe = undefined,
     cqe_buf_head: usize = 0,
     cqe_buf_tail: usize = 0,
-    next: ?*Op = null,
+    pending: Fifo(Op) = .{},
 
     pub fn init(self: *Io, allocator: mem.Allocator, opt: Options) !void {
         var timer_pool = std.heap.MemoryPool(Timer).init(allocator);
@@ -96,7 +85,12 @@ pub const Io = struct {
         self.metric.loops += 1;
         // Submit prepared sqe-s to the kernel.
         _ = try self.ring.submit();
-        // TODO: submit pending
+        // Prepare pending operations
+        while (self.pending.peek()) |op| {
+            try op.prep(self);
+            _ = self.pending.pop();
+        }
+
         if (self.cqe_buf_head >= self.cqe_buf_tail) {
             // Get completions.
             self.cqe_buf_head = 0;
@@ -116,28 +110,22 @@ pub const Io = struct {
     fn flushCompletions(self: *Io) Error!void {
         while (self.cqe_buf_head < self.cqe_buf_tail) : (self.cqe_buf_head += 1) {
             const cqe = self.cqe_buf[self.cqe_buf_head];
-            // There is no op for this cqe
-            if (cqe.user_data == 0) continue;
             const has_more = flagMore(cqe);
-
             const op: *Op = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
+            const op_kind: Op.Kind = op.args;
+            // Set op flags
             if (has_more) op.flags |= Op.flag_has_more else op.flags &= ~Op.flag_has_more;
             op.flags &= ~Op.flag_submitted;
-            const op_kind: Op.Kind = op.args;
-
             // Do operation callback
-            op.callback(op, self, cqe) catch |err| switch (err) {
-                error.MultishotCanceled, error.ShortSend => {
-                    self.metric.restart(op_kind);
-                    self.submit(op);
-                    continue;
-                },
-                // Retry cqe callback
-                error.OutOfMemory, error.SubmissionQueueFull => |e| return e,
-            };
+            try op.callback(op, self, cqe);
             // NOTE: op can be already deallocated here don't use it after callback
             if (!has_more) self.metric.complete(op_kind);
         }
+    }
+
+    fn restart(self: *Io, op: *Op) void {
+        self.metric.restart(op.args);
+        self.submit(op);
     }
 
     pub fn submit(self: *Io, op: *Op) void {
@@ -145,11 +133,7 @@ pub const Io = struct {
         op.flags |= Op.flag_submitted;
         op.prep(self) catch |err| {
             log.debug("fail to submit operation {}", .{err});
-            // add to linked list
-            op.next = self.next;
-            self.next = op;
-            // TODO not parsing that list
-            unreachable;
+            self.pending.push(op);
         };
     }
 
@@ -351,7 +335,7 @@ fn flagMore(cqe: linux.io_uring_cqe) bool {
 
 pub const Op = struct {
     context: u64 = 0,
-    callback: *const fn (*Op, *Io, linux.io_uring_cqe) CallbackError!void = undefined,
+    callback: *const fn (*Op, *Io, linux.io_uring_cqe) Error!void = undefined,
     args: Args = undefined,
     next: ?*Op = null,
     flags: u8 = 0,
@@ -453,7 +437,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
@@ -471,7 +455,7 @@ pub const Op = struct {
                     .CONNABORTED, .INTR => {}, // continue
                     else => |errno| return try fail(ctx, errFromErrno(errno)),
                 }
-                if (!flagMore(cqe)) return error.MultishotCanceled;
+                if (!flagMore(cqe)) io.submit(op);
             }
         };
         return .{
@@ -489,7 +473,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
@@ -517,7 +501,7 @@ pub const Op = struct {
                     .INTR => {},
                     else => |errno| return try fail(ctx, errFromErrno(errno)),
                 }
-                if (!flagMore(cqe)) return error.MultishotCanceled;
+                if (!flagMore(cqe)) return io.restart(op);
             }
         };
         return .{
@@ -538,7 +522,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
@@ -569,7 +553,7 @@ pub const Op = struct {
                             if (v.len > 0) { // restart on short send
                                 op.args.sendv.msghdr.iov = v.ptr;
                                 op.args.sendv.msghdr.iovlen = @intCast(v.len);
-                                return error.ShortSend;
+                                return io.restart(op);
                             }
                         }
 
@@ -597,7 +581,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
@@ -606,7 +590,7 @@ pub const Op = struct {
                         const send_buf = op.args.send.buf;
                         if (n < send_buf.len) {
                             op.args.send.buf = send_buf[n..];
-                            return error.ShortSend;
+                            return io.restart(op);
                         }
                         try success(ctx);
                     },
@@ -631,7 +615,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS, .TIME => try success(ctx),
@@ -655,7 +639,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
@@ -687,7 +671,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => return try success(ctx, op.args.connect.socket),
@@ -714,7 +698,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
                 const err: ?anyerror = switch (cqe.err()) {
                     .SUCCESS => null,
                     else => |errno| errFromErrno(errno),
@@ -739,7 +723,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) Error!void {
                 _ = cqe;
                 const ctx: Context = @ptrFromInt(op.context);
                 done(ctx, op.args.close.err);
@@ -759,7 +743,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) CallbackError!void {
+            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) Error!void {
                 const err: ?anyerror = switch (cqe.err()) {
                     .SUCCESS => null,
                     else => |errno| errFromErrno(errno),
