@@ -973,9 +973,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 test "channel consumers iterator" {
     const allocator = testing.allocator;
 
-    var io = TestIo{};
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &io, &notifier);
+    var server = TestServer.init(allocator, &notifier, 0);
     defer server.deinit();
 
     var consumer1 = TestConsumer.init(allocator);
@@ -1012,9 +1011,8 @@ test "channel fin req" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var io = TestIo{};
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &io, &notifier);
+    var server = TestServer.init(allocator, &notifier, 0);
     const idFromSeq = TestServer.Channel.Msg.idFromSeq;
     defer server.deinit();
 
@@ -1240,7 +1238,7 @@ pub const NoopNotifier = struct {
     }
 };
 
-const TestServer = ServerType(TestConsumer, TestIo, NoopNotifier);
+const TestServer = ServerType(TestConsumer, NoopNotifier);
 
 test "multiple channels" {
     const allocator = testing.allocator;
@@ -1249,9 +1247,8 @@ test "multiple channels" {
     const channel_name2 = "channel2";
     const no = 1024;
 
-    var io = TestIo{};
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &io, &notifier);
+    var server = TestServer.init(allocator, &notifier, 0);
     defer server.deinit();
 
     var c1 = TestConsumer.init(allocator);
@@ -1319,9 +1316,8 @@ test "first channel gets all messages accumulated in topic" {
     const channel_name = "channel1";
     const no = 16;
 
-    var io = TestIo{};
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &io, &notifier);
+    var server = TestServer.init(allocator, &notifier, 0);
     defer server.deinit();
     // publish messages to the topic which don't have channels created
     for (0..no) |_|
@@ -1353,9 +1349,8 @@ test "timeout messages" {
     const channel_name = "channel";
     const no = 4;
 
-    var io = TestIo{};
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &io, &notifier);
+    var server = TestServer.init(allocator, &notifier, 0);
     defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1364,7 +1359,7 @@ test "timeout messages" {
     consumer.channel = channel;
 
     for (0..no) |i| {
-        io.timestamp = i + 1;
+        server.now = i + 1;
         try server.publish(topic_name, "message body");
         try consumer.pull();
     }
@@ -1417,9 +1412,8 @@ test "deferred messages" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var io = TestIo{};
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &io, &notifier);
+    var server = TestServer.init(allocator, &notifier, 0);
     defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1436,7 +1430,7 @@ test "deferred messages" {
     }
 
     { // move now, one is in flight after wakeup
-        io.timestamp = ns_per_ms;
+        server.now = ns_per_ms;
         try channel.wakeup();
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
@@ -1448,7 +1442,7 @@ test "deferred messages" {
     }
 
     { // move now to deliver both
-        io.timestamp = 3 * ns_per_ms;
+        server.now = 3 * ns_per_ms;
         consumer.ready_count = 2;
         try channel.wakeup();
         try testing.expectEqual(2, channel.in_flight.count());
@@ -1461,9 +1455,8 @@ test "topic pause" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var io = TestIo{};
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &io, &notifier);
+    var server = TestServer.init(allocator, &notifier, 0);
     defer server.deinit();
     const topic = try server.getOrCreateTopic(topic_name);
 
@@ -1514,9 +1507,8 @@ test "channel empty" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var io = TestIo{};
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &io, &notifier);
+    var server = TestServer.init(allocator, &notifier, 0);
     defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1525,12 +1517,11 @@ test "channel empty" {
     const channel = try server.subscribe(&consumer, topic_name, channel_name);
     consumer.channel = channel;
 
-    io.timestamp = 1;
+    server.now = 1;
     try server.publish(topic_name, "message 1");
     try server.publish(topic_name, "message 2");
 
-    io.timestamp = 2;
-    try testing.expectEqual(2, channel.timer.now());
+    server.now = 2;
     try consumer.pull();
     try testing.expectEqual(2, channel.in_flight.count());
     try channel.empty();
@@ -1548,9 +1539,8 @@ test "channel empty" {
 test "notifier" {
     const allocator = testing.allocator;
 
-    var io = TestIo{};
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &io, &notifier);
+    var server = TestServer.init(allocator, &notifier, 0);
 
     var consumer = TestConsumer.init(allocator);
     defer consumer.deinit();
@@ -1587,9 +1577,8 @@ test "depth" {
     const allocator = testing.allocator;
     const topic_name = "topic";
 
-    var io = TestIo{};
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &io, &notifier);
+    var server = TestServer.init(allocator, &notifier, 0);
     defer server.deinit();
 
     var consumer1 = TestConsumer.init(allocator);
@@ -1659,9 +1648,8 @@ test "check allocations" {
 
 fn publishFinish(allocator: mem.Allocator) !void {
     const topic_name = "topic";
-    var io = TestIo{};
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &io, &notifier);
+    var server = TestServer.init(allocator, &notifier, 0);
     defer server.deinit();
 
     // Create 2 channels
