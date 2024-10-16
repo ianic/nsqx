@@ -15,7 +15,7 @@ fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * ns_per_ms;
 }
 
-pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
+pub fn ServerType(Consumer: type, Notifier: type) type {
     return struct {
         const Server = @This();
         const Topic = TopicType();
@@ -23,21 +23,26 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
         allocator: mem.Allocator,
         topics: std.StringHashMap(*Topic),
-        io: *Io,
         notifier: *Notifier,
+
         started_at: u64,
         metric: Topic.Metric = .{},
         metric_prev: Topic.Metric = .{},
 
+        // Current timestamp, set in tick().
+        now: u64 = 0,
+        // Channels waiting for wake up at specific timestamp.
+        wakeup_queue: WakeupQueue(Channel),
+
         // Init/deinit -----------------
 
-        pub fn init(allocator: mem.Allocator, io: *Io, notifier: *Notifier) Server {
+        pub fn init(allocator: mem.Allocator, notifier: *Notifier, now: u64) Server {
             return .{
                 .allocator = allocator,
                 .topics = std.StringHashMap(*Topic).init(allocator),
-                .io = io,
                 .notifier = notifier,
-                .started_at = io.now(),
+                .started_at = now,
+                .wakeup_queue = WakeupQueue(Channel).init(allocator),
             };
         }
 
@@ -45,6 +50,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             var iter = self.topics.iterator();
             while (iter.next()) |e| self.deinitTopic(e.value_ptr.*);
             self.topics.deinit();
+            self.wakeup_queue.deinit();
         }
 
         fn deinitTopic(self: *Server, topic: *Topic) void {
@@ -55,14 +61,14 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
             self.allocator.destroy(topic);
         }
 
-        pub fn stopTimers(self: *Server) !void {
-            var ti = self.topics.valueIterator();
-            while (ti.next()) |topic| {
-                var ci = topic.*.channels.valueIterator();
-                while (ci.next()) |channel| {
-                    try channel.*.timer.close();
-                }
-            }
+        pub fn tick(self: *Server, ts: u64) u64 {
+            self.now = ts;
+            self.wakeup_queue.onTimer(ts);
+            return self.wakeup_queue.nextTs();
+        }
+
+        fn tsWithDelay(self: *Server, delay_ms: u32) u64 {
+            return self.now + nsFromMs(delay_ms);
         }
 
         // Publish/subscribe -----------------
@@ -366,14 +372,10 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     const key = try self.allocator.dupe(u8, name);
                     errdefer self.allocator.free(key);
                     try self.channels.ensureUnusedCapacity(1);
-
                     try channel.init(self, key);
-                    // channel.* = Channel.init(self, key);
                     errdefer channel.deinit();
-                    // try channel.initTimer(self.server.io);
 
                     self.channels.putAssumeCapacityNoClobber(key, channel);
-
                     log.debug("topic '{s}' channel '{s}' created", .{ self.name, key });
                     self.server.notifier.channelCreated(self.name, channel.name);
                     return channel;
@@ -386,7 +388,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
 
                 fn deferredPublish(self: *Topic, data: []const u8, delay: u32) !void {
                     var msg = try self.append(data);
-                    msg.defer_until = self.server.io.now() + nsFromMs(delay);
+                    msg.defer_until = self.server.tsWithDelay(delay);
                     self.notifyChannels(msg, 1);
                 }
 
@@ -419,7 +421,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         msg.* = .{
                             .topic = self,
                             .sequence = self.sequence,
-                            .created_at = self.server.io.now(),
+                            .created_at = self.server.now,
                             .body = body,
                             .rc = 0,
                         };
@@ -593,7 +595,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 allocator: mem.Allocator,
                 name: []const u8,
                 topic: *Topic,
-                timer: *Io.Timer = undefined,
+                // Timestamp when next onTimer will be called
+                timer_ts: u64 = max_ts,
                 consumers: std.ArrayList(*Consumer),
                 // Sent but not jet acknowledged (fin) messages.
                 in_flight: std.AutoArrayHashMap(u64, *Msg),
@@ -629,8 +632,6 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 // TODO spoji ova dva init nije to tako tesko
 
                 fn init(self: *Channel, topic: *Topic, name: []const u8) !void {
-                    const timer = try topic.server.io.initTimer(self, onTimer);
-                    errdefer timer.deinit();
                     const allocator = topic.allocator;
                     self.* = .{
                         .allocator = allocator,
@@ -641,12 +642,12 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         .deferred = std.PriorityQueue(*Msg, void, Msg.less).init(allocator, {}),
                         // Channel starts at the last topic message at the moment of channel creation
                         .next = null,
-                        .timer = timer,
+                        .timer_ts = max_ts,
                     };
                 }
 
                 fn deinit(self: *Channel) void {
-                    self.timer.deinit();
+                    //self.timer.deinit();
                     // TODO: ovo treba kada ga brisem ali ne u deinit cak ne
                     // smije biti u deinit jer je consumer vec deallocated
                     // for (self.consumers.items) |consumer| consumer.channelClosed();
@@ -695,7 +696,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     var n: u32 = 0;
                     while (n < max) : (n += 1) {
                         var msg = (try self.nextMsg(consumer.msgTimeout())) orelse break;
-                        msg.sent_at = self.timer.now();
+                        msg.sent_at = self.now();
                         msg.in_flight_socket = consumer.socket;
                         try consumer.prepareSend(&msg.header, msg.msg.body, n);
                     }
@@ -710,8 +711,8 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     if (self.paused) return null;
 
                     // First look into deferred messages
-                    const now = self.timer.now();
-                    if (self.deferred.peek()) |msg| if (msg.timestamp <= now) {
+                    const now_ = self.now();
+                    if (self.deferred.peek()) |msg| if (msg.timestamp <= now_) {
                         try self.inFlightAppend(msg, msg_timeout);
                         _ = self.deferred.remove();
                         return msg;
@@ -726,9 +727,9 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                             errdefer self.allocator.destroy(msg);
                             msg.* = topic_msg.asChannelMsg();
 
-                            const deferred = msg.timestamp > now;
+                            const deferred = msg.timestamp > now_;
                             if (deferred) {
-                                self.setTimeout(msg.timestamp);
+                                self.updateTimer(msg.timestamp);
                                 try self.deferred.add(msg);
                             } else {
                                 try self.inFlightAppend(msg, msg_timeout);
@@ -742,9 +743,17 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                     }
                 }
 
+                fn now(self: *Channel) u64 {
+                    return self.topic.server.now;
+                }
+
+                fn tsWithDelay(self: *Channel, delay_ms: u32) u64 {
+                    return self.topic.server.tsWithDelay(delay_ms);
+                }
+
                 fn inFlightAppend(self: *Channel, msg: *Msg, msg_timeout: u32) !void {
-                    msg.timestamp = self.timer.now() + nsFromMs(msg_timeout);
-                    self.setTimeout(msg.timestamp);
+                    msg.timestamp = self.tsWithDelay(msg_timeout);
+                    self.updateTimer(msg.timestamp);
                     try self.in_flight.put(msg.sequence(), msg);
                 }
 
@@ -752,53 +761,63 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                 fn deffer(self: *Channel, msg: *Msg, delay: u32) !void {
                     msg.in_flight_socket = 0;
                     msg.incAttempts();
-                    msg.timestamp = if (delay == 0) 0 else self.timer.now() + nsFromMs(delay);
+                    msg.timestamp = if (delay == 0) 0 else self.tsWithDelay(delay);
                     if (msg.timestamp > 0)
-                        self.setTimeout(msg.timestamp);
+                        self.updateTimer(msg.timestamp);
                     try self.deferred.add(msg);
                     assert(self.in_flight.swapRemove(msg.sequence()));
                 }
 
+                fn updateTimer(self: *Channel, next_ts: u64) void {
+                    if (self.timer_ts <= next_ts) return;
+                    self.setTimer(next_ts);
+                }
+
                 // Sets next timer timeout
-                fn setTimeout(self: *Channel, next_timeout: u64) void {
-                    self.timer.setAbs(next_timeout);
+                fn setTimer(self: *Channel, next_ts: u64) void {
+                    self.timer_ts = next_ts;
+
+                    var wq = &self.topic.server.wakeup_queue;
+                    if (next_ts == max_ts)
+                        wq.remove(self) catch {}
+                    else
+                        wq.update(self) catch {};
                 }
 
                 // Callback when timer timeout if fired
-                fn onTimer(self: *Channel) void {
-                    const now = self.timer.now();
-                    const next_timeout = @min(
-                        self.inFlightTimeout(now) catch Io.Timer.no_timeout,
-                        self.deferredTimeout(now) catch Io.Timer.no_timeout,
+                fn onTimer(self: *Channel, now_: u64) void {
+                    const next_ts = @min(
+                        self.inFlightTimeout(now_) catch max_ts,
+                        self.deferredTimeout(now_) catch max_ts,
                     );
-                    // log.debug("timerTimeout next: {}", .{next_timeout});
-                    self.setTimeout(next_timeout);
+                    // log.debug("on timer next: {}", .{next_ts});
+                    self.setTimer(next_ts);
                 }
 
                 // Returns next timeout of deferred messages
-                fn deferredTimeout(self: *Channel, now: u64) !u64 {
-                    var timeout: u64 = Io.Timer.no_timeout;
+                fn deferredTimeout(self: *Channel, now_: u64) !u64 {
+                    var ts: u64 = max_ts;
                     if (self.deferred.count() > 0) {
                         try self.wakeup();
                         if (self.deferred.peek()) |msg| {
-                            if (msg.timestamp > now and msg.timestamp < timeout) timeout = msg.timestamp;
+                            if (msg.timestamp > now_ and msg.timestamp < ts) ts = msg.timestamp;
                         }
                     }
-                    return timeout;
+                    return ts;
                 }
 
                 // Finds time-outed in flight messages and move them to the
                 // deferred queue.
                 // Returns next timeout for in flight messages.
-                fn inFlightTimeout(self: *Channel, now: u64) !u64 {
+                fn inFlightTimeout(self: *Channel, now_: u64) !u64 {
                     var msgs = std.ArrayList(*Msg).init(self.allocator);
                     defer msgs.deinit();
-                    var timeout: u64 = Io.Timer.no_timeout;
+                    var ts: u64 = max_ts;
                     for (self.in_flight.values()) |msg| {
-                        if (msg.timestamp <= now) {
+                        if (msg.timestamp <= now_) {
                             try msgs.append(msg);
                         } else {
-                            if (timeout > msg.timestamp) timeout = msg.timestamp;
+                            if (ts > msg.timestamp) ts = msg.timestamp;
                         }
                     }
                     for (msgs.items) |msg| {
@@ -806,7 +825,7 @@ pub fn ServerType(Consumer: type, Io: type, Notifier: type) type {
                         try self.deffer(msg, 0);
                     }
                     self.metric.timeout += msgs.items.len;
-                    return timeout;
+                    return ts;
                 }
 
                 // Iterates over ready consumers. Returns null when there is no
@@ -1200,7 +1219,7 @@ const TestIo = struct {
             testing.allocator.destroy(self);
         }
 
-        const no_timeout: u64 = @import("io.zig").Io.Timer.no_timeout;
+        const no_timeout: u64 = @import("io.zig").max_ts;
     };
 };
 
@@ -1704,4 +1723,106 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try channel2.empty();
     try testing.expectEqual(1, channel2.in_flight.count());
     try server.deleteTopic(topic_name);
+}
+
+test "wakeup queue" {
+    const allocator = testing.allocator;
+    const C = struct {
+        timer_ts: u64 = 0,
+        count: usize = 0,
+        pub fn onTimer(self: *Self, ts: u64) void {
+            assert(ts <= self.timer_ts);
+            self.count += 1;
+        }
+        const Self = @This();
+    };
+
+    var pq = WakeupQueue(C).init(allocator);
+    defer pq.deinit();
+
+    var c1 = C{ .timer_ts = 5 };
+    try pq.add(&c1);
+    try testing.expectEqual(5, pq.nextTs());
+
+    var c2 = C{ .timer_ts = 3 };
+    try pq.add(&c2);
+    try testing.expectEqual(3, pq.nextTs());
+
+    pq.onTimer(2);
+    try testing.expectEqual(3, pq.nextTs());
+    pq.onTimer(3);
+    try testing.expectEqual(1, c2.count);
+    try testing.expectEqual(0, c1.count);
+    try testing.expectEqual(5, pq.nextTs());
+
+    c2.timer_ts = 4;
+    try pq.add(&c2);
+    try testing.expectEqual(4, pq.nextTs());
+
+    c2.timer_ts = 10;
+    try pq.update(&c2);
+    try testing.expectEqual(5, pq.nextTs());
+
+    c1.timer_ts = 20;
+    try pq.update(&c1);
+    try testing.expectEqual(10, pq.nextTs());
+}
+
+pub const max_ts: u64 = std.math.maxInt(u64);
+
+fn WakeupQueue(comptime T: type) type {
+    return struct {
+        pq: PQ,
+
+        const PQ = std.PriorityQueue(*T, void, less);
+        const Self = @This();
+
+        fn less(_: void, a: *T, b: *T) math.Order {
+            return math.order(a.timer_ts, b.timer_ts);
+        }
+
+        pub fn init(allocator: mem.Allocator) Self {
+            return .{
+                .pq = PQ.init(allocator, {}),
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.pq.deinit();
+        }
+
+        pub fn add(self: *Self, elem: *T) !void {
+            try self.pq.add(elem);
+        }
+
+        pub fn remove(self: *Self, elem: *T) !void {
+            const index = blk: {
+                var idx: usize = 0;
+                while (idx < self.pq.items.len) : (idx += 1) {
+                    const item = self.pq.items[idx];
+                    if (item == elem) break :blk idx;
+                }
+                return error.ElementNotFound;
+            };
+            _ = self.pq.removeIndex(index);
+        }
+
+        pub fn update(self: *Self, elem: *T) !void {
+            self.remove(elem) catch {};
+            try self.add(elem);
+        }
+
+        pub fn onTimer(self: *Self, ts: u64) void {
+            while (self.pq.peek()) |elem| {
+                if (elem.timer_ts > ts) break;
+                _ = self.pq.remove();
+                elem.onTimer(ts);
+            }
+        }
+
+        pub fn nextTs(self: *Self) u64 {
+            if (self.pq.peek()) |elem| return elem.timer_ts;
+            return max_ts;
+        }
+    };
 }

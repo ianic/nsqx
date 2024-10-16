@@ -32,7 +32,7 @@ pub fn main() !void {
 
     // var lookup_connector = @import("server.zig").NoopNotifier{};
     var lookup_connector: lookup.Connector = undefined;
-    var server = tcp.Server.init(allocator, &io, &lookup_connector);
+    var server = tcp.Server.init(allocator, &lookup_connector, io.now());
     try lookup_connector.init(allocator, &io, &server, options.lookup_tcp_addresses);
     defer lookup_connector.deinit();
     defer server.deinit();
@@ -55,7 +55,15 @@ pub fn main() !void {
     { // Run loop
         catchSignals();
         while (true) {
-            io.tick() catch |err| {
+            const now = io.timestamp;
+            const server_ts = server.tick(now);
+
+            const min_ts = now + std.time.ns_per_ms; // 1 ms
+            const max_ts = now + 10 * std.time.ns_per_s; // 10 s
+            const ts = @max(min_ts, @min(server_ts, max_ts));
+
+            //std.debug.print(".", .{});
+            io.tickTs(ts) catch |err| {
                 if (err != error.SignalInterrupt) log.err("io.tick failed {}", .{err});
                 switch (err) {
                     // OutOfMemory

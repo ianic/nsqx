@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
-	//"math/rand/v2"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"syscall"
@@ -47,8 +47,8 @@ type Handler struct {
 
 func (th *Handler) HandleMessage(m *nsq.Message) error {
 	log.Printf("%d attempts: %d", len(m.Body), m.Attempts)
-	//sleep := rand.IntN(10)
-	//time.Sleep(time.Duration(sleep) * time.Second)
+	sleep := rand.IntN(3)
+	time.Sleep(time.Duration(sleep) * time.Second)
 	return nil
 }
 

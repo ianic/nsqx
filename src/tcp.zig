@@ -11,8 +11,7 @@ const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
 const lookup = @import("lookup.zig");
-pub const Server = @import("server.zig").ServerType(Conn, Io, lookup.Connector);
-//pub const Server = @import("server.zig").ServerType(Conn, Io, @import("server.zig").NoopNotifier);
+pub const Server = @import("server.zig").ServerType(Conn, lookup.Connector);
 const Channel = Server.Channel;
 const Msg = Server.Channel.Msg;
 
