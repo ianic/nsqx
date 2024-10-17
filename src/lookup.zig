@@ -363,7 +363,7 @@ const Conn = struct {
                 self.state = .closed;
                 log.debug("{} closed", .{self.address});
             },
-            else => unreachable,
+            .closed => {},
         }
     }
 };

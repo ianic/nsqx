@@ -7,7 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	//"time"
+	"time"
 
 	"github.com/nsqio/go-nsq"
 )
@@ -16,8 +16,8 @@ func main() {
 	cfg := nsq.NewConfig()
 	cfg.MaxInFlight = 16
 	// cfg.HeartbeatInterval = 5 * time.Second
-	// cfg.MsgTimeout = 2 * time.Second
-	// cfg.LookupdPollInterval = 5 * time.Second
+	cfg.MsgTimeout = 2 * time.Second
+	cfg.LookupdPollInterval = 5 * time.Second
 
 	consumers := make([]*nsq.Consumer, 0, 127)
 

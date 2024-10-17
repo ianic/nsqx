@@ -56,7 +56,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         fn deinitTopic(self: *Server, topic: *Topic) void {
             const key = topic.name;
             topic.deinit();
-            self.notifier.topicDeleted(key);
             self.allocator.free(key);
             self.allocator.destroy(topic);
         }
@@ -69,6 +68,11 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
         fn tsWithDelay(self: *Server, delay_ms: u32) u64 {
             return self.now + nsFromMs(delay_ms);
+        }
+
+        fn channelCreated(self: *Server, topic_name: []const u8, name: []const u8) void {
+            self.notifier.channelCreated(topic_name, name);
+            log.debug("topic '{s}' channel '{s}' created", .{ topic_name, name });
         }
 
         // Publish/subscribe -----------------
@@ -117,7 +121,10 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
         pub fn deleteTopic(self: *Server, name: []const u8) !void {
             const kv = self.topics.fetchRemove(name) orelse return error.NotFound;
-            self.deinitTopic(kv.value);
+            const topic = kv.value;
+            topic.delete();
+            self.deinitTopic(topic);
+            self.notifier.topicDeleted(name);
             log.debug("deleted topic {s}", .{name});
         }
 
@@ -129,6 +136,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         pub fn deleteChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
             const topic = self.topics.get(topic_name) orelse return error.NotFound;
             try topic.deleteChannel(name);
+            self.notifier.channelDeleted(topic_name, name);
             log.debug("deleted channel {s} on topic {s}", .{ name, topic_name });
         }
 
@@ -343,10 +351,14 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     self.channels.deinit();
                 }
 
+                fn delete(self: *Topic) void {
+                    // call delete on all channels
+                    var iter = self.channels.iterator();
+                    while (iter.next()) |e| e.value_ptr.*.delete();
+                }
+
                 fn deinitChannel(self: *Topic, channel: *Channel) void {
                     const key = channel.name;
-                    // TODO: ovome nije mjesto u deinit, ali je potreban u delete channel
-                    self.server.notifier.channelDeleted(self.name, channel.name);
                     channel.deinit();
                     self.allocator.free(key);
                     self.allocator.destroy(channel);
@@ -376,8 +388,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     errdefer channel.deinit();
 
                     self.channels.putAssumeCapacityNoClobber(key, channel);
-                    log.debug("topic '{s}' channel '{s}' created", .{ self.name, key });
-                    self.server.notifier.channelCreated(self.name, channel.name);
+                    self.server.channelCreated(self.name, channel.name);
                     return channel;
                 }
 
@@ -465,7 +476,9 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
                 fn deleteChannel(self: *Topic, name: []const u8) !void {
                     const kv = self.channels.fetchRemove(name) orelse return error.NotFound;
-                    self.deinitChannel(kv.value);
+                    const channel = kv.value;
+                    channel.delete();
+                    self.deinitChannel(channel);
                 }
 
                 fn pause(self: *Topic) void {
@@ -595,9 +608,9 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 allocator: mem.Allocator,
                 name: []const u8,
                 topic: *Topic,
+                consumers: std.ArrayList(*Consumer),
                 // Timestamp when next onTimer will be called
                 timer_ts: u64 = max_ts,
-                consumers: std.ArrayList(*Consumer),
                 // Sent but not jet acknowledged (fin) messages.
                 in_flight: std.AutoArrayHashMap(u64, *Msg),
                 // Re-queued by consumer, timed-out or defer published messages.
@@ -629,8 +642,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
                 // Init/deinit -----------------
 
-                // TODO spoji ova dva init nije to tako tesko
-
                 fn init(self: *Channel, topic: *Topic, name: []const u8) !void {
                     const allocator = topic.allocator;
                     self.* = .{
@@ -640,17 +651,18 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         .consumers = std.ArrayList(*Consumer).init(allocator),
                         .in_flight = std.AutoArrayHashMap(u64, *Msg).init(allocator),
                         .deferred = std.PriorityQueue(*Msg, void, Msg.less).init(allocator, {}),
+                        .timer_ts = max_ts,
                         // Channel starts at the last topic message at the moment of channel creation
                         .next = null,
-                        .timer_ts = max_ts,
                     };
+                }
+
+                fn delete(self: *Channel) void {
+                    for (self.consumers.items) |consumer| consumer.channelClosed();
                 }
 
                 fn deinit(self: *Channel) void {
                     self.topic.server.wakeup_queue.remove(self) catch {};
-                    // TODO: ovo treba kada ga brisem ali ne u deinit cak ne
-                    // smije biti u deinit jer je consumer vec deallocated
-                    // for (self.consumers.items) |consumer| consumer.channelClosed();
                     for (self.in_flight.values()) |cm| cm.destroy(self.allocator);
                     while (self.deferred.removeOrNull()) |cm| cm.destroy(self.allocator);
                     self.in_flight.deinit();
