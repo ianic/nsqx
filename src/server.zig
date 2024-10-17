@@ -647,7 +647,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn deinit(self: *Channel) void {
-                    //self.timer.deinit();
+                    self.topic.server.wakeup_queue.remove(self) catch {};
                     // TODO: ovo treba kada ga brisem ali ne u deinit cak ne
                     // smije biti u deinit jer je consumer vec deallocated
                     // for (self.consumers.items) |consumer| consumer.channelClosed();
@@ -776,12 +776,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 // Sets next timer timeout
                 fn setTimer(self: *Channel, next_ts: u64) void {
                     self.timer_ts = next_ts;
-
-                    var wq = &self.topic.server.wakeup_queue;
-                    if (next_ts == max_ts)
-                        wq.remove(self) catch {}
-                    else
-                        wq.update(self) catch {};
+                    self.topic.server.wakeup_queue.update(self) catch {};
                 }
 
                 // Callback when timer timeout if fired
@@ -1181,44 +1176,6 @@ const TestConsumer = struct {
     fn channelClosed(self: *Self) void {
         self.channel = null;
     }
-};
-
-const TestIo = struct {
-    timestamp: u64 = 0,
-    const Self = @This();
-    pub fn now(self: Self) u64 {
-        return self.timestamp;
-    }
-    pub fn initTimer(
-        self: *Self,
-        context: anytype,
-        comptime _: fn (@TypeOf(context)) void,
-    ) !*Timer {
-        const tmr = try testing.allocator.create(Timer);
-        errdefer self.allocator.destroy(tmr);
-        tmr.* = .{ .io = self };
-        return tmr;
-    }
-    pub const Timer = struct {
-        io: *TestIo,
-        fire_at: u64 = 0,
-
-        fn now(self: *Timer) u64 {
-            return self.io.timestamp;
-        }
-
-        fn setAbs(self: *Timer, fire_at: u64) void {
-            self.fire_at = fire_at;
-        }
-
-        fn close(_: *Timer) !void {}
-
-        fn deinit(self: *Timer) void {
-            testing.allocator.destroy(self);
-        }
-
-        const no_timeout: u64 = @import("io.zig").max_ts;
-    };
 };
 
 pub const NoopNotifier = struct {
@@ -1797,6 +1754,7 @@ fn WakeupQueue(comptime T: type) type {
 
         pub fn update(self: *Self, elem: *T) !void {
             self.remove(elem) catch {};
+            if (elem.timer_ts == max_ts) return;
             try self.add(elem);
         }
 

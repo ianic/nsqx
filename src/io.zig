@@ -315,31 +315,24 @@ pub const Io = struct {
         timer_op: Op = .{},
         cancel_op: Op = .{},
         args: Op.TimerArgs = .{},
-        fire_at: u64 = no_timeout,
 
-        const no_timeout: u64 = std.math.maxInt(u64);
         const Self = @This();
 
-        fn now(self: *Self) u64 {
-            return self.io.timestamp;
-        }
-
         pub fn set(self: *Self, ts: u64) void {
-            if (ts == no_timeout) return;
-            if (ts <= self.now()) return;
-            if (self.timer_op.active() and self.fire_at <= ts) return;
-
             if (self.timer_op.active()) {
-                if (self.cancel_op.active()) return;
-                self.cancel_op = Op.cancel(&self.timer_op, self, onCancel);
-                self.io.submit(&self.cancel_op);
-                return;
+                if (self.args.value() <= ts) return;
+                return self.cancel();
             }
-
-            self.fire_at = ts;
-            self.args.prep(self.fire_at - self.now());
+            self.args.abs(ts);
             self.timer_op = Op.timer(self.args, self, onTimer, onTimerFail);
             self.io.submit(&self.timer_op);
+        }
+
+        fn cancel(self: *Self) void {
+            if (!self.timer_op.active()) return;
+            if (self.cancel_op.active()) return;
+            self.cancel_op = Op.cancel(&self.timer_op, self, onCancel);
+            self.io.submit(&self.cancel_op);
         }
 
         fn onCancel(_: *Self, _: ?anyerror) void {}
@@ -428,8 +421,21 @@ pub const Op = struct {
         fn prep(self: *TimerArgs, delay_ns: u64) void {
             const sec = delay_ns / ns_per_s;
             const nsec = (delay_ns - sec * ns_per_s);
-            self.ts.sec = @intCast(sec);
-            self.ts.nsec = @intCast(nsec);
+            self.ts = .{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
+            self.count = 0;
+            self.flags = 0;
+        }
+
+        fn abs(self: *TimerArgs, ts_ns: u64) void {
+            const sec = ts_ns / ns_per_s;
+            const nsec = (ts_ns - sec * ns_per_s);
+            self.ts = .{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
+            self.count = 0;
+            self.flags = linux.IORING_TIMEOUT_ABS | linux.IORING_TIMEOUT_REALTIME;
+        }
+
+        fn value(self: TimerArgs) u64 {
+            return @as(u64, @intCast(self.ts.sec)) * ns_per_s + @as(u64, @intCast(self.ts.nsec));
         }
     };
 
@@ -912,6 +918,26 @@ test "ticker" {
     try io.tick();
     try testing.expectEqual(.cancel, timer.state);
     try testing.expectEqual(4, ctx.count);
+}
+
+test "loop timer" {
+    if (true) return error.SkipZigTest;
+
+    const allocator = testing.allocator;
+    var io: Io = undefined;
+    try io.init(allocator, .{ .entries = 4, .recv_buffers = 0, .recv_buffer_len = 0 });
+    defer io.deinit();
+
+    const start = io.timestamp;
+    try io.tickTs(io.timestamp + 100 * std.time.ns_per_ms);
+    std.debug.print("1: {}\n", .{(io.timestamp - start) / std.time.ns_per_ms});
+    try io.tickTs(io.timestamp + 200 * std.time.ns_per_ms);
+    std.debug.print("2: {}\n", .{(io.timestamp - start) / std.time.ns_per_ms});
+    io.loop_timer.set(io.timestamp + 200 * std.time.ns_per_ms);
+    try io.tickTs(io.timestamp + 199 * std.time.ns_per_ms);
+    std.debug.print("3: {}\n", .{(io.timestamp - start) / std.time.ns_per_ms});
+    try io.tickTs(io.timestamp + 100 * std.time.ns_per_ms);
+    std.debug.print("4: {}\n", .{(io.timestamp - start) / std.time.ns_per_ms});
 }
 
 fn timestamp() u64 {

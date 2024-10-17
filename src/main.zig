@@ -52,62 +52,63 @@ pub fn main() !void {
     } else null;
     defer if (statsd_connector) |*sc| sc.deinit();
 
-    { // Run loop
-        catchSignals();
-        while (true) {
+    // Run loop
+    catchSignals();
+    while (true) {
+        const ts = brk: {
             const now = io.timestamp;
             const server_ts = server.tick(now);
 
             const min_ts = now + std.time.ns_per_ms; // 1 ms
             const max_ts = now + 10 * std.time.ns_per_s; // 10 s
-            const ts = @max(min_ts, @min(server_ts, max_ts));
+            break :brk @max(min_ts, @min(server_ts, max_ts));
+        };
 
-            //std.debug.print(".", .{});
-            io.tickTs(ts) catch |err| {
-                if (err != error.SignalInterrupt) log.err("io.tick failed {}", .{err});
-                switch (err) {
-                    // OutOfMemory
-                    // SubmissionQueueFull - when unable to prepare io operation
-                    // all other errors are io_uring enter specific
-                    error.OutOfMemory => {
-                        // Release glibc malloc memory
-                        if (builtin.mode == .ReleaseFast) mallocTrim();
-                    },
-                    // Next tick will ring.submit at start
-                    error.SubmissionQueueFull => {},
+        io.tickTs(ts) catch |err| {
+            if (err != error.SignalInterrupt)
+                log.err("io.tick failed {}", .{err});
+            switch (err) {
+                // OutOfMemory
+                // SubmissionQueueFull - when unable to prepare io operation
+                // all other errors are io_uring enter specific
+                error.OutOfMemory => {
+                    // Release glibc malloc memory
+                    if (builtin.mode == .ReleaseFast) mallocTrim();
+                },
+                // Next tick will ring.submit at start
+                error.SubmissionQueueFull => {},
 
-                    // io_uring enter errors
-                    // ref: https://manpages.debian.org/unstable/liburing-dev/io_uring_enter.2.en.html#RETURN_VALUE
-                    error.SignalInterrupt => {},
-                    // hopefully transient errors
-                    error.SystemResources,
-                    error.CompletionQueueOvercommitted,
-                    => {},
-                    // fatal errors
-                    error.FileDescriptorInvalid,
-                    error.FileDescriptorInBadState,
-                    error.SubmissionQueueEntryInvalid,
-                    error.BufferInvalid,
-                    error.RingShuttingDown,
-                    error.OpcodeNotSupported,
-                    error.Unexpected,
-                    => break,
-                }
-            };
+                // io_uring enter errors
+                // ref: https://manpages.debian.org/unstable/liburing-dev/io_uring_enter.2.en.html#RETURN_VALUE
+                error.SignalInterrupt => {},
+                // hopefully transient errors
+                error.SystemResources,
+                error.CompletionQueueOvercommitted,
+                => {},
+                // fatal errors
+                error.FileDescriptorInvalid,
+                error.FileDescriptorInBadState,
+                error.SubmissionQueueEntryInvalid,
+                error.BufferInvalid,
+                error.RingShuttingDown,
+                error.OpcodeNotSupported,
+                error.Unexpected,
+                => break,
+            }
+        };
 
-            const sig = signal.load(.monotonic);
-            if (sig != 0) {
-                signal.store(0, .release);
-                switch (sig) {
-                    posix.SIG.USR1 => try showStat(&tcp_listener, &io, &server),
-                    posix.SIG.USR2 => {
-                        mallocInfo();
-                        mallocTrim();
-                        mallocInfo();
-                    },
-                    posix.SIG.TERM, posix.SIG.INT => break,
-                    else => {},
-                }
+        const sig = signal.load(.monotonic);
+        if (sig != 0) {
+            signal.store(0, .release);
+            switch (sig) {
+                posix.SIG.USR1 => try showStat(&tcp_listener, &io, &server),
+                posix.SIG.USR2 => {
+                    mallocInfo();
+                    mallocTrim();
+                    mallocInfo();
+                },
+                posix.SIG.TERM, posix.SIG.INT => break,
+                else => {},
             }
         }
     }
