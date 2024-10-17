@@ -1467,8 +1467,7 @@ test "topic pause" {
     }
 
     try server.deleteTopic(topic_name);
-    // TODO
-    //try testing.expect(consumer.channel == null);
+    try testing.expect(consumer.channel == null);
 }
 
 test "channel empty" {
@@ -1510,6 +1509,7 @@ test "notifier" {
 
     var notifier = NoopNotifier{};
     var server = TestServer.init(allocator, &notifier, 0);
+    defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
     defer consumer.deinit();
@@ -1538,8 +1538,11 @@ test "notifier" {
         , buf);
     }
     // test deletes
-    server.deinit();
-    try testing.expectEqual(10, notifier.call_count);
+    try testing.expectEqual(5, notifier.call_count);
+    try server.deleteTopic("topic1");
+    try testing.expectEqual(6, notifier.call_count);
+    try server.deleteChannel("topic2", "channel2");
+    try testing.expectEqual(7, notifier.call_count);
 }
 
 test "depth" {
