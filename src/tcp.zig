@@ -419,13 +419,13 @@ pub const Conn = struct {
     }
 
     pub fn printStatus(self: *Conn) void {
-        std.debug.print("  socket {} state: {s}, is done? recv: {} ticker: {} send: {} close: {}\n", .{
-            self.socket,
+        std.debug.print("  socket {:>3} {s} state: {s}, active:{s}{s}{s}\n", .{
+            @as(u32, @intCast(self.socket)),
+            if (self.channel != null) "sub" else "pub",
             @tagName(self.state),
-            self.recv_op.active(),
-            false,
-            self.send_op.active(),
-            self.close_op.active(),
+            if (self.recv_op.active()) " recv" else "",
+            if (self.send_op.active()) " send" else "",
+            if (self.close_op.active()) " close" else "",
         });
     }
 };
