@@ -20,7 +20,6 @@ pub const Error = error{OutOfMemory};
 
 pub const Io = struct {
     allocator: mem.Allocator,
-    timer_pool: std.heap.MemoryPool(Timer) = undefined,
     ring: IoUring = undefined,
     timestamp: u64 = 0,
     recv_buf_grp: IoUring.BufferGroup = undefined,
@@ -33,9 +32,6 @@ pub const Io = struct {
     loop_timer: LoopTimer,
 
     pub fn init(self: *Io, allocator: mem.Allocator, options: Options) !void {
-        var timer_pool = std.heap.MemoryPool(Timer).init(allocator);
-        errdefer timer_pool.deinit();
-
         // Flags reference: https://nick-black.com/dankwiki/index.php/Io_uring
         const flags =
             // Create a kernel thread to poll on the submission queue. If the
@@ -51,7 +47,6 @@ pub const Io = struct {
             .allocator = allocator,
             .ring = ring,
             .timestamp = timestamp(),
-            .timer_pool = timer_pool,
             .loop_timer = .{ .io = self },
         };
         if (options.recv_buffers > 0) {
@@ -72,7 +67,6 @@ pub const Io = struct {
             self.allocator.free(self.recv_buf_grp.buffers);
             self.recv_buf_grp.deinit();
         }
-        self.timer_pool.deinit();
         self.ring.deinit();
     }
 
@@ -151,153 +145,6 @@ pub const Io = struct {
     pub fn tsFromDelay(self: *Io, delay_ms: u32) u64 {
         return self.timestamp + @as(u64, @intCast(delay_ms)) * std.time.ns_per_ms;
     }
-
-    pub fn initTimer(
-        self: *Io,
-        context: anytype,
-        comptime cb: fn (@TypeOf(context)) void,
-    ) !*Timer {
-        const tmr = try self.timer_pool.create();
-        errdefer self.allocator.destroy(tmr);
-        tmr.* = Timer.init(self, context, cb);
-        return tmr;
-    }
-
-    pub const Timer = struct {
-        io: *Io,
-        timer_op: Op = .{},
-        cancel_op: Op = .{},
-        state: enum {
-            single,
-            multi,
-            reset,
-            cancel,
-            close,
-        } = .cancel,
-        args: Op.TimerArgs = .{ .ts = .{ .sec = 0, .nsec = 0 }, .count = 0, .flags = 0 },
-
-        context: usize = 0,
-        callback: *const fn (*Self) void = undefined,
-
-        pub const no_timeout: u64 = std.math.maxInt(u64);
-        const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
-        const Self = @This();
-
-        pub fn init(
-            io: *Io,
-            context: anytype,
-            comptime cb: fn (@TypeOf(context)) void,
-        ) Self {
-            const Context = @TypeOf(context);
-            const wrapper = struct {
-                fn complete(t: *Self) void {
-                    const ctx: Context = @ptrFromInt(t.context);
-                    cb(ctx);
-                }
-            };
-            return .{
-                .io = io,
-                .context = @intFromPtr(context),
-                .callback = wrapper.complete,
-            };
-        }
-
-        pub fn now(self: *Self) u64 {
-            return self.io.timestamp;
-        }
-
-        /// Set multi shot ticker to fire every delay milliseconds.
-        pub fn setTicker(self: *Self, interval_ms: u32) void {
-            self.args.ticker(interval_ms);
-            self.set_();
-        }
-
-        /// Set one shot timer after delay milliseconds.
-        pub fn set(self: *Self, delay_ms: u32) void {
-            self.setAbs(@as(u64, @intCast(delay_ms)) * ns_per_ms + self.now());
-        }
-
-        /// Set one shot timer at an absolute timestamp (nanoseconds). If ts is
-        /// after already set timer it is ignored, shorter timer is preserved.
-        /// So this can be called multiple times and shortest timer will be
-        /// used.
-        pub fn setAbs(self: *Self, ts: u64) void {
-            if (ts == no_timeout) return;
-            if (ts <= self.now()) return;
-
-            self.args.abs(ts);
-            self.set_();
-        }
-
-        fn set_(self: *Self) void {
-            if (self.timer_op.active()) return self.reset();
-
-            self.timer_op = Op.timer(self.args, self, onTimer, onTimerFail);
-            self.io.submit(&self.timer_op);
-            self.state = if (self.args.flags & IORING_TIMEOUT_MULTISHOT == 0) .single else .multi;
-        }
-
-        fn reset(self: *Self) void {
-            self.cancel_();
-            self.state = .reset;
-        }
-
-        /// Cancel any running timer.
-        pub fn cancel(self: *Self) void {
-            self.cancel_();
-            self.state = .cancel;
-        }
-
-        fn cancel_(self: *Self) void {
-            if (self.cancel_op.active()) return;
-            if (!self.timer_op.active()) return;
-            self.cancel_op = Op.cancel(&self.timer_op, self, onCancel);
-            self.io.submit(&self.cancel_op);
-        }
-
-        /// Cancel pending operation and deinit self.
-        pub fn deinit(self: *Self) void {
-            self.state = .close;
-            if (self.timer_op.active()) return self.cancel_();
-            if (self.cancel_op.active()) return;
-            self.io.timer_pool.destroy(self);
-        }
-
-        fn onTimer(self: *Self) Error!void {
-            switch (self.state) {
-                .close => return self.deinit(),
-                .reset => return self.set_(),
-                .cancel => {},
-                .single => {
-                    self.state = .cancel;
-                    self.callback(self);
-                },
-                .multi => {
-                    if (!self.timer_op.hasMore()) self.set_();
-                    self.callback(self);
-                },
-            }
-        }
-
-        fn onTimerFail(self: *Self, _: anyerror) Error!void {
-            switch (self.state) {
-                .close => self.deinit(),
-                .reset => self.set_(),
-                .cancel => {},
-                .single => {
-                    self.state = .cancel;
-                },
-                .multi => if (!self.timer_op.hasMore()) self.set_(),
-            }
-        }
-
-        fn onCancel(self: *Self, _: ?anyerror) void {
-            switch (self.state) {
-                .close => self.deinit(),
-                else => {},
-            }
-        }
-    };
 
     const LoopTimer = struct {
         io: *Io,
@@ -876,69 +723,6 @@ test "resize iovec" {
     try testing.expectEqual(0, ret.len);
 }
 
-test "timer" {
-    const allocator = testing.allocator;
-    var io: Io = undefined;
-    try io.init(allocator, .{ .entries = 4, .recv_buffers = 0, .recv_buffer_len = 0 });
-    defer io.deinit();
-
-    const Ctx = struct {
-        count: usize = 0,
-        pub fn onTimer(self: *@This()) void {
-            self.count += 1;
-        }
-    };
-    var ctx = Ctx{};
-    var timer = try io.initTimer(&ctx, Ctx.onTimer);
-    defer timer.deinit();
-
-    timer.set(1);
-    try io.tick();
-    try testing.expectEqual(1, ctx.count);
-
-    timer.set(std.math.maxInt(u32)); // really long
-    timer.set(1); // reset and set again
-    try io.drain();
-    try testing.expectEqual(2, ctx.count);
-}
-
-test "ticker" {
-    const allocator = testing.allocator;
-    var io: Io = undefined;
-    try io.init(allocator, .{ .entries = 4, .recv_buffers = 0, .recv_buffer_len = 0 });
-    defer io.deinit();
-
-    const Ctx = struct {
-        count: usize = 0,
-        pub fn onTimer(self: *@This()) void {
-            self.count += 1;
-        }
-    };
-    var ctx = Ctx{};
-    var timer = try io.initTimer(&ctx, Ctx.onTimer);
-    defer timer.deinit();
-
-    try testing.expectEqual(.cancel, timer.state);
-    timer.setTicker(1);
-    try testing.expectEqual(.multi, timer.state);
-    try io.tick();
-    try testing.expectEqual(1, ctx.count);
-    try io.tick();
-    try testing.expectEqual(2, ctx.count);
-    try io.tick();
-    try testing.expectEqual(3, ctx.count);
-    try testing.expectEqual(.multi, timer.state);
-    try testing.expect(timer.timer_op.active());
-    timer.set(1); // reset and set one shot
-    try testing.expectEqual(.reset, timer.state);
-    try io.tick();
-    // try testing.expectEqual(.single, timer.state);
-    try testing.expectEqual(3, ctx.count);
-    try io.tick();
-    try testing.expectEqual(.cancel, timer.state);
-    try testing.expectEqual(4, ctx.count);
-}
-
 test "loop timer" {
     if (true) return error.SkipZigTest;
 
@@ -1018,8 +802,6 @@ test "size" {
     try testing.expectEqual(112, @sizeOf(net.Address));
     try testing.expectEqual(16, @sizeOf(linux.kernel_timespec));
     try testing.expectEqual(8, @sizeOf(?*Op));
-
-    try testing.expectEqual(184, @sizeOf(Io.Timer));
 }
 
 test "pointer" {
