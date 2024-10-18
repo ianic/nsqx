@@ -23,7 +23,7 @@ pub const Connector = struct {
     server: *Server,
     connections: std.ArrayList(*Conn),
     identify: []const u8,
-    timer: *Io.Timer,
+    ticker_op: Op = .{},
     topic: Topic,
     state: State,
     const State = enum {
@@ -35,8 +35,6 @@ pub const Connector = struct {
     pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, server: *Server, lookup_tcp_addresses: []net.Address) !void {
         // TODO: create identify from command line arguments, options
         const identify = try identifyMessage(allocator, "127.0.0.1", "hydra", 4151, 4150, "0.1.0");
-        const timer = try io.initTimer(self, onTick);
-        errdefer timer.deinit();
 
         self.* = .{
             .allocator = allocator,
@@ -46,12 +44,14 @@ pub const Connector = struct {
             .topic = Topic.init(allocator),
             .identify = identify,
             .state = .connected,
-            .timer = timer,
         };
         errdefer self.deinit();
         try self.connections.ensureUnusedCapacity(lookup_tcp_addresses.len);
         for (lookup_tcp_addresses) |addr| try self.addLookupd(addr);
-        self.timer.setTicker(ping_interval);
+
+        // Start endless ticker
+        self.ticker_op = Op.ticker(ping_interval, self, onTick);
+        self.io.submit(&self.ticker_op);
     }
 
     fn addLookupd(self: *Self, address: std.net.Address) !void {
@@ -65,7 +65,6 @@ pub const Connector = struct {
     pub fn close(self: *Self) void {
         self.state = .closing;
         for (self.connections.items) |conn| conn.shutdown();
-        self.timer.cancel();
     }
 
     pub fn deinit(self: *Self) void {
@@ -76,7 +75,6 @@ pub const Connector = struct {
         self.connections.deinit();
         self.allocator.free(self.identify);
         self.topic.deinit();
-        self.timer.deinit();
     }
 
     fn onTick(self: *Self) void {

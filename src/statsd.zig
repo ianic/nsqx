@@ -22,7 +22,7 @@ pub const Connector = struct {
     socket: socket_t = 0,
     connect_op: Op = .{},
     send_op: Op = .{},
-    timer: *Io.Timer,
+    ticker_op: Op = .{},
 
     iter: BufferSizeIterator = .{},
     prefix: []const u8,
@@ -30,8 +30,6 @@ pub const Connector = struct {
     const Self = @This();
 
     pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !void {
-        const timer = try io.initTimer(self, onTick);
-        errdefer timer.deinit();
         self.* = .{
             .allocator = allocator,
             .io = io,
@@ -39,15 +37,16 @@ pub const Connector = struct {
             .options = options.statsd,
             .address = options.statsd.address.?,
             .prefix = try fmtPrefix(allocator, options.statsd.prefix, options.broadcastAddress(), options.broadcast_tcp_port),
-            .timer = timer,
         };
         errdefer self.deinit();
-        self.timer.setTicker(self.options.interval);
+        // Start endless ticker
+        self.ticker_op = Op.ticker(self.options.interval, self, onTick);
+        self.io.submit(&self.ticker_op);
     }
 
     pub fn deinit(self: *Self) void {
         self.allocator.free(self.prefix);
-        self.timer.deinit();
+        self.allocator.free(self.iter.buf);
     }
 
     fn onTick(self: *Self) void {
@@ -106,8 +105,8 @@ pub const Connector = struct {
             log.err("statm write metrics error {}", .{err});
             return;
         };
-        const book = try writer.toOwned();
-        self.iter = BufferSizeIterator{ .buf = book, .size = self.options.udp_packet_size };
+        const buf = try writer.toOwned();
+        self.iter = BufferSizeIterator{ .buf = buf, .size = self.options.udp_packet_size };
     }
 
     fn send(self: *Self) void {

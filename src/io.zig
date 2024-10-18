@@ -422,12 +422,22 @@ pub const Op = struct {
         count: u32 = 0,
         flags: u32 = 0,
 
+        const IORING_TIMEOUT_MULTISHOT = 1 << 6; // TODO: missing in linux. package
+
         fn prep(self: *TimerArgs, delay_ns: u64) void {
             const sec = delay_ns / ns_per_s;
             const nsec = (delay_ns - sec * ns_per_s);
             self.ts = .{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
             self.count = 0;
             self.flags = 0;
+        }
+
+        fn ticker(self: *TimerArgs, interval_ms: u32) void {
+            const sec = interval_ms / std.time.ms_per_s;
+            const nsec = (interval_ms - sec * std.time.ms_per_s) * std.time.ns_per_ms;
+            self.ts = .{ .sec = @intCast(sec), .nsec = @intCast(nsec) };
+            self.count = 0;
+            self.flags = IORING_TIMEOUT_MULTISHOT;
         }
 
         fn abs(self: *TimerArgs, ts_ns: u64) void {
@@ -684,6 +694,32 @@ pub const Op = struct {
                 }
             }
         };
+        return .{
+            .context = @intFromPtr(context),
+            .callback = wrapper.complete,
+            .args = .{ .timer = args },
+        };
+    }
+
+    pub fn ticker(
+        interval_ms: u32,
+        context: anytype,
+        comptime success: fn (@TypeOf(context)) void,
+    ) Op {
+        const Context = @TypeOf(context);
+        const wrapper = struct {
+            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
+                const ctx: Context = @ptrFromInt(op.context);
+                switch (cqe.err()) {
+                    .SUCCESS, .TIME => success(ctx),
+                    .CANCELED => return, // don't restart
+                    else => {},
+                }
+                if (!flagMore(cqe)) return io.restart(op);
+            }
+        };
+        var args: TimerArgs = .{};
+        args.ticker(interval_ms);
         return .{
             .context = @intFromPtr(context),
             .callback = wrapper.complete,

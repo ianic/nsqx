@@ -39,12 +39,13 @@ admin_pid=$!
 cd ~/Code/nsql
 ./zig-out/bin/nsql \
   --statsd-prefix "" \
+  --statsd-address localhost:8125 \
   --lookupd-tcp-address localhost:4160 \
   --lookupd-tcp-address localhost:4162 \
   --lookupd-tcp-address localhost:4164 \
   > tmp/nsql 2>&1 &
 # --io-entries 16 \
-# --statsd-address localhost:8125 \
+
 nsql_pid=$!
 
 sleep 1

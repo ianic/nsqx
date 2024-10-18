@@ -45,12 +45,12 @@ pub fn main() !void {
     try http_listener.init(allocator, &io, &server, options, try socket(options.http_address));
     defer http_listener.deinit();
 
-    var statsd_connector: ?statsd.Connector = if (options.statsd.address) |_| brk: {
+    const statsd_connector: ?*statsd.Connector = if (options.statsd.address) |_| brk: {
         var sc: statsd.Connector = undefined;
         try sc.init(allocator, &io, &server, options);
-        break :brk sc;
+        break :brk &sc;
     } else null;
-    defer if (statsd_connector) |*sc| sc.deinit();
+    defer if (statsd_connector) |sc| sc.deinit();
 
     // Run loop
     catchSignals();
