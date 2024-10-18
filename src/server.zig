@@ -10,9 +10,8 @@ const log = std.log.scoped(.server);
 const Error = @import("io.zig").Error;
 const validateName = @import("protocol.zig").validateName;
 
-const ns_per_ms = std.time.ns_per_ms;
 fn nsFromMs(ms: u32) u64 {
-    return @as(u64, @intCast(ms)) * ns_per_ms;
+    return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
 }
 
 pub fn ServerType(Consumer: type, Notifier: type) type {
@@ -1393,7 +1392,7 @@ test "deferred messages" {
     }
 
     { // move now, one is in flight after wakeup
-        server.now = ns_per_ms;
+        server.now = nsFromMs(1);
         try channel.wakeup();
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
@@ -1405,7 +1404,7 @@ test "deferred messages" {
     }
 
     { // move now to deliver both
-        server.now = 3 * ns_per_ms;
+        server.now = nsFromMs(3);
         consumer.ready_count = 2;
         try channel.wakeup();
         try testing.expectEqual(2, channel.in_flight.count());

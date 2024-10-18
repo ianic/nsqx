@@ -148,6 +148,10 @@ pub const Io = struct {
         return self.timestamp;
     }
 
+    pub fn tsFromDelay(self: *Io, delay_ms: u32) u64 {
+        return self.timestamp + @as(u64, @intCast(delay_ms)) * std.time.ns_per_ms;
+    }
+
     pub fn initTimer(
         self: *Io,
         context: anytype,

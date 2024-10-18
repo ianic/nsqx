@@ -58,10 +58,11 @@ pub fn main() !void {
         const ts = brk: {
             const now = io.timestamp;
             const server_ts = server.tick(now);
+            const tcp_ts = tcp_listener.timers.tick(now);
 
             const min_ts = now + std.time.ns_per_ms; // 1 ms
             const max_ts = now + 10 * std.time.ns_per_s; // 10 s
-            break :brk @max(min_ts, @min(server_ts, max_ts));
+            break :brk @max(min_ts, @min(server_ts, tcp_ts, max_ts));
         };
 
         io.tickTs(ts) catch |err| {

@@ -28,6 +28,7 @@ pub const Conn = struct {
 
     send_vec: [2]posix.iovec_const = undefined, // header and body
     send_msghdr: posix.msghdr_const = .{ .iov = undefined, .iovlen = undefined, .name = null, .namelen = 0, .control = null, .controllen = 0, .flags = 0 },
+    timer_ts: u64 = 0,
 
     state: State = .connected,
     const State = enum {
