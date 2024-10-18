@@ -22,7 +22,7 @@ pub fn SimpleTopic(
                 self.rc -= 1;
                 if (self.rc == 0) {
                     switch (@typeInfo(Data)) {
-                        .Pointer => |ptr_info| switch (ptr_info.size) {
+                        .pointer => |ptr_info| switch (ptr_info.size) {
                             .Slice => allocator.free(self.data),
                             .One => allocator.destroy(self.data),
                             else => @compileError("invalid type given"),
