@@ -21,6 +21,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         pub const Channel = ChannelType();
 
         allocator: mem.Allocator,
+        channel_msg_pool: std.heap.MemoryPool(Channel.Msg),
+        topic_msg_pool: std.heap.MemoryPool(Topic.Msg),
         topics: std.StringHashMap(*Topic),
         notifier: *Notifier,
 
@@ -38,6 +40,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         pub fn init(allocator: mem.Allocator, notifier: *Notifier, now: u64) Server {
             return .{
                 .allocator = allocator,
+                .channel_msg_pool = std.heap.MemoryPool(Channel.Msg).init(allocator),
+                .topic_msg_pool = std.heap.MemoryPool(Topic.Msg).init(allocator),
                 .topics = std.StringHashMap(*Topic).init(allocator),
                 .notifier = notifier,
                 .started_at = now,
@@ -51,6 +55,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
             while (iter.next()) |e| self.deinitTopic(e.value_ptr.*);
             self.topics.deinit();
             self.timers.deinit();
+            self.channel_msg_pool.deinit();
         }
 
         fn deinitTopic(self: *Server, topic: *Topic) void {
@@ -310,6 +315,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 paused: bool = false,
                 metric: Metric = .{},
                 metric_prev: Metric = .{},
+                msg_pool: *std.heap.MemoryPool(Msg),
 
                 const Metric = struct {
                     // Current number of messages in the topic linked list.
@@ -340,6 +346,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         .name = name,
                         .channels = std.StringHashMap(*Channel).init(allocator),
                         .server = server,
+                        .msg_pool = &server.topic_msg_pool,
                     };
                 }
 
@@ -421,8 +428,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 fn append(self: *Topic, data: []const u8) !*Msg {
                     var msg = brk: {
                         // Allocate message and body
-                        const msg = try self.allocator.create(Msg);
-                        errdefer self.allocator.destroy(msg);
+                        const msg = try self.msg_pool.create();
+                        errdefer self.msg_pool.destroy(msg);
                         const body = try self.allocator.dupe(u8, data);
                         errdefer self.allocator.free(body);
 
@@ -458,7 +465,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     self.metric.dec(msg.body.len);
                     self.server.metric.dec(msg.body.len);
                     self.allocator.free(msg.body);
-                    self.allocator.destroy(msg);
+                    self.msg_pool.destroy(msg);
                 }
 
                 // Notify all channels that there is pending messages
@@ -531,9 +538,9 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     // is reached.
                     timestamp: u64 = 0,
 
-                    fn destroy(self: *Msg, allocator: mem.Allocator) void {
+                    fn destroy(self: *Msg, pool: *std.heap.MemoryPool(Channel.Msg)) void {
                         self.msg.release(); // release inner topic message
-                        allocator.destroy(self); // destroy this channel message
+                        pool.destroy(self); // destroy this channel message
                     }
 
                     pub fn body(self: *Msg) []const u8 {
@@ -605,6 +612,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 };
 
                 allocator: mem.Allocator,
+                msg_pool: *std.heap.MemoryPool(Channel.Msg),
                 name: []const u8,
                 topic: *Topic,
                 consumers: std.ArrayList(*Consumer),
@@ -657,6 +665,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         .timer_ts = infinite,
                         // Channel starts at the last topic message at the moment of channel creation
                         .next = null,
+                        .msg_pool = &topic.server.channel_msg_pool,
                     };
                 }
 
@@ -666,8 +675,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
                 fn deinit(self: *Channel) void {
                     self.timers.remove(self);
-                    for (self.in_flight.values()) |cm| cm.destroy(self.allocator);
-                    while (self.deferred.removeOrNull()) |cm| cm.destroy(self.allocator);
+                    for (self.in_flight.values()) |cm| cm.destroy(self.msg_pool);
+                    while (self.deferred.removeOrNull()) |cm| cm.destroy(self.msg_pool);
                     self.in_flight.deinit();
                     self.deferred.deinit();
                     self.consumers.deinit();
@@ -738,8 +747,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     while (true) {
                         if (self.next) |topic_msg| {
                             // Allocate and convert Topic.Msg to Channel.Msg
-                            const msg = try self.allocator.create(Msg);
-                            errdefer self.allocator.destroy(msg);
+                            const msg = try self.msg_pool.create();
+                            errdefer self.msg_pool.destroy(msg);
                             msg.* = topic_msg.asChannelMsg();
 
                             const deferred = msg.timestamp > now;
@@ -868,7 +877,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     if (self.in_flight.fetchSwapRemove(seq)) |kv| {
                         self.metric.finish += 1;
                         self.metric.depth -= 1;
-                        kv.value.destroy(self.allocator);
+                        kv.value.destroy(self.msg_pool);
                         return true;
                     }
                     return false;
@@ -948,18 +957,18 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         }
                         if (msgs.items.len == self.in_flight.count()) { // Hopefully there is no messages in the kernel
                             // Remove all
-                            for (self.in_flight.values()) |cm| cm.destroy(self.allocator);
+                            for (self.in_flight.values()) |cm| cm.destroy(self.msg_pool);
                             self.in_flight.clearAndFree();
                         } else {
                             // Selectively remove
                             for (msgs.items) |cm| {
                                 assert(self.in_flight.swapRemove(cm.sequence()));
-                                cm.destroy(self.allocator);
+                                cm.destroy(self.msg_pool);
                             }
                         }
                     }
                     // Remove all deferred messages.
-                    while (self.deferred.removeOrNull()) |cm| cm.destroy(self.allocator);
+                    while (self.deferred.removeOrNull()) |cm| cm.destroy(self.msg_pool);
                     // Position to the end of the topic.
                     if (self.next) |n| n.release();
                     self.next = null;
