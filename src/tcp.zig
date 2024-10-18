@@ -196,8 +196,7 @@ pub const Conn = struct {
 
     /// Sends all prepared messages.
     /// msgs must be number of prepared messages
-    // TODO not fallible any more
-    pub fn sendPrepared(self: *Conn, msgs: u32) !void {
+    pub fn sendPrepared(self: *Conn, msgs: u32) void {
         assert(msgs == self.send_vec.prepMsgs());
         self.send();
         self.metric.send += msgs;

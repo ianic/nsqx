@@ -32,7 +32,7 @@ pub const Io = struct {
     pending: Fifo(Op) = .{},
     loop_timer: LoopTimer,
 
-    pub fn init(self: *Io, allocator: mem.Allocator, opt: Options) !void {
+    pub fn init(self: *Io, allocator: mem.Allocator, options: Options) !void {
         var timer_pool = std.heap.MemoryPool(Timer).init(allocator);
         errdefer timer_pool.deinit();
 
@@ -45,7 +45,7 @@ pub const Io = struct {
             // Hint to the kernel that only a single thread will submit
             // requests, allowing for optimizations.
             linux.IORING_SETUP_SINGLE_ISSUER;
-        var ring = try IoUring.init(opt.entries, flags);
+        var ring = try IoUring.init(options.entries, flags);
         errdefer ring.deinit();
         self.* = .{
             .allocator = allocator,
@@ -54,8 +54,8 @@ pub const Io = struct {
             .timer_pool = timer_pool,
             .loop_timer = .{ .io = self },
         };
-        if (opt.recv_buffers > 0) {
-            self.recv_buf_grp = try self.initBufferGroup(1, opt.recv_buffers, opt.recv_buffer_len);
+        if (options.recv_buffers > 0) {
+            self.recv_buf_grp = try self.initBufferGroup(1, options.recv_buffers, options.recv_buffer_len);
         } else {
             self.recv_buf_grp.buffers_count = 0;
         }
@@ -167,7 +167,6 @@ pub const Io = struct {
         io: *Io,
         timer_op: Op = .{},
         cancel_op: Op = .{},
-        fire_at: u64 = no_timeout,
         state: enum {
             single,
             multi,
@@ -208,9 +207,8 @@ pub const Io = struct {
         }
 
         /// Set multi shot ticker to fire every delay milliseconds.
-        pub fn setTicker(self: *Self, delay_ms: u32) void {
-            self.prepArgs(@as(u64, @intCast(delay_ms)) * ns_per_ms, IORING_TIMEOUT_MULTISHOT);
-            self.fire_at = no_timeout;
+        pub fn setTicker(self: *Self, interval_ms: u32) void {
+            self.args.ticker(interval_ms);
             self.set_();
         }
 
@@ -226,21 +224,9 @@ pub const Io = struct {
         pub fn setAbs(self: *Self, ts: u64) void {
             if (ts == no_timeout) return;
             if (ts <= self.now()) return;
-            if (self.timer_op.active() and self.fire_at <= ts) return;
 
-            self.fire_at = ts;
-            self.prepArgs(ts - self.now(), 0);
+            self.args.abs(ts);
             self.set_();
-        }
-
-        fn prepArgs(self: *Self, delay_ns: u64, flags: u32) void {
-            const sec = delay_ns / ns_per_s;
-            const nsec = (delay_ns - sec * ns_per_s);
-            self.args = .{
-                .ts = .{ .sec = @intCast(sec), .nsec = @intCast(nsec) },
-                .count = 0,
-                .flags = flags,
-            };
         }
 
         fn set_(self: *Self) void {
@@ -283,7 +269,6 @@ pub const Io = struct {
                 .reset => return self.set_(),
                 .cancel => {},
                 .single => {
-                    self.fire_at = no_timeout;
                     self.state = .cancel;
                     self.callback(self);
                 },
@@ -476,10 +461,6 @@ pub const Op = struct {
     }
 
     fn prep(op: *Op, io: *Io) !void {
-        // TODO timeout on connect or any other non multishot operation can be implemented like
-        //sqe.flags |= linux.IOSQE_IO_LINK;
-        //_ = try io.ring.link_timeout(1, &timeout_ts, linux.IORING_TIMEOUT_ETIME_SUCCESS);
-
         switch (op.args) {
             .accept => |*arg| _ = try io.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),
             .connect => |*arg| _ = try io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen()),
@@ -559,14 +540,12 @@ pub const Op = struct {
                         io.recv_buf_grp.put(buffer_id);
                         io.metric.recv_buf_grp.success +%= 1;
 
-                        // TODO ovaj note vise ne stoji
                         // NOTE: recv is not restarted if there is no more
-                        // multishot cqe's (like accept, timer). Check op_field
-                        // in callback if null multishot is terminated.
+                        // multishot cqe's (like accept). Check op.hasMore
+                        // in callback and submit if needed.
                         return;
                     },
                     .NOBUFS => {
-                        // log.info("recv nobufs", .{});
                         io.metric.recv_buf_grp.no_bufs +%= 1;
                     },
                     .INTR => {},
@@ -1040,7 +1019,7 @@ test "size" {
     try testing.expectEqual(16, @sizeOf(linux.kernel_timespec));
     try testing.expectEqual(8, @sizeOf(?*Op));
 
-    try testing.expectEqual(192, @sizeOf(Io.Timer));
+    try testing.expectEqual(184, @sizeOf(Io.Timer));
 }
 
 test "pointer" {

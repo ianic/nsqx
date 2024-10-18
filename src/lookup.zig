@@ -12,6 +12,7 @@ const Error = @import("io.zig").Error;
 const Topic = @import("simple_topic.zig").SimpleTopic([]const u8, Conn, Conn.pullTopic);
 const RecvBuf = @import("tcp.zig").RecvBuf;
 const Server = @import("tcp.zig").Server;
+const Options = @import("Options.zig");
 
 const log = std.log.scoped(.lookup);
 
@@ -32,9 +33,22 @@ pub const Connector = struct {
     };
     const ping_interval = 15 * 1000; // in milliseconds
 
-    pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, server: *Server, lookup_tcp_addresses: []net.Address) !void {
-        // TODO: create identify from command line arguments, options
-        const identify = try identifyMessage(allocator, "127.0.0.1", "hydra", 4151, 4150, "0.1.0");
+    pub fn init(
+        self: *Self,
+        allocator: mem.Allocator,
+        io: *Io,
+        server: *Server,
+        lookup_tcp_addresses: []net.Address,
+        options: Options,
+    ) !void {
+        const identify = try identifyMessage(
+            allocator,
+            options.broadcastAddress(),
+            options.hostname,
+            options.broadcast_http_port,
+            options.broadcast_tcp_port,
+            "0.1.0",
+        );
 
         self.* = .{
             .allocator = allocator,

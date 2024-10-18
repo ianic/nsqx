@@ -716,7 +716,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         try consumer.prepareSend(&msg.header, msg.msg.body, n);
                     }
                     if (n == 0) return false;
-                    try consumer.sendPrepared(n);
+                    consumer.sendPrepared(n);
                     return n == max;
                 }
 
