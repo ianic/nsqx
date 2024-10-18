@@ -354,7 +354,7 @@ pub const Op = struct {
                     .CONNABORTED, .INTR => {}, // continue
                     else => |errno| return try fail(ctx, errFromErrno(errno)),
                 }
-                if (!flagMore(cqe)) io.submit(op);
+                if (!flagMore(cqe)) io.restart(op);
             }
         };
         return .{
@@ -860,7 +860,7 @@ const Metric = struct {
 
         // Current number of active operations
         pub fn active(self: Counter) usize {
-            return self.submitted - self.restarted - self.completed;
+            return self.submitted - self.completed;
         }
         fn submit(self: *Counter) void {
             self.submitted += 1;
