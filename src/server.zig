@@ -56,6 +56,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
             self.topics.deinit();
             self.timers.deinit();
             self.channel_msg_pool.deinit();
+            self.topic_msg_pool.deinit();
         }
 
         fn deinitTopic(self: *Server, topic: *Topic) void {

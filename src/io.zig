@@ -454,9 +454,13 @@ pub const Op = struct {
                             }
                         }
 
+                        op.args.sendv.msghdr.iovlen = 0;
                         try success(ctx);
                     },
-                    else => |errno| try fail(ctx, errFromErrno(errno)),
+                    else => |errno| {
+                        op.args.sendv.msghdr.iovlen = 0;
+                        try fail(ctx, errFromErrno(errno));
+                    },
                 }
             }
         };
@@ -680,6 +684,83 @@ pub const Op = struct {
             .callback = wrapper.complete,
             .args = .{ .cancel = op_to_cancel },
         };
+    }
+};
+
+pub const SendOp = struct {
+    op: Op = .{},
+
+    // Vectored send structure
+    iov: []posix.iovec_const = &.{},
+    // Zeroed msghdr
+    msghdr: posix.msghdr_const = .{ .iov = undefined, .iovlen = 0, .name = null, .namelen = 0, .control = null, .controllen = 0, .flags = 0 },
+
+    // iovlen in msghdr is limited by IOV_MAX in <limits.h>. On modern Linux
+    // systems, the limit is 1024. Each message has header and body: 2 iovecs that
+    // limits number of messages in a batch to 512.
+    // ref: https://man7.org/linux/man-pages/man2/readv.2.html
+    const max_capacity = 1024;
+    // Start with one message (header and body) capacity
+    const initial_capacity = 2;
+    const Self = @This();
+
+    pub fn init(
+        self: *Self,
+        allocator: mem.Allocator,
+        socket: socket_t,
+        context: anytype,
+        comptime success: fn (@TypeOf(context)) Error!void,
+        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
+    ) !void {
+        self.iov = try allocator.alloc(posix.iovec_const, initial_capacity);
+        self.msghdr.iov = self.iov.ptr;
+        self.op = Op.sendv(socket, &self.msghdr, context, success, fail);
+    }
+
+    pub fn deinit(self: *Self, allocator: mem.Allocator) void {
+        allocator.free(self.iov);
+    }
+
+    pub fn active(self: *Self) bool {
+        return self.op.active();
+    }
+
+    /// Maximum buffer which can be sent in one go.
+    pub fn capacity(self: *Self) usize {
+        return self.iov.len;
+    }
+
+    /// Submit io operation with all prepared buffers.
+    pub fn send(self: *Self, io: *Io) void {
+        assert(self.msghdr.iov == self.iov.ptr);
+        assert(self.op.args.sendv.msghdr == &self.msghdr);
+        io.submit(&self.op);
+        // io will reset msghdr to 0 after operation completion
+    }
+
+    /// Extends iov to want_capacity if that is less then max_capacity.
+    pub fn ensureCapacity(self: *Self, allocator: mem.Allocator, want_capacity: usize) !void {
+        assert(!self.op.active());
+        const new_capacity: usize = @min(want_capacity, max_capacity);
+        if (new_capacity <= self.iov.len) return;
+
+        const new_iov = try allocator.alloc(posix.iovec_const, new_capacity);
+        allocator.free(self.iov);
+        self.iov = new_iov;
+        self.msghdr.iov = self.iov.ptr;
+    }
+
+    /// Prepare single buffer to be sent. Puts data into next iov.
+    pub fn prep(self: *Self, data: []const u8) void {
+        assert(!self.op.active());
+        const n: usize = @intCast(self.msghdr.iovlen);
+        self.iov[n] = .{ .base = data.ptr, .len = data.len };
+        self.msghdr.iovlen += 1;
+    }
+
+    /// Number of prepared buffers.
+    pub fn count(self: *Self) usize {
+        return @intCast(self.msghdr.iovlen);
     }
 };
 

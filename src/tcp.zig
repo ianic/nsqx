@@ -7,9 +7,12 @@ const fd_t = std.posix.fd_t;
 
 const protocol = @import("protocol.zig");
 const Options = @import("Options.zig");
+
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
+const SendOp = @import("io.zig").SendOp;
 const Error = @import("io.zig").Error;
+
 const lookup = @import("lookup.zig");
 pub const Server = @import("server.zig").ServerType(Conn, lookup.Connector);
 const Channel = Server.Channel;
@@ -104,7 +107,7 @@ pub const Conn = struct {
     addr: std.net.Address,
 
     recv_op: Op = .{},
-    send_op: Op = .{},
+    send_op: SendOp = .{},
     close_op: Op = .{},
     // If send is in process store here response to send later
     pending_response: ?Response = null,
@@ -113,7 +116,6 @@ pub const Conn = struct {
     timer_ts: u64,
     heartbeat_interval: u32 = initial_heartbeat,
     outstanding_heartbeats: u8 = 0,
-    send_vec: SendVec = .{},
     recv_buf: RecvBuf, // Unprocessed bytes from previous receive
     send_buf: [34]u8 = undefined, // Send buffer for control messages
     sent_at: u64 = 0, // Timestamp of the last finished send
@@ -145,8 +147,9 @@ pub const Conn = struct {
     const initial_heartbeat = 2000;
 
     fn init(self: *Conn, listener: *Listener, socket: socket_t, addr: std.net.Address) !void {
+        const allocator = listener.allocator;
         self.* = .{
-            .allocator = listener.allocator,
+            .allocator = allocator,
             .listener = listener,
             .io = listener.io,
             .socket = socket,
@@ -155,9 +158,9 @@ pub const Conn = struct {
             .metric = .{ .connected_at = listener.io.now() },
             .timer_ts = listener.io.tsFromDelay(initial_heartbeat),
         };
-        try self.send_vec.init(self.allocator);
-        errdefer self.send_vec.deinit(self.allocator);
-        self.send_op = Op.sendv(self.socket, self.send_vec.ptr(), self, onSend, onSendFail);
+        try self.send_op.init(allocator, socket, self, onSend, onSendFail);
+        errdefer self.send_op.deinit(allocator);
+
         self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
         self.io.submit(&self.recv_op);
 
@@ -167,7 +170,7 @@ pub const Conn = struct {
     fn deinit(self: *Conn) void {
         self.recv_buf.free();
         self.identify.deinit(self.allocator);
-        self.send_vec.deinit(self.allocator);
+        self.send_op.deinit(self.allocator);
     }
 
     // Channel api -----------------
@@ -183,22 +186,24 @@ pub const Conn = struct {
         if (self.in_flight >= self.ready_count) return 0;
         return @min(
             self.ready_count - self.in_flight,
-            self.send_vec.maxMsgs(),
+            self.send_op.capacity() / 2,
         );
     }
 
     /// Prepares single message to be sent. Fills vectored sending structures.
     /// msg_no must be 0,1,2
     pub fn prepareSend(self: *Conn, header: []const u8, body: []const u8, msg_no: u32) !void {
-        if (msg_no == 0) try self.send_vec.prepInit(self.allocator, self.ready_count);
-        self.send_vec.prep(header, body);
+        if (msg_no == 0) {
+            try self.send_op.ensureCapacity(self.allocator, self.ready_count * 2);
+        }
+        self.send_op.prep(header);
+        if (body.len > 0) self.send_op.prep(body);
     }
 
     /// Sends all prepared messages.
-    /// msgs must be number of prepared messages
     pub fn sendPrepared(self: *Conn, msgs: u32) void {
-        assert(msgs == self.send_vec.prepMsgs());
-        self.send();
+        assert(msgs * 2 == self.send_op.count());
+        self.send_op.send(self.io);
         self.metric.send += msgs;
         self.in_flight += msgs;
     }
@@ -360,10 +365,6 @@ pub const Conn = struct {
         }
     }
 
-    fn send(self: *Conn) void {
-        self.io.submit(&self.send_op);
-    }
-
     fn respond(self: *Conn, rsp: Response) !void {
         if (self.send_op.active()) {
             self.pending_response = rsp;
@@ -382,8 +383,8 @@ pub const Conn = struct {
         mem.writeInt(u32, hdr[0..4], @intCast(4 + data.len), .big);
         mem.writeInt(u32, hdr[4..8], @intFromEnum(protocol.FrameType.response), .big);
         @memcpy(hdr[8..][0..data.len], data);
-        self.send_vec.prepOne(self.send_buf[0 .. data.len + 8]);
-        self.send();
+        self.send_op.prep(self.send_buf[0 .. data.len + 8]);
+        self.send_op.send(self.io);
     }
 
     fn onClose(self: *Conn, _: ?anyerror) void {
@@ -460,77 +461,5 @@ pub const RecvBuf = struct {
         const new_buf = try self.allocator.dupe(u8, bytes);
         self.free();
         self.buf = new_buf;
-    }
-};
-
-/// Growable vectored send structures. Call prepInit then prep multiple times and
-/// then use ptr in sendv.
-const SendVec = struct {
-    // iovlen in msghdr is limited by IOV_MAX in <limits.h>. On modern Linux
-    // systems, the limit is 1024. Each message has header and body: 2 iovecs that
-    // limits number of messages in a batch to 512.
-    // ref: https://man7.org/linux/man-pages/man2/readv.2.html
-    const max_msgs = 512;
-
-    iov: []posix.iovec_const = &.{}, // header and body for each message
-    msghdr: posix.msghdr_const = .{
-        .iov = undefined,
-        .iovlen = 0,
-        .name = null,
-        .namelen = 0,
-        .control = null,
-        .controllen = 0,
-        .flags = 0,
-    },
-
-    const Self = @This();
-
-    fn init(self: *Self, allocator: mem.Allocator) !void {
-        // Start with one message space
-        self.iov = try allocator.alloc(posix.iovec_const, 2);
-        self.msghdr.iov = self.iov.ptr;
-    }
-
-    fn deinit(self: *Self, allocator: mem.Allocator) void {
-        allocator.free(self.iov);
-    }
-
-    /// Max number of messages which can fit into iov.
-    fn maxMsgs(self: *Self) usize {
-        return self.iov.len / 2;
-    }
-
-    /// Number of prepared messages
-    fn prepMsgs(self: *Self) usize {
-        return @as(usize, @intCast(self.msghdr.iovlen)) / 2;
-    }
-
-    fn prepOne(self: *Self, header: []const u8) void {
-        self.iov[0] = .{ .base = header.ptr, .len = header.len };
-        self.msghdr.iovlen = 1;
-    }
-
-    /// Start of prepare multiple messages
-    fn prepInit(self: *Self, allocator: mem.Allocator, want_msgs: usize) !void {
-        self.msghdr.iovlen = 0;
-        const new_len: usize = @as(usize, @intCast(@min(want_msgs, max_msgs))) * 2;
-        if (new_len > self.iov.len) {
-            allocator.free(self.iov);
-            self.iov = try allocator.alloc(posix.iovec_const, new_len);
-            self.msghdr.iov = self.iov.ptr;
-        }
-    }
-
-    /// Puts each message(header/body) into iov
-    fn prep(self: *Self, header: []const u8, body: []const u8) void {
-        const n: usize = @intCast(self.msghdr.iovlen);
-        self.iov[n] = .{ .base = header.ptr, .len = header.len };
-        self.iov[n + 1] = .{ .base = if (body.len == 0) header.ptr else body.ptr, .len = body.len };
-        self.msghdr.iovlen += 2;
-    }
-
-    /// Pointer to use in vectored send (sendv)
-    fn ptr(self: *Self) *posix.msghdr_const {
-        return &self.msghdr;
     }
 };

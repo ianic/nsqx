@@ -8,6 +8,7 @@ const fd_t = std.posix.fd_t;
 const Options = @import("Options.zig");
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
+const SendOp = @import("io.zig").SendOp;
 const Error = @import("io.zig").Error;
 const Server = @import("tcp.zig").Server;
 pub const Listener = @import("tcp.zig").ListenerType(Conn);
@@ -22,12 +23,10 @@ pub const Conn = struct {
     addr: std.net.Address,
 
     recv_op: Op = .{},
-    send_op: Op = .{},
+    send_op: SendOp = .{},
     close_op: Op = .{},
-    arena: ?std.heap.ArenaAllocator = null,
 
-    send_vec: [2]posix.iovec_const = undefined, // header and body
-    send_msghdr: posix.msghdr_const = .{ .iov = undefined, .iovlen = undefined, .name = null, .namelen = 0, .control = null, .controllen = 0, .flags = 0 },
+    rsp_arena: ?std.heap.ArenaAllocator = null, // arena allocator for response
     timer_ts: u64 = 0, // not used here but required by listener
 
     state: State = .connected,
@@ -37,29 +36,33 @@ pub const Conn = struct {
     };
 
     pub fn init(self: *Conn, listener: *Listener, socket: socket_t, addr: std.net.Address) !void {
+        const allocator = listener.allocator;
         self.* = .{
-            .gpa = listener.allocator,
+            .gpa = allocator,
             .listener = listener,
             .io = listener.io,
             .socket = socket,
             .addr = addr,
         };
+        errdefer self.deinit();
+        try self.send_op.init(allocator, socket, self, onSend, onSendFail);
+
         self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
         self.io.submit(&self.recv_op);
-        self.send_op = Op.sendv(self.socket, &self.send_msghdr, self, onSend, onSendFail);
     }
 
     pub fn deinit(self: *Conn) void {
-        self.sendDeinit();
+        self.deinitResponse();
+        self.send_op.deinit(self.gpa);
     }
 
     fn onRecv(self: *Conn, bytes: []const u8) Error!void {
         if (self.send_op.active()) return self.shutdown();
-        assert(self.arena == null);
+        assert(self.rsp_arena == null);
 
-        self.arena = std.heap.ArenaAllocator.init(self.gpa);
-        errdefer self.sendDeinit();
-        const allocator = self.arena.?.allocator();
+        self.rsp_arena = std.heap.ArenaAllocator.init(self.gpa);
+        errdefer self.deinitResponse();
+        const allocator = self.rsp_arena.?.allocator();
 
         var body_bytes = std.ArrayList(u8).init(allocator);
         defer body_bytes.deinit();
@@ -68,19 +71,17 @@ pub const Conn = struct {
         if (self.handle(writer, bytes)) {
             const body = try body_bytes.toOwnedSlice();
             const header = try std.fmt.allocPrint(allocator, header_template, .{ body.len, "application/json" });
-            self.send_vec[0] = .{ .base = header.ptr, .len = header.len };
-            self.send_vec[1] = .{ .base = body.ptr, .len = body.len };
+            self.send_op.prep(header);
+            self.send_op.prep(body);
         } else |err| {
             log.warn("request failed {}", .{err});
             const header = switch (err) {
                 error.NotFound => not_found,
                 else => bad_request,
             };
-            self.send_vec[0] = .{ .base = header.ptr, .len = header.len };
-            self.send_vec[1].len = 0;
+            self.send_op.prep(header);
         }
-
-        self.send();
+        self.send_op.send(self.io);
         if (self.recv_op.active()) self.shutdown();
     }
 
@@ -123,25 +124,18 @@ pub const Conn = struct {
         }
     }
 
-    fn send(self: *Conn) void {
-        self.send_msghdr.iov = &self.send_vec;
-        self.send_msghdr.iovlen = if (self.send_vec[1].len > 0) 2 else 1;
-        self.io.submit(&self.send_op);
-    }
-
-    fn onSend(self: *Conn) Error!void {
-        self.sendDeinit();
-    }
-
-    fn sendDeinit(self: *Conn) void {
-        if (self.arena) |arena| {
+    fn deinitResponse(self: *Conn) void {
+        if (self.rsp_arena) |arena| {
             arena.deinit();
-            self.arena = null;
+            self.rsp_arena = null;
         }
+    }
+    fn onSend(self: *Conn) Error!void {
+        self.deinitResponse();
     }
 
     fn onSendFail(self: *Conn, err: anyerror) Error!void {
-        self.sendDeinit();
+        self.deinitResponse();
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.err("{} send failed {}", .{ self.socket, err }),
