@@ -8,7 +8,7 @@ const testing = std.testing;
 
 const log = std.log.scoped(.server);
 const Error = @import("io.zig").Error;
-const validateName = @import("protocol.zig").validateName;
+const protocol = @import("protocol.zig");
 
 fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
@@ -121,7 +121,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         // Http interface actions -----------------
 
         pub fn createTopic(self: *Server, name: []const u8) !void {
-            _ = try self.getOrCreateTopic(try validateName(name));
+            _ = try self.getOrCreateTopic(try protocol.validateName(name));
         }
 
         pub fn deleteTopic(self: *Server, name: []const u8) !void {
@@ -134,8 +134,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         }
 
         pub fn createChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
-            const topic = try self.getOrCreateTopic(try validateName(topic_name));
-            _ = try topic.getOrCreateChannel(try validateName(name));
+            const topic = try self.getOrCreateTopic(try protocol.validateName(topic_name));
+            _ = try topic.getOrCreateChannel(try protocol.validateName(name));
         }
 
         pub fn deleteChannel(self: *Server, topic_name: []const u8, name: []const u8) !void {
@@ -362,6 +362,11 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     // call delete on all channels
                     var iter = self.channels.iterator();
                     while (iter.next()) |e| e.value_ptr.*.delete();
+                }
+
+                fn removeChannel(self: *Topic, channel: *Channel) void {
+                    assert(self.channels.remove(channel.name));
+                    self.deinitChannel(channel);
                 }
 
                 fn deinitChannel(self: *Topic, channel: *Channel) void {
@@ -634,6 +639,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 metric: Metric = .{},
                 metric_prev: Metric = .{},
                 paused: bool = false,
+                ephemeral: bool = false,
 
                 const Metric = struct {
                     // Total number of messages ...
@@ -667,6 +673,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         // Channel starts at the last topic message at the moment of channel creation
                         .next = null,
                         .msg_pool = &topic.server.channel_msg_pool,
+                        .ephemeral = protocol.isEphemeral(name),
                     };
                 }
 
@@ -916,6 +923,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                             break;
                         }
                     }
+                    if (self.consumers.items.len == 0 and self.ephemeral)
+                        self.topic.removeChannel(self);
                 }
 
                 fn removeInFlight(self: *Channel, socket: socket_t) !void {
@@ -1505,6 +1514,28 @@ test "channel empty" {
     consumer.sent_at = 3;
     try channel.empty();
     try testing.expectEqual(0, channel.in_flight.count());
+}
+
+test "ephemeral channel" {
+    const allocator = testing.allocator;
+    const topic_name = "topic";
+    const channel_name = "channel#ephemeral";
+
+    var notifier = NoopNotifier{};
+    var server = TestServer.init(allocator, &notifier, 0);
+    defer server.deinit();
+
+    var consumer = TestConsumer.init(allocator);
+    defer consumer.deinit();
+
+    const channel = try server.subscribe(&consumer, topic_name, channel_name);
+    consumer.channel = channel;
+    const topic = consumer.channel.?.topic;
+    try testing.expect(channel.ephemeral);
+
+    try testing.expectEqual(1, topic.channels.count());
+    channel.unsubscribe(&consumer);
+    try testing.expectEqual(0, topic.channels.count());
 }
 
 test "notifier" {

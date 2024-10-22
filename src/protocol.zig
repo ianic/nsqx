@@ -486,9 +486,10 @@ test "identify parse json" {
     }
 }
 
+const ephemeral_suffix = "#ephemeral";
+
 // Valid topic and channel names are characters [.a-zA-Z0-9_-] and 1 <= length <= 64
 pub fn validateName(name: []const u8) ![]const u8 {
-    const ephemeral_suffix = "#ephemeral";
     const chars = if (std.mem.endsWith(u8, name, ephemeral_suffix)) name[0 .. name.len - ephemeral_suffix.len] else name;
     if (chars.len < 1 or chars.len > 64) return error.InvalidName;
 
@@ -502,10 +503,20 @@ pub fn validateName(name: []const u8) ![]const u8 {
     return name;
 }
 
+pub fn isEphemeral(name: []const u8) bool {
+    _ = validateName(name) catch return false;
+    return std.mem.endsWith(u8, name, ephemeral_suffix);
+}
+
 test "validate name" {
     _ = try validateName("foo.bar");
     _ = try validateName("foo.bar#ephemeral");
     try testing.expectError(error.InvalidName, validateName("#ephemeral"));
     try testing.expectError(error.InvalidName, validateName("a" ** 65));
     try testing.expectError(error.InvalidNameCharacter, validateName("foo%bar"));
+}
+
+test isEphemeral {
+    try testing.expect(!isEphemeral("#ephemeral"));
+    try testing.expect(isEphemeral("foo#ephemeral"));
 }
