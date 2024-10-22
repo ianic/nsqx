@@ -108,7 +108,7 @@ pub const Conn = struct {
 
     recv_op: Op = .{},
     send_op: SendOp = .{},
-    close_op: Op = .{},
+    shutdown_op: Op = .{},
     // If send is in process store here response to send later
     pending_response: ?Response = null,
     ready_count: u32 = 0,
@@ -401,15 +401,15 @@ pub const Conn = struct {
                 self.pending_response = null;
                 self.state = .closing;
                 if (self.channel) |channel| channel.unsubscribe(self);
-                self.close_op = Op.shutdown(self.socket, self, onClose);
-                self.io.submit(&self.close_op);
+                self.shutdown_op = Op.shutdown(self.socket, self, onClose);
+                self.io.submit(&self.shutdown_op);
             },
             .closing => {
                 // Shutdown already in process.
                 // Wait for all operation to finish.
                 if (self.recv_op.active() or
                     self.send_op.active() or
-                    self.close_op.active())
+                    self.shutdown_op.active())
                     return;
 
                 log.debug("{} closed", .{self.socket});
@@ -426,7 +426,7 @@ pub const Conn = struct {
             @tagName(self.state),
             if (self.recv_op.active()) " recv" else "",
             if (self.send_op.active()) " send" else "",
-            if (self.close_op.active()) " close" else "",
+            if (self.shutdown_op.active()) " shutdown" else "",
         });
     }
 };

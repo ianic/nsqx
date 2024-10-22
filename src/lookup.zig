@@ -304,7 +304,7 @@ const Conn = struct {
         };
     }
 
-    fn handleResponse(self: *Self, bytes: []const u8) error{OutOfMemory}!void {
+    fn handleResponse(self: *Self, bytes: []const u8) Error!void {
         var buf = try self.recv_buf.append(bytes);
 
         while (true) {

@@ -380,11 +380,11 @@ pub const Op = struct {
                         if (n == 0)
                             return try fail(ctx, error.EndOfFile);
 
-                        io.metric.recv_bytes +%= n;
                         const buffer_id = cqe.buffer_id() catch unreachable;
                         const bytes = io.recv_buf_grp.get(buffer_id)[0..n];
                         try success(ctx, bytes);
                         io.recv_buf_grp.put(buffer_id);
+                        io.metric.recv_bytes +%= n;
                         io.metric.recv_buf_grp.success +%= 1;
 
                         // NOTE: recv is not restarted if there is no more

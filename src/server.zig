@@ -1139,18 +1139,18 @@ const TestConsumer = struct {
     }
 
     fn prepareSend(self: *Self, header: []const u8, body: []const u8, msg_no: u32) !void {
+        {
+            // Making this method fallible in check all allocations
+            const buf = try self.allocator.alloc(u8, 8);
+            defer self.allocator.free(buf);
+        }
         const sequence = mem.readInt(u64, header[26..34], .big);
         try self.sequences.append(sequence);
         _ = msg_no;
         _ = body;
     }
 
-    fn sendPrepared(self: *Self, msgs: u32) !void {
-        {
-            // Making this method fallible in check all allocations
-            const buf = try self.allocator.alloc(u8, 8);
-            defer self.allocator.free(buf);
-        }
+    fn sendPrepared(self: *Self, msgs: u32) void {
         self.ready_count -= msgs;
     }
 
@@ -1688,53 +1688,6 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try server.deleteTopic(topic_name);
 }
 
-test "wakeup queue" {
-    const allocator = testing.allocator;
-    const C = struct {
-        timer_ts: u64 = 0,
-        count: usize = 0,
-        pub fn onTimer(self: *Self, ts: u64) void {
-            assert(ts <= self.timer_ts);
-            self.count += 1;
-        }
-        const Self = @This();
-    };
-
-    var pq = TimerQueue(C).init(allocator);
-    defer pq.deinit();
-
-    var c1 = C{ .timer_ts = 5 };
-    try pq.add(&c1);
-    try testing.expectEqual(5, pq.next());
-
-    var c2 = C{ .timer_ts = 3 };
-    try pq.add(&c2);
-    try testing.expectEqual(3, pq.next());
-
-    try testing.expectEqual(3, pq.tick(2));
-    _ = pq.tick(3);
-    try testing.expectEqual(1, c2.count);
-    try testing.expectEqual(0, c1.count);
-    try testing.expectEqual(5, pq.next());
-
-    c2.timer_ts = 4;
-    try pq.add(&c2);
-    try testing.expectEqual(4, pq.next());
-
-    c2.timer_ts = 10;
-    try pq.update(&c2);
-    try testing.expectEqual(5, pq.next());
-
-    c1.timer_ts = 20;
-    try pq.update(&c1);
-    try testing.expectEqual(10, pq.next());
-
-    pq.remove(&c2);
-    try testing.expectEqual(20, pq.tick(11));
-    pq.remove(&c1);
-    try testing.expectEqual(infinite, pq.tick(0));
-}
-
 pub const infinite: u64 = std.math.maxInt(u64);
 
 pub fn TimerQueue(comptime T: type) type {
@@ -1796,4 +1749,51 @@ pub fn TimerQueue(comptime T: type) type {
             return infinite;
         }
     };
+}
+
+test "timer queue" {
+    const allocator = testing.allocator;
+    const C = struct {
+        timer_ts: u64 = 0,
+        count: usize = 0,
+        pub fn onTimer(self: *Self, ts: u64) void {
+            assert(ts <= self.timer_ts);
+            self.count += 1;
+        }
+        const Self = @This();
+    };
+
+    var pq = TimerQueue(C).init(allocator);
+    defer pq.deinit();
+
+    var c1 = C{ .timer_ts = 5 };
+    try pq.add(&c1);
+    try testing.expectEqual(5, pq.next());
+
+    var c2 = C{ .timer_ts = 3 };
+    try pq.add(&c2);
+    try testing.expectEqual(3, pq.next());
+
+    try testing.expectEqual(3, pq.tick(2));
+    _ = pq.tick(3);
+    try testing.expectEqual(1, c2.count);
+    try testing.expectEqual(0, c1.count);
+    try testing.expectEqual(5, pq.next());
+
+    c2.timer_ts = 4;
+    try pq.add(&c2);
+    try testing.expectEqual(4, pq.next());
+
+    c2.timer_ts = 10;
+    try pq.update(&c2);
+    try testing.expectEqual(5, pq.next());
+
+    c1.timer_ts = 20;
+    try pq.update(&c1);
+    try testing.expectEqual(10, pq.next());
+
+    pq.remove(&c2);
+    try testing.expectEqual(20, pq.tick(11));
+    pq.remove(&c1);
+    try testing.expectEqual(infinite, pq.tick(0));
 }
