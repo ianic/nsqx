@@ -9,6 +9,7 @@ const testing = std.testing;
 const log = std.log.scoped(.server);
 const Error = @import("io.zig").Error;
 const protocol = @import("protocol.zig");
+const Limits = @import("Options.zig").Limits;
 
 fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
@@ -25,6 +26,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         topic_msg_pool: std.heap.MemoryPool(Topic.Msg),
         topics: std.StringHashMap(*Topic),
         notifier: *Notifier,
+        limits: Limits,
 
         started_at: u64,
         metric: Topic.Metric = .{},
@@ -37,7 +39,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
         // Init/deinit -----------------
 
-        pub fn init(allocator: mem.Allocator, notifier: *Notifier, now: u64) Server {
+        pub fn init(allocator: mem.Allocator, notifier: *Notifier, now: u64, limits: Limits) Server {
             return .{
                 .allocator = allocator,
                 .channel_msg_pool = std.heap.MemoryPool(Channel.Msg).init(allocator),
@@ -47,6 +49,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 .started_at = now,
                 .now = now,
                 .timers = TimerQueue(Channel).init(allocator),
+                .limits = limits,
             };
         }
 
@@ -104,11 +107,17 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         }
 
         pub fn publish(self: *Server, topic_name: []const u8, data: []const u8) !void {
+            if (self.metric.depth_bytes + data.len > self.limits.max_mem)
+                return error.ServerMemoryOverflow;
+
             const topic = try self.getOrCreateTopic(topic_name);
             try topic.publish(data);
         }
 
         pub fn multiPublish(self: *Server, topic_name: []const u8, msgs: u32, data: []const u8) !void {
+            if (self.metric.depth_bytes + data.len > self.limits.max_mem)
+                return error.ServerMemoryOverflow;
+
             const topic = try self.getOrCreateTopic(topic_name);
             try topic.multiPublish(msgs, data);
         }
@@ -377,10 +386,10 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn subscribe(self: *Topic, consumer: *Consumer, name: []const u8) !*Channel {
-                    const is_first = self.channels.count() == 0;
+                    const first_channel = self.channels.count() == 0;
                     const channel = try self.getOrCreateChannel(name);
                     try channel.subscribe(consumer);
-                    if (is_first) { // First channel gets all messages from the topic
+                    if (first_channel) { // First channel gets all messages from the topic
                         channel.next = self.first;
                         channel.metric.depth = self.metric.depth;
                         self.first = null;
@@ -404,18 +413,29 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     return channel;
                 }
 
-                fn publish(self: *Topic, data: []const u8) error{OutOfMemory}!void {
+                fn checkLimits(self: Topic, msgs: u32, bytes: usize) !void {
+                    if (self.metric.depth_bytes + bytes > self.server.limits.topic_max_mem)
+                        return error.TopicMemoryOverflow;
+                    if (self.metric.depth + msgs > self.server.limits.topic_max_msgs)
+                        return error.TopicMessagesOverflow;
+                }
+
+                fn publish(self: *Topic, data: []const u8) !void {
+                    try self.checkLimits(1, data.len);
                     const msg = try self.append(data);
                     self.notifyChannels(msg, 1);
                 }
 
                 fn deferredPublish(self: *Topic, data: []const u8, delay: u32) !void {
+                    try self.checkLimits(1, data.len);
                     var msg = try self.append(data);
                     msg.defer_until = self.server.tsFromDelay(delay);
                     self.notifyChannels(msg, 1);
                 }
 
                 fn multiPublish(self: *Topic, msgs: u32, data: []const u8) !void {
+                    try self.checkLimits(msgs, data.len);
+
                     if (msgs == 0) return;
                     var pos: usize = 0;
                     var first: *Msg = undefined;
@@ -462,7 +482,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     // If there is no channels messages are accumulated in
                     // topic. We need to hold pointer to the first message (to
                     // prevent release).
-                    if (self.channels.count() == 0 and self.first == null) self.first = msg.acquire();
+                    if (self.channels.count() == 0 and self.first == null)
+                        self.first = msg.acquire();
 
                     return msg;
                 }
@@ -993,7 +1014,7 @@ test "channel consumers iterator" {
     const allocator = testing.allocator;
 
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     defer server.deinit();
 
     var consumer1 = TestConsumer.init(allocator);
@@ -1031,7 +1052,7 @@ test "channel fin req" {
     const channel_name = "channel";
 
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     const idFromSeq = TestServer.Channel.Msg.idFromSeq;
     defer server.deinit();
 
@@ -1229,7 +1250,7 @@ test "multiple channels" {
     const no = 1024;
 
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     defer server.deinit();
 
     var c1 = TestConsumer.init(allocator);
@@ -1298,7 +1319,7 @@ test "first channel gets all messages accumulated in topic" {
     const no = 16;
 
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     defer server.deinit();
     // publish messages to the topic which don't have channels created
     for (0..no) |_|
@@ -1331,7 +1352,7 @@ test "timeout messages" {
     const no = 4;
 
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1394,7 +1415,7 @@ test "deferred messages" {
     const channel_name = "channel";
 
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1437,7 +1458,7 @@ test "topic pause" {
     const channel_name = "channel";
 
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     defer server.deinit();
     const topic = try server.getOrCreateTopic(topic_name);
 
@@ -1488,7 +1509,7 @@ test "channel empty" {
     const channel_name = "channel";
 
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1522,7 +1543,7 @@ test "ephemeral channel" {
     const channel_name = "channel#ephemeral";
 
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1542,7 +1563,7 @@ test "notifier" {
     const allocator = testing.allocator;
 
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     defer server.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1584,7 +1605,7 @@ test "depth" {
     const topic_name = "topic";
 
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     defer server.deinit();
 
     var consumer1 = TestConsumer.init(allocator);
@@ -1655,7 +1676,7 @@ test "check allocations" {
 fn publishFinish(allocator: mem.Allocator) !void {
     const topic_name = "topic";
     var notifier = NoopNotifier{};
-    var server = TestServer.init(allocator, &notifier, 0);
+    var server = TestServer.init(allocator, &notifier, 0, .{});
     defer server.deinit();
 
     // Create 2 channels

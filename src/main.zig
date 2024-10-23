@@ -31,7 +31,7 @@ pub fn main() !void {
     defer io.deinit();
 
     var lookup_connector: lookup.Connector = undefined;
-    var server = tcp.Server.init(allocator, &lookup_connector, io.now());
+    var server = tcp.Server.init(allocator, &lookup_connector, io.now(), options.limits);
     try lookup_connector.init(allocator, &io, &server, options.lookup_tcp_addresses, options);
     defer lookup_connector.deinit();
     defer server.deinit();

@@ -141,6 +141,7 @@ pub const Conn = struct {
         ok,
         close,
         heartbeat,
+        pub_failed,
     };
 
     // Until client set's connection heartbeat interval in identify message.
@@ -279,7 +280,17 @@ pub const Conn = struct {
             );
             return err;
         }) |msg| {
-            try self.receivedMsg(msg);
+            self.receivedMsg(msg) catch |err| switch (err) {
+                error.MessageSizeOverflow,
+                error.ServerMemoryOverflow,
+                error.TopicMemoryOverflow,
+                error.TopicMessagesOverflow,
+                => {
+                    log.err("{} publish failed {}", .{ self.socket, err });
+                    try self.respond(.pub_failed);
+                },
+                else => return err,
+            };
         }
 
         try self.recv_buf.set(parser.unparsed());
@@ -307,6 +318,7 @@ pub const Conn = struct {
             },
             .publish => |arg| {
                 if (arg.data.len > options.max_msg_size) return error.MessageSizeOverflow;
+
                 try server.publish(arg.topic, arg.data);
                 try self.respond(.ok);
                 log.debug("{} publish: {s}", .{ self.socket, arg.topic });
@@ -314,11 +326,14 @@ pub const Conn = struct {
             .multi_publish => |arg| {
                 if (arg.msgs == 0) return;
                 if (arg.data.len / arg.msgs > options.max_msg_size) return error.MessageSizeOverflow;
+
                 try server.multiPublish(arg.topic, arg.msgs, arg.data);
                 try self.respond(.ok);
                 log.debug("{} multi publish: {s} messages: {}", .{ self.socket, arg.topic, arg.msgs });
             },
             .deferred_publish => |arg| {
+                if (arg.data.len > options.max_msg_size) return error.MessageSizeOverflow;
+
                 try server.deferredPublish(arg.topic, arg.data, arg.delay);
                 try self.respond(.ok);
                 log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });
@@ -374,6 +389,7 @@ pub const Conn = struct {
             .ok => try self.sendResponse("OK"),
             .heartbeat => try self.sendResponse("_heartbeat_"),
             .close => try self.sendResponse("CLOSE_WAIT"),
+            .pub_failed => try self.sendResponse("E_PUB_FAILED"),
         }
     }
 

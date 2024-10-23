@@ -44,6 +44,13 @@ const usage =
     \\  --statsd-udp-packet-size int
     \\        the size in bytes of statsd UDP packets (default 508)
     \\
+    \\  --max-mem
+    \\        maximum total message size of all messages in all topics (default 80% of system memory)
+    \\  --topic-max-mem
+    \\        maximum total messages size per topic (default 1GB)
+    \\  --topic-max-msgs
+    \\        maximum number of messages per topic (default 0, unlimited)
+    \\
     \\  io_uring:
     \\  --io-entries
     \\        number of entries in io_uring submission queue (default 16k)
@@ -59,21 +66,23 @@ const usage =
 tcp_address: net.Address = net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, 4150),
 http_address: net.Address = net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, 4151),
 
+lookup_tcp_addresses: []net.Address = &.{},
+
 hostname: []const u8,
 broadcast_address: ?[]const u8 = null,
 broadcast_tcp_port: u16 = 0,
 broadcast_http_port: u16 = 0,
 
-lookup_tcp_addresses: []net.Address = &.{},
-
 max_rdy_count: u16 = 2500,
 max_msg_size: u32 = 1048576,
 
-// duration values in milliseconds
+// Duration values in milliseconds
 max_heartbeat_interval: u32 = 60000, // 1m
 max_msg_timeout: u32 = 60000 * 15, // 15m
 max_req_timeout: u32 = 60000 * 60, // 1h
 msg_timeout: u32 = 60000, // 1m
+
+limits: Limits = .{},
 
 /// io_uring configuration
 io: Io = .{},
@@ -82,6 +91,12 @@ io: Io = .{},
 statsd: Statsd = .{},
 
 const Options = @This();
+
+pub const Limits = struct {
+    max_mem: usize = std.math.maxInt(usize),
+    topic_max_mem: usize = 1 * 1024 * 1024 * 1024, // 1 GB
+    topic_max_msgs: usize = std.math.maxInt(usize), // unlimited
+};
 
 pub const Io = struct {
     /// Number of io_uring sqe entries
@@ -128,6 +143,7 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
     var opt: Options = .{
         .hostname = hostname,
         .statsd = .{ .prefix = "nsq.%s" },
+        .limits = .{ .max_mem = totalSystemMemory() / 5 * 4 }, // 80%
     };
 
     outer: while (iter.next()) |arg| {
@@ -179,6 +195,14 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
         } else if (iter.durationMs("statsd-interval")) |d| {
             opt.statsd.interval = d;
 
+            // limits
+        } else if (iter.byteSize("max-mem")) |d| {
+            opt.limits.max_mem = d;
+        } else if (iter.byteSize("topic-max-mem")) |d| {
+            opt.limits.topic_max_mem = d;
+        } else if (iter.byteSize("topic-max-msgs")) |d| {
+            opt.limits.topic_max_msgs = d;
+
             // io_uring
         } else if (iter.int("io-entries", u16)) |i| {
             opt.io.entries = i;
@@ -210,6 +234,11 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
     if (opt.broadcast_http_port == 0) opt.broadcast_http_port = opt.http_address.getPort();
     if (lookup_tcp_addresses.items.len > 0) opt.lookup_tcp_addresses = try lookup_tcp_addresses.toOwnedSlice();
     opt.statsd.prefix = try allocator.dupe(u8, opt.statsd.prefix);
+
+    const unlimited = std.math.maxInt(usize);
+    if (opt.limits.max_mem == 0) opt.limits.max_mem = unlimited;
+    if (opt.limits.topic_max_mem == 0) opt.limits.topic_max_mem = unlimited;
+    if (opt.limits.topic_max_msgs == 0) opt.limits.topic_max_msgs = unlimited;
 
     return opt;
 }
@@ -282,6 +311,16 @@ const ArgIterator = struct {
         return null;
     }
 
+    fn byteSize(self: *Self, flag: []const u8) ?usize {
+        if (eql(flag, self.arg)) {
+            const val = self.value();
+            return parseByteSize(val) catch {
+                fatal("unable to parse byte size '{s}', valid format: 123K, 456G, 789T", .{val});
+            };
+        }
+        return null;
+    }
+
     fn value(self: *Self) []const u8 {
         return self.inner.next() orelse {
             fatal("expected parameter after {s}", .{self.arg});
@@ -335,6 +374,8 @@ test parseAddressFailing {
     try testing.expectEqual(80, addr.getPort());
 }
 
+// test example:
+// $ zig run -lc Options.zig -- --max-mem 10G --topic-max-mem 4G --topic-max-msgs 1T
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -364,6 +405,11 @@ pub fn main() !void {
     std.debug.print("statsd_interval: {}\n", .{opt.statsd.interval});
     std.debug.print("statsd_prefix: {s}\n", .{opt.statsd.prefix});
     std.debug.print("statsd_udp_packet_size: {}\n", .{opt.statsd.udp_packet_size});
+
+    std.debug.print("\n", .{});
+    std.debug.print("max_mem: {}\n", .{opt.limits.max_mem});
+    std.debug.print("topic_max_mem: {}\n", .{opt.limits.topic_max_mem});
+    std.debug.print("topic_max_msgs: {}\n", .{opt.limits.topic_max_msgs});
 }
 
 fn parseDuration(arg: []const u8) !u64 {
@@ -405,6 +451,37 @@ test parseDuration {
     try testing.expectError(error.DurationParse, parseDuration("34m56s78ab"));
     try testing.expectError(error.DurationParse, parseDuration("34m56ss"));
     try testing.expectError(error.InvalidCharacter, parseDuration("3-m56ss"));
+}
+
+fn parseByteSize(arg: []const u8) !u64 {
+    if (arg.len < 1) return 0;
+    const b_char = arg[arg.len - 1] == 'b' or arg[arg.len - 1] == 'B';
+    if (b_char and arg.len < 2) return 0;
+    var unit_pos: usize = arg.len - @as(usize, if (b_char) 2 else 1);
+    if (unit_pos > arg.len) return 0;
+    const unit: u64 = switch (arg[unit_pos]) {
+        'b', 'B' => 1,
+        'k', 'K' => 1024,
+        'm', 'M' => 1024 * 1024,
+        'g', 'G' => 1024 * 1024 * 1024,
+        't', 'T' => 1024 * 1024 * 1024 * 1024,
+        else => brk: {
+            unit_pos += 1;
+            break :brk 1;
+        },
+    };
+    return try fmt.parseInt(u64, arg[0..unit_pos], 10) * unit;
+}
+
+test parseByteSize {
+    try testing.expectEqual(123 * 1024, try parseByteSize("123K"));
+    try testing.expectEqual(4567 * 1024 * 1024, try parseByteSize("4567M"));
+    try testing.expectEqual(89, try parseByteSize("89"));
+    try testing.expectEqual(0, parseByteSize("B"));
+    try testing.expectEqual(123, parseByteSize("123B"));
+
+    try testing.expectEqual(123 * 1024, try parseByteSize("123KB"));
+    try testing.expectEqual(4567 * 1024 * 1024, try parseByteSize("4567MB"));
 }
 
 pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
@@ -470,3 +547,10 @@ const nsqd_flags = [_][]const u8{
     "worker-id",
     "deflate",
 };
+
+fn totalSystemMemory() usize {
+    const c = @cImport(@cInclude("unistd.h"));
+    const pages: usize = @intCast(c.sysconf(c._SC_PHYS_PAGES));
+    const page_size: usize = @intCast(c.sysconf(c._SC_PAGE_SIZE));
+    return pages * page_size;
+}
