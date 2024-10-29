@@ -6,6 +6,7 @@ const net = std.net;
 const mem = std.mem;
 
 const Options = @import("Options.zig");
+const fatal = @import("Options.zig").fatal;
 const Io = @import("io.zig").Io;
 const tcp = @import("tcp.zig");
 const http = @import("http.zig");
@@ -25,6 +26,12 @@ pub fn main() !void {
 
     var options = try Options.initFromArgs(allocator);
     defer options.deinit(allocator);
+    var data_dir = std.fs.cwd().openDir(options.data_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => fatal("unable to open data path {s}", .{options.data_path}),
+        else => return err,
+    };
+    defer data_dir.close();
+    log.debug("using data dir {s}", .{options.data_path});
 
     var io: Io = undefined;
     try io.init(allocator, options.io);
@@ -50,6 +57,8 @@ pub fn main() !void {
         break :brk &sc;
     } else null;
     defer if (statsd_connector) |sc| sc.deinit();
+
+    try server.restore(data_dir);
 
     // Run loop
     catchSignals();
@@ -112,6 +121,8 @@ pub fn main() !void {
             }
         }
     }
+
+    try server.dump(data_dir);
 }
 
 pub fn socket(addr: net.Address) !posix.socket_t {

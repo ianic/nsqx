@@ -7,6 +7,8 @@ const time = std.time;
 const usage =
     \\Usage of nsqd:
     \\
+    \\  --data-path string (default current dir)
+    \\        path to store disk-backed messages
     \\  --tcp-address string
     \\        address to listen on for TCP clients (<addr>:<port>) (default "0.0.0.0:4150")
     \\  --http-address string
@@ -62,6 +64,8 @@ const usage =
     \\        byte size of each io_uring provided buffer (default 64k)
     \\
 ;
+
+data_path: []const u8 = ".",
 
 tcp_address: net.Address = net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, 4150),
 http_address: net.Address = net.Address.initIp4([4]u8{ 0, 0, 0, 0 }, 4151),
@@ -150,6 +154,10 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
         if (eql("help", arg) or eql("h", arg)) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
+
+            //
+        } else if (iter.string("data-path")) |str| {
+            opt.data_path = str;
 
             // tcp/http address
         } else if (iter.address("tcp-address", opt.tcp_address.getPort())) |addr| {
