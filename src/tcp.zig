@@ -485,10 +485,10 @@ const Response = enum {
 
     pub fn body(self: Response) []const u8 {
         return switch (self) {
-            .ok => ok_frame,
-            .close => close_frame,
-            .heartbeat => heartbeat_frame,
-            .pub_failed => pub_failed_frame,
+            .ok => &ok_frame,
+            .close => &close_frame,
+            .heartbeat => &heartbeat_frame,
+            .pub_failed => &pub_failed_frame,
         };
     }
 };
@@ -504,18 +504,8 @@ test "response body is comptime" {
     const r1: Response = .heartbeat;
     const r2: Response = .heartbeat;
     try testing.expect(r1.body().ptr == r2.body().ptr);
-    std.debug.print("body {x}\n", .{r1.body()});
-    std.debug.print("body {s}\n", .{r2.body()[8..]});
+    try testing.expectEqualStrings(
+        &[_]u8{ 0, 0, 0, 15, 0, 0, 0, 0, 95, 104, 101, 97, 114, 116, 98, 101, 97, 116, 95 },
+        r1.body(),
+    );
 }
-
-const Responses = struct {
-    list: std.ArrayList(Response),
-
-    const Self = @This();
-
-    fn init(allocator: mem.Allocator) Self {
-        return .{
-            .list = std.ArrayList(Response).init(allocator),
-        };
-    }
-};
