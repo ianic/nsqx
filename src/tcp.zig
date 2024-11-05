@@ -109,8 +109,7 @@ pub const Conn = struct {
     recv_op: Op = .{},
     send_op: SendOp = .{},
     shutdown_op: Op = .{},
-    // If send is in process store here response to send later
-    pending_response: ?Response = null,
+    pending_responses: std.ArrayList(Response),
     ready_count: u32 = 0,
     in_flight: u32 = 0,
     timer_ts: u64,
@@ -137,13 +136,6 @@ pub const Conn = struct {
         closing,
     };
 
-    const Response = enum {
-        ok,
-        close,
-        heartbeat,
-        pub_failed,
-    };
-
     // Until client set's connection heartbeat interval in identify message.
     const initial_heartbeat = 2000;
 
@@ -158,6 +150,7 @@ pub const Conn = struct {
             .recv_buf = RecvBuf.init(listener.allocator),
             .metric = .{ .connected_at = listener.io.now() },
             .timer_ts = listener.io.tsFromDelay(initial_heartbeat),
+            .pending_responses = std.ArrayList(Response).init(allocator),
         };
         try self.send_op.init(allocator, socket, self, onSend, onSendFail);
         errdefer self.send_op.deinit(allocator);
@@ -172,6 +165,7 @@ pub const Conn = struct {
         self.recv_buf.free();
         self.identify.deinit(self.allocator);
         self.send_op.deinit(self.allocator);
+        self.pending_responses.deinit();
     }
 
     // Channel api -----------------
@@ -181,38 +175,57 @@ pub const Conn = struct {
         return self.identify.msg_timeout;
     }
 
-    /// Number of messages connection is ready to send
-    pub fn ready(self: *Conn) u32 {
-        if (self.send_op.active()) return 0;
-        if (self.in_flight >= self.ready_count) return 0;
-        return @min(
-            self.ready_count - self.in_flight,
-            self.send_op.capacity() / 2,
-        );
-    }
-
-    /// Prepares single message to be sent. Fills vectored sending structures.
-    /// msg_no must be 0,1,2
-    pub fn prepareSend(self: *Conn, header: []const u8, body: []const u8, msg_no: u32) !void {
-        if (msg_no == 0) {
-            try self.send_op.ensureCapacity(self.allocator, self.ready_count * 2);
-        }
-        self.send_op.prep(header);
-        if (body.len > 0) self.send_op.prep(body);
-    }
-
-    /// Sends all prepared messages.
-    pub fn sendPrepared(self: *Conn, msgs: u32) void {
-        assert(msgs * 2 == self.send_op.count());
-        self.send_op.send(self.io);
-        self.metric.send += msgs;
-        self.in_flight += msgs;
+    /// Is connection ready to send messages
+    pub fn ready(self: *Conn) bool {
+        return !(self.send_op.active() or self.in_flight >= self.ready_count);
     }
 
     /// When channel is deleted via web interface
     pub fn channelClosed(self: *Conn) void {
         self.channel = null;
         self.shutdown();
+    }
+
+    /// Pull messages from channel and send.
+    pub fn wakeup(self: *Conn) !void {
+        if (self.send_op.active()) return;
+
+        { // resize sendv
+            const want_send_capacity = @max(
+                self.ready_count * 2,
+                self.pending_responses.items.len,
+            );
+            try self.send_op.ensureCapacity(self.allocator, want_send_capacity);
+        }
+
+        { // prepare pending responses
+            while (self.send_op.free() > 0) {
+                const rsp = self.pending_responses.popOrNull() orelse break;
+                self.send_op.prep(rsp.body());
+            }
+        }
+
+        { // prepare messages
+            if (self.channel) |channel| {
+                if (self.in_flight < self.ready_count) {
+                    var ready_count = self.ready_count - self.in_flight;
+
+                    while (self.send_op.free() > 1 and ready_count > 0) : (ready_count -= 1) {
+                        var msg = try channel.popMsg(self) orelse break;
+
+                        self.send_op.prep(&msg.header);
+                        const body = msg.body();
+                        if (body.len > 0) self.send_op.prep(body);
+
+                        self.metric.send +%= 1;
+                        self.in_flight += 1;
+                    }
+                }
+            }
+        }
+
+        if (self.send_op.count() > 0)
+            self.send_op.send(self.io);
     }
 
     // IO callbacks -----------------
@@ -252,12 +265,7 @@ pub const Conn = struct {
 
     fn onSend(self: *Conn) Error!void {
         self.sent_at = self.io.now();
-        if (self.pending_response) |r| {
-            try self.respond(r);
-            self.pending_response = null;
-            return;
-        }
-        if (self.channel) |channel| try channel.ready(self);
+        try self.wakeup();
     }
 
     fn onSendFail(self: *Conn, err: anyerror) Error!void {
@@ -294,7 +302,7 @@ pub const Conn = struct {
         }
 
         try self.recv_buf.set(parser.unparsed());
-        if (self.channel) |channel| if (self.ready() > 0) try channel.ready(self);
+        try self.wakeup();
     }
 
     fn receivedMsg(self: *Conn, msg: protocol.Message) !void {
@@ -381,25 +389,10 @@ pub const Conn = struct {
     }
 
     fn respond(self: *Conn, rsp: Response) !void {
-        if (self.send_op.active()) {
-            self.pending_response = rsp;
-            return;
-        }
-        switch (rsp) {
-            .ok => try self.sendResponse("OK"),
-            .heartbeat => try self.sendResponse("_heartbeat_"),
-            .close => try self.sendResponse("CLOSE_WAIT"),
-            .pub_failed => try self.sendResponse("E_PUB_FAILED"),
-        }
-    }
+        if (self.send_op.active())
+            return try self.pending_responses.insert(0, rsp);
 
-    fn sendResponse(self: *Conn, data: []const u8) !void {
-        var hdr = &self.send_buf;
-        assert(data.len <= hdr.len - 8);
-        mem.writeInt(u32, hdr[0..4], @intCast(4 + data.len), .big);
-        mem.writeInt(u32, hdr[4..8], @intFromEnum(protocol.FrameType.response), .big);
-        @memcpy(hdr[8..][0..data.len], data);
-        self.send_op.prep(self.send_buf[0 .. data.len + 8]);
+        self.send_op.prep(rsp.body());
         self.send_op.send(self.io);
     }
 
@@ -414,7 +407,7 @@ pub const Conn = struct {
             .connected => {
                 // Start shutdown.
                 self.ready_count = 0;
-                self.pending_response = null;
+                // self.pending_response = null;
                 self.state = .closing;
                 if (self.channel) |channel| channel.unsubscribe(self);
                 self.shutdown_op = Op.shutdown(self.socket, self, onClose);
@@ -436,10 +429,14 @@ pub const Conn = struct {
     }
 
     pub fn printStatus(self: *Conn) void {
-        std.debug.print("  socket {:>3} {s} state: {s}, active:{s}{s}{s}\n", .{
+        std.debug.print("  socket {:>3} {s} state: {s}, capacity: {} {}  active:{s}{s}{s}\n", .{
             @as(u32, @intCast(self.socket)),
             if (self.channel != null) "sub" else "pub",
             @tagName(self.state),
+
+            self.send_op.capacity(),
+            self.pending_responses.capacity,
+
             if (self.recv_op.active()) " recv" else "",
             if (self.send_op.active()) " send" else "",
             if (self.shutdown_op.active()) " shutdown" else "",
@@ -477,5 +474,48 @@ pub const RecvBuf = struct {
         const new_buf = try self.allocator.dupe(u8, bytes);
         self.free();
         self.buf = new_buf;
+    }
+};
+
+const Response = enum {
+    ok,
+    close,
+    heartbeat,
+    pub_failed,
+
+    pub fn body(self: Response) []const u8 {
+        return switch (self) {
+            .ok => ok_frame,
+            .close => close_frame,
+            .heartbeat => heartbeat_frame,
+            .pub_failed => pub_failed_frame,
+        };
+    }
+};
+
+const ok_frame = protocol.frame("OK", .response);
+const close_frame = protocol.frame("CLOSE_WAIT", .response);
+const heartbeat_frame = protocol.frame("_heartbeat_", .response);
+const pub_failed_frame = protocol.frame("E_PUB_FAILED", .err);
+
+const testing = std.testing;
+
+test "response body is comptime" {
+    const r1: Response = .heartbeat;
+    const r2: Response = .heartbeat;
+    try testing.expect(r1.body().ptr == r2.body().ptr);
+    std.debug.print("body {x}\n", .{r1.body()});
+    std.debug.print("body {s}\n", .{r2.body()[8..]});
+}
+
+const Responses = struct {
+    list: std.ArrayList(Response),
+
+    const Self = @This();
+
+    fn init(allocator: mem.Allocator) Self {
+        return .{
+            .list = std.ArrayList(Response).init(allocator),
+        };
     }
 };

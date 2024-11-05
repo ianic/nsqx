@@ -38,6 +38,7 @@ admin_pid=$!
 # daemon
 cd ~/Code/nsql
 ./zig-out/bin/nsql \
+  --data-path ./tmp \
   --statsd-prefix "" \
   --lookupd-tcp-address localhost:4160 \
   --lookupd-tcp-address localhost:4162 \

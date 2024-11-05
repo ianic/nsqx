@@ -70,6 +70,18 @@ pub const FrameType = enum(u32) {
     message = 2,
 };
 
+// Message frame:
+// |  (int32) ||  (int32) || (binary)
+// |  4-byte  ||  4-byte  || N-byte
+// ------------------------------------...
+//     size     frame type     data
+pub fn frame(comptime data: []const u8, comptime typ: FrameType) []const u8 {
+    var hdr: [8]u8 = undefined;
+    mem.writeInt(u32, hdr[0..4], @intCast(4 + data.len), .big);
+    mem.writeInt(u32, hdr[4..8], @intFromEnum(typ), .big);
+    return hdr ++ data;
+}
+
 pub const Parser = struct {
     buf: []const u8,
     pos: usize = 0,

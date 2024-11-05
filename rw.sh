@@ -17,9 +17,13 @@ go build
 cd ~/Code/go/nsq/bench/bench_reader/
 go build
 
+
+
 cd ~/Code/nsql
+rm ./tmp/nsql.dump
+
 #./zig-out/bin/nsql --statsd-address localhost --statsd-prefix "" > tmp/nsql 2>&1 &
-./zig-out/bin/nsql  > tmp/nsql 2>&1 &
+./zig-out/bin/nsql --data-path ./tmp  > tmp/nsql 2>&1 &
 # valgrind --tool=callgrind ./zig-out/bin/nsql > tmp/nsql 2>&1 &
 # ~/Code/go/nsq/apps/nsqd/nsqd --mem-queue-size=100000000 > tmp/nsql 2>&1 &
 nsqd_pid=$!

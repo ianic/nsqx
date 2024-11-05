@@ -5,6 +5,7 @@ const posix = std.posix;
 const math = std.math;
 const socket_t = posix.socket_t;
 const testing = std.testing;
+const builtin = @import("builtin");
 
 const log = std.log.scoped(.server);
 const Error = @import("io.zig").Error;
@@ -388,7 +389,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     while (channel_messages > 0) : (channel_messages -= 1) {
                         const sequence = try meta.readInt(u64, .little);
                         const timestamp = try meta.readInt(u64, .little);
-                        try channel.restore(sequence, timestamp);
+                        try channel.restoreMsg(sequence, timestamp);
                     }
                 }
                 // Release reference created during restore.
@@ -817,6 +818,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 name: []const u8,
                 topic: *Topic,
                 consumers: std.ArrayList(*Consumer),
+                // Round robin consumers iterator.
+                consumers_iterator: ConsumersIterator,
                 // Timestamp when next onTimer will be called
                 timer_ts: u64,
                 timers: *TimerQueue(Channel),
@@ -828,9 +831,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 // Pointer to the next message in the topic, null if we reached
                 // end of the topic.
                 next: ?*Topic.Msg = null,
-                // Round robin consumers iterator. Preserves last consumer index
-                // between init's.
-                iterator: ConsumersIterator = .{},
+
                 metric: Metric = .{},
                 metric_prev: Metric = .{},
                 paused: bool = false,
@@ -860,6 +861,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         .name = name,
                         .topic = topic,
                         .consumers = std.ArrayList(*Consumer).init(allocator),
+                        .consumers_iterator = .{ .channel = self },
                         .in_flight = std.AutoArrayHashMap(u64, *Msg).init(allocator),
                         .deferred = std.PriorityQueue(*Msg, void, Msg.less).init(allocator, {}),
                         .timers = &topic.server.timers,
@@ -895,44 +897,30 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
                 // Called from topic when new topic message is created.
                 fn topicAppended(self: *Channel, msg: *Topic.Msg) void {
-                    if (self.next == null) {
-                        self.next = msg.acquire();
-                        self.wakeup() catch |err| {
+                    if (self.next != null) return;
+                    self.next = msg.acquire();
+                    self.wakeup() catch |err| {
+                        if (!builtin.is_test)
                             log.err("fail to wakeup channel {s}: {}", .{ self.name, err });
-                        };
-                    }
+                    };
                 }
 
                 // Try to push messages to the consumers.
                 fn wakeup(self: *Channel) !void {
-                    const cnt = self.consumers.items.len;
-                    if (cnt == 0) return;
-                    if (cnt == 1) {
-                        _ = try self.fillConsumer(self.consumers.items[0]);
-                        return;
+                    while (self.consumers_iterator.next()) |consumer| {
+                        if (!self.hasNextMsg()) break;
+                        try consumer.wakeup();
                     }
-                    var iter = self.consumersIterator();
-                    while (iter.next()) |consumer|
-                        if (!try self.fillConsumer(consumer)) break;
                 }
 
-                // Returns true if there are, probably, more ready messages for next consumer
-                fn fillConsumer(self: *Channel, consumer: *Consumer) !bool {
-                    const max = consumer.ready();
-                    if (max == 0) return true;
-                    var n: u32 = 0;
-                    while (n < max) : (n += 1) {
-                        var msg = (try self.nextMsg(consumer.msgTimeout())) orelse break;
-                        msg.sent_at = self.now.*;
-                        msg.in_flight_socket = consumer.socket;
-                        try consumer.prepareSend(&msg.header, msg.msg.body, n);
-                    }
-                    if (n == 0) return false;
-                    consumer.sendPrepared(n);
-                    return n == max;
+                fn hasNextMsg(self: *Channel) bool {
+                    if (self.paused) return false;
+                    if (!self.topic.paused and self.next != null) return true;
+                    if (self.deferred.peek()) |msg| if (msg.timestamp <= self.now.*) return true;
+                    return false;
                 }
 
-                // Get next message to push to some consumer
+                // Get next message to send by some consumer
                 // msg_timeout - consumer message timeout in ms
                 fn nextMsg(self: *Channel, msg_timeout: u32) !?*Msg {
                     if (self.paused) return null;
@@ -976,7 +964,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     self.metric.depth += self.topic.last.?.sequence - topic_msg.sequence + 1;
                 }
 
-                fn restore(self: *Channel, sequence: u64, timestamp: u64) !void {
+                fn restoreMsg(self: *Channel, sequence: u64, timestamp: u64) !void {
                     var topic_msg = self.topic.findMsg(sequence) orelse return error.InvalidSequence;
                     const msg = try self.msg_pool.create();
                     errdefer self.msg_pool.destroy(msg);
@@ -1057,40 +1045,35 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     return ts;
                 }
 
-                // Iterates over ready consumers. Returns null when there is no
-                // ready consumers.
-                fn consumersIterator(self: *Channel) *ConsumersIterator {
-                    self.iterator.init(self.consumers.items);
-                    return &self.iterator;
-                }
-
                 const ConsumersIterator = struct {
-                    consumers: []*Consumer = undefined,
-                    not_ready_count: usize = 0,
+                    channel: *Channel,
                     idx: usize = 0,
 
-                    fn init(self: *ConsumersIterator, consumers: []*Consumer) void {
-                        self.consumers = consumers;
-                        self.not_ready_count = 0;
-                    }
-
+                    // Iterates over ready consumers. Returns null when there is no
+                    // ready consumers. Ensures round robin consumer selection.
                     fn next(self: *ConsumersIterator) ?*Consumer {
-                        const count = self.consumers.len;
+                        const consumers = self.channel.consumers.items;
+                        const count = consumers.len;
                         if (count == 0) return null;
-                        while (true) {
-                            if (self.not_ready_count == count) return null;
+                        for (0..count) |_| {
                             self.idx += 1;
                             if (self.idx >= count) self.idx = 0;
-                            const consumer = self.consumers[self.idx];
-                            if (consumer.ready() > 0) {
-                                return consumer;
-                            }
-                            self.not_ready_count += 1;
+                            const consumer = consumers[self.idx];
+                            if (consumer.ready()) return consumer;
                         }
+                        return null;
                     }
                 };
 
                 // Consumer interface actions -----------------
+
+                /// Consumer pops single message when ready to send more messages.
+                pub fn popMsg(self: *Channel, consumer: *Consumer) !?*Msg {
+                    var msg = (try self.nextMsg(consumer.msgTimeout())) orelse return null;
+                    msg.sent_at = self.now.*;
+                    msg.in_flight_socket = consumer.socket;
+                    return msg;
+                }
 
                 pub fn finish(self: *Channel, msg_id: [16]u8) bool {
                     const seq = Msg.seqFromId(msg_id);
@@ -1150,11 +1133,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     self.metric.requeue += msgs.items.len;
                 }
 
-                /// Consumer calls this when ready to send more messages.
-                pub fn ready(self: *Channel, consumer: *Consumer) !void {
-                    _ = try self.fillConsumer(consumer);
-                }
-
                 // Http admin interface  -----------------
 
                 fn pause(self: *Channel) void {
@@ -1211,7 +1189,7 @@ test "channel consumers iterator" {
     var consumer1 = TestConsumer.init(allocator);
     var channel = try server.subscribe(&consumer1, "topic", "channel");
 
-    var iter = channel.consumersIterator();
+    var iter = channel.consumers_iterator;
     try testing.expectEqual(&consumer1, iter.next().?);
     try testing.expectEqual(&consumer1, iter.next().?);
     consumer1.ready_count = 0;
@@ -1224,17 +1202,24 @@ test "channel consumers iterator" {
     channel = try server.subscribe(&consumer3, "topic", "channel");
     try testing.expectEqual(3, channel.consumers.items.len);
 
-    iter = channel.consumersIterator();
-    try testing.expectEqual(3, iter.consumers.len);
+    try testing.expectEqual(3, channel.consumers.items.len);
     try testing.expectEqual(&consumer2, iter.next().?);
     try testing.expectEqual(&consumer3, iter.next().?);
     try testing.expectEqual(&consumer1, iter.next().?);
     try testing.expectEqual(&consumer2, iter.next().?);
 
-    iter = channel.consumersIterator();
     try testing.expectEqual(&consumer3, iter.next().?);
     try testing.expectEqual(&consumer1, iter.next().?);
     try testing.expectEqual(&consumer2, iter.next().?);
+    consumer3.ready_count = 0;
+    try testing.expectEqual(&consumer1, iter.next().?);
+    try testing.expectEqual(&consumer2, iter.next().?);
+    try testing.expectEqual(&consumer1, iter.next().?);
+    consumer2.ready_count = 0;
+    try testing.expectEqual(&consumer1, iter.next().?);
+    try testing.expectEqual(&consumer1, iter.next().?);
+    consumer1.ready_count = 0;
+    try testing.expect(iter.next() == null);
 }
 
 test "channel fin req" {
@@ -1251,6 +1236,7 @@ test "channel fin req" {
     defer consumer.deinit();
     consumer.ready_count = 0;
     var channel = try server.subscribe(&consumer, topic_name, channel_name);
+    consumer.channel = channel;
     const topic = server.topics.get(topic_name).?;
 
     try server.publish(topic_name, "1");
@@ -1271,7 +1257,7 @@ test "channel fin req" {
 
     { // consumer is ready
         consumer.ready_count = 1;
-        try channel.ready(&consumer);
+        try channel.wakeup();
         try testing.expectEqual(1, consumer.lastSeq());
         // 1 is in flight
         try testing.expectEqual(1, channel.in_flight.count());
@@ -1362,24 +1348,21 @@ const TestConsumer = struct {
         self.sequences.deinit();
     }
 
-    fn ready(self: *Self) usize {
-        return self.ready_count;
-    }
-
-    fn prepareSend(self: *Self, header: []const u8, body: []const u8, msg_no: u32) !void {
+    fn wakeup(self: *Self) !void {
         {
             // Making this method fallible in check all allocations
             const buf = try self.allocator.alloc(u8, 8);
             defer self.allocator.free(buf);
         }
-        const sequence = mem.readInt(u64, header[26..34], .big);
-        try self.sequences.append(sequence);
-        _ = msg_no;
-        _ = body;
+        while (self.ready_count > 0) {
+            var msg = try self.channel.?.popMsg(self) orelse break;
+            try self.sequences.append(msg.sequence());
+            self.ready_count -= 1;
+        }
     }
 
-    fn sendPrepared(self: *Self, msgs: u32) void {
-        self.ready_count -= msgs;
+    fn ready(self: *Self) bool {
+        return self.ready_count > 0;
     }
 
     // send fin for the last received message
@@ -1395,7 +1378,7 @@ const TestConsumer = struct {
     // pull message from channel
     fn pull(self: *Self) !void {
         self.ready_count = 1;
-        try self.channel.?.ready(self);
+        try self.wakeup();
     }
 
     fn pullAndFin(self: *Self) !void {

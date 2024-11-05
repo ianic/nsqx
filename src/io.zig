@@ -762,6 +762,10 @@ pub const SendOp = struct {
     pub fn count(self: *Self) usize {
         return @intCast(self.msghdr.iovlen);
     }
+
+    pub fn free(self: *Self) usize {
+        return self.capacity() - self.count();
+    }
 };
 
 const testing = std.testing;
