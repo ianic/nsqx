@@ -28,6 +28,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		consumer.SetLoggerLevel(nsq.LogLevelError)
 		consumer.AddHandler(&Handler{})
 		//consumer.AddConcurrentHandlers(&Handler{}, 16)
 
@@ -53,9 +54,24 @@ func main() {
 }
 
 type Handler struct {
-	counter int
+	m int
+	n byte
 }
 
 func (th *Handler) HandleMessage(m *nsq.Message) error {
+	// print("msg ", th.m, " len ", len(m.Body), "\n")
+	for _, b := range m.Body {
+		if b != th.n {
+			print(b, "!=", th.n, "\n")
+		}
+		if th.n == 255 {
+			th.n = 0
+		} else {
+			th.n += 1
+		}
+
+	}
+	th.m += 1
+
 	return nil
 }

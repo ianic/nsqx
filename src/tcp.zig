@@ -293,16 +293,23 @@ pub const Conn = struct {
                 error.ServerMemoryOverflow,
                 error.TopicMemoryOverflow,
                 error.TopicMessagesOverflow,
-                => {
-                    log.err("{} publish failed {}", .{ self.socket, err });
-                    try self.respond(.pub_failed);
-                },
+                => try self.respond(.pub_failed),
                 else => return err,
             };
         }
 
         try self.recv_buf.set(parser.unparsed());
         try self.wakeup();
+    }
+
+    fn checkLimits(self: *Conn, topic_name: []const u8, len: usize) !void {
+        if (len > self.listener.options.max_msg_size) {
+            log.err(
+                "{s} publish failed, message length of {} bytes over limit of {} bytes ",
+                .{ topic_name, len, self.listener.options.max_msg_size },
+            );
+            return error.MessageSizeOverflow;
+        }
     }
 
     fn receivedMsg(self: *Conn, msg: protocol.Message) !void {
@@ -325,23 +332,20 @@ pub const Conn = struct {
                 log.debug("{} subscribe: {s} {s}", .{ self.socket, arg.topic, arg.channel });
             },
             .publish => |arg| {
-                if (arg.data.len > options.max_msg_size) return error.MessageSizeOverflow;
-
+                try self.checkLimits(arg.topic, arg.data.len);
                 try server.publish(arg.topic, arg.data);
                 try self.respond(.ok);
                 log.debug("{} publish: {s}", .{ self.socket, arg.topic });
             },
             .multi_publish => |arg| {
                 if (arg.msgs == 0) return;
-                if (arg.data.len / arg.msgs > options.max_msg_size) return error.MessageSizeOverflow;
-
+                try self.checkLimits(arg.topic, arg.data.len / arg.msgs);
                 try server.multiPublish(arg.topic, arg.msgs, arg.data);
                 try self.respond(.ok);
                 log.debug("{} multi publish: {s} messages: {}", .{ self.socket, arg.topic, arg.msgs });
             },
             .deferred_publish => |arg| {
-                if (arg.data.len > options.max_msg_size) return error.MessageSizeOverflow;
-
+                try self.checkLimits(arg.topic, arg.data.len);
                 try server.deferredPublish(arg.topic, arg.data, arg.delay);
                 try self.respond(.ok);
                 log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });

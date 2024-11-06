@@ -108,24 +108,31 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         }
 
         pub fn publish(self: *Server, topic_name: []const u8, data: []const u8) !void {
-            if (self.metric.depth_bytes + data.len > self.limits.max_mem)
-                return error.ServerMemoryOverflow;
-
+            try self.checkLimits(topic_name, data.len);
             const topic = try self.getOrCreateTopic(topic_name);
             try topic.publish(data);
         }
 
         pub fn multiPublish(self: *Server, topic_name: []const u8, msgs: u32, data: []const u8) !void {
-            if (self.metric.depth_bytes + data.len > self.limits.max_mem)
-                return error.ServerMemoryOverflow;
-
+            try self.checkLimits(topic_name, data.len);
             const topic = try self.getOrCreateTopic(topic_name);
             try topic.multiPublish(msgs, data);
         }
 
         pub fn deferredPublish(self: *Server, topic_name: []const u8, data: []const u8, delay: u32) !void {
+            try self.checkLimits(topic_name, data.len);
             const topic = try self.getOrCreateTopic(topic_name);
             try topic.deferredPublish(data, delay);
+        }
+
+        fn checkLimits(self: *Server, topic_name: []const u8, len: usize) !void {
+            if (self.metric.depth_bytes + len > self.limits.max_mem) {
+                log.err(
+                    "{s} publish failed, server memory limit of {} bytes reached",
+                    .{ topic_name, self.limits.max_mem },
+                );
+                return error.ServerMemoryOverflow;
+            }
         }
 
         // Http interface actions -----------------
@@ -569,10 +576,20 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn checkLimits(self: Topic, msgs: u32, bytes: usize) !void {
-                    if (self.metric.depth_bytes + bytes > self.server.limits.topic_max_mem)
+                    if (self.metric.depth_bytes + bytes > self.server.limits.topic_max_mem) {
+                        log.err(
+                            "{s} publish failed, topic memory limit of {} bytes reached",
+                            .{ self.name, self.server.limits.topic_max_mem },
+                        );
                         return error.TopicMemoryOverflow;
-                    if (self.metric.depth + msgs > self.server.limits.topic_max_msgs)
+                    }
+                    if (self.metric.depth + msgs > self.server.limits.topic_max_msgs) {
+                        log.err(
+                            "{s} publish failed, topic max number of messages limit of {} reached",
+                            .{ self.name, self.server.limits.topic_max_msgs },
+                        );
                         return error.TopicMessagesOverflow;
+                    }
                 }
 
                 fn publish(self: *Topic, data: []const u8) !void {

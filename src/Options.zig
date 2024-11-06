@@ -47,7 +47,7 @@ const usage =
     \\        the size in bytes of statsd UDP packets (default 508)
     \\
     \\  --max-mem
-    \\        maximum total message size of all messages in all topics (default 80% of system memory)
+    \\        maximum total message size of all messages in all topics (default 50% of system memory)
     \\  --topic-max-mem
     \\        maximum total messages size per topic (default 1GB)
     \\  --topic-max-msgs
@@ -96,10 +96,12 @@ statsd: Statsd = .{},
 
 const Options = @This();
 
+const unlimited = std.math.maxInt(usize);
+
 pub const Limits = struct {
-    max_mem: usize = std.math.maxInt(usize),
-    topic_max_mem: usize = 1 * 1024 * 1024 * 1024, // 1 GB
-    topic_max_msgs: usize = std.math.maxInt(usize), // unlimited
+    max_mem: usize = unlimited,
+    topic_max_mem: usize = unlimited,
+    topic_max_msgs: usize = unlimited,
 };
 
 pub const Io = struct {
@@ -147,7 +149,7 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
     var opt: Options = .{
         .hostname = hostname,
         .statsd = .{ .prefix = "nsq.%s" },
-        .limits = .{ .max_mem = totalSystemMemory() / 5 * 4 }, // 80%
+        .limits = .{ .max_mem = totalSystemMemory() / 2 }, // 50%
     };
 
     outer: while (iter.next()) |arg| {
@@ -243,7 +245,6 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
     if (lookup_tcp_addresses.items.len > 0) opt.lookup_tcp_addresses = try lookup_tcp_addresses.toOwnedSlice();
     opt.statsd.prefix = try allocator.dupe(u8, opt.statsd.prefix);
 
-    const unlimited = std.math.maxInt(usize);
     if (opt.limits.max_mem == 0) opt.limits.max_mem = unlimited;
     if (opt.limits.topic_max_mem == 0) opt.limits.topic_max_mem = unlimited;
     if (opt.limits.topic_max_msgs == 0) opt.limits.topic_max_msgs = unlimited;
