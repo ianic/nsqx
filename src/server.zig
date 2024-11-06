@@ -945,7 +945,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     // First look into deferred messages
                     const now = self.now.*;
                     if (self.deferred.peek()) |msg| if (msg.timestamp <= now) {
-                        try self.inFlightAppend(msg, msg_timeout);
+                        try self.addInFlight(msg, msg_timeout);
                         _ = self.deferred.remove();
                         return msg;
                     };
@@ -964,7 +964,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                                 self.updateTimer(msg.timestamp);
                                 try self.deferred.add(msg);
                             } else {
-                                try self.inFlightAppend(msg, msg_timeout);
+                                try self.addInFlight(msg, msg_timeout);
                             }
                             // Move topic pointer when nothing can fail any more
                             self.next = topic_msg.nextAcquire();
@@ -996,14 +996,15 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     return self.topic.server.tsFromDelay(delay_ms);
                 }
 
-                fn inFlightAppend(self: *Channel, msg: *Msg, msg_timeout: u32) !void {
+                fn addInFlight(self: *Channel, msg: *Msg, msg_timeout: u32) !void {
                     msg.timestamp = self.tsFromDelay(msg_timeout);
                     self.updateTimer(msg.timestamp);
                     try self.in_flight.put(msg.sequence(), msg);
                 }
 
-                // Move message from in_flight to the deferred
-                fn deffer(self: *Channel, msg: *Msg, delay: u32) !void {
+                // Defer in flight message.
+                // Moves message from in_flight to the deferred.
+                fn deferInFlight(self: *Channel, msg: *Msg, delay: u32) !void {
                     msg.in_flight_socket = 0;
                     msg.incAttempts();
                     msg.timestamp = if (delay == 0) 0 else self.tsFromDelay(delay);
@@ -1025,7 +1026,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         self.inFlightTimeout(now) catch infinite,
                         self.deferredTimeout(now) catch infinite,
                     );
-                    // log.debug("on timer next: {}", .{self.timer_ts});
                 }
 
                 // Returns next timeout of deferred messages
@@ -1040,7 +1040,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     return ts;
                 }
 
-                // Finds time-outed in flight messages and move them to the
+                // Finds time-outed in flight messages and moves them to the
                 // deferred queue.
                 // Returns next timeout for in flight messages.
                 fn inFlightTimeout(self: *Channel, now: u64) !u64 {
@@ -1056,7 +1056,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     }
                     for (msgs.items) |msg| {
                         log.debug("{} message timeout {}", .{ msg.in_flight_socket, msg.sequence() });
-                        try self.deffer(msg, 0);
+                        try self.deferInFlight(msg, 0);
                     }
                     self.metric.timeout += msgs.items.len;
                     return ts;
@@ -1116,7 +1116,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 pub fn requeue(self: *Channel, msg_id: [16]u8, delay: u32) !bool {
                     const seq = Msg.seqFromId(msg_id);
                     if (self.in_flight.get(seq)) |msg| {
-                        try self.deffer(msg, delay);
+                        try self.deferInFlight(msg, delay);
                         self.metric.requeue += 1;
                         return true;
                     }
@@ -1124,7 +1124,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 }
 
                 pub fn unsubscribe(self: *Channel, consumer: *Consumer) void {
-                    self.removeInFlight(consumer.socket) catch |err| {
+                    self.requeueAll(consumer) catch |err| {
                         log.warn("failed to remove in flight messages for socket {}, {}", .{ consumer.socket, err });
                     };
 
@@ -1139,14 +1139,16 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         self.topic.removeChannel(self);
                 }
 
-                fn removeInFlight(self: *Channel, socket: socket_t) !void {
+                // Requeue all messages which are in-flight on some consumer.
+                fn requeueAll(self: *Channel, consumer: *Consumer) !void {
+                    const in_flight_socket = consumer.socket;
                     var msgs = std.ArrayList(*Msg).init(self.allocator);
                     defer msgs.deinit();
                     for (self.in_flight.values()) |msg| {
-                        if (msg.in_flight_socket == socket)
+                        if (msg.in_flight_socket == in_flight_socket)
                             try msgs.append(msg);
                     }
-                    for (msgs.items) |msg| try self.deffer(msg, 0);
+                    for (msgs.items) |msg| try self.deferInFlight(msg, 0);
                     self.metric.requeue += msgs.items.len;
                 }
 
@@ -1927,7 +1929,7 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try testing.expectEqual(3, channel2_consumer2.lastSeq());
     // Unsubscribe consumer2
     try testing.expectEqual(1, channel2.in_flight.count());
-    try channel2.removeInFlight(channel2_consumer2.socket);
+    try channel2.requeueAll(&channel2_consumer2);
     channel2.unsubscribe(&channel2_consumer2);
     try testing.expectEqual(0, channel2.in_flight.count());
     try testing.expectEqual(1, channel2.deferred.count());
