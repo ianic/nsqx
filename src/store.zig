@@ -30,7 +30,7 @@ const Page = struct {
         return self.capacity() - self.writePos();
     }
 
-    fn next(self: *Self, sequence: *u64, ready_count: u32) ?[]const u8 {
+    fn next(self: *Self, sequence: *u64, ready_count: u32, ack_policy: AckPolicy) ?[]const u8 {
         assert(ready_count > 0);
         assert(sequence.* < self.last());
         const msgs_count = self.offsets.items.len;
@@ -38,7 +38,7 @@ const Page = struct {
         if (sequence.* < self.first()) {
             const no_msgs = @min(msgs_count, ready_count);
             const end_idx = no_msgs - 1;
-            if (ready_count != chunk_ready_count) self.rc += no_msgs;
+            if (ack_policy == .explicit) self.rc += no_msgs;
             sequence.* = self.first() + end_idx;
             return self.buf[0..self.offsets.items[end_idx]];
         }
@@ -46,7 +46,7 @@ const Page = struct {
         const start_idx: u32 = @intCast(sequence.* - self.sequence);
         const end_idx: u32 = @min(msgs_count - 1, start_idx + ready_count);
         const no_msgs: u32 = end_idx - start_idx;
-        if (ready_count != chunk_ready_count) self.rc += no_msgs;
+        if (ack_policy == .explicit) self.rc += no_msgs;
         sequence.* += no_msgs;
 
         return self.buf[self.offsets.items[start_idx]..self.offsets.items[end_idx]];
@@ -65,24 +65,50 @@ const Page = struct {
     }
 };
 
-// Start receiving from the earliest available message in the stream.
-pub const sequence_deliver_all = 0;
-// Start receiving messages created after the consumer was created.
-pub const sequence_deliver_new = std.math.maxInt(u64);
-// Don't hold reference for each message
-const chunk_ready_count = std.math.maxInt(u32);
+pub const DeliverPolicy = union(enum) {
+    // Start receiving from the earliest available message in the stream.
+    all: void,
+    // Start receiving messages created after the consumer was created.
+    new: void,
+    // Start receiving after some sequence.
+    from_sequence: u64,
+    // last
+};
+
+pub const AckPolicy = enum {
+    // Fin is expected for each message.
+    // Reference counter raised for each message returned in next.
+    explicit,
+    none,
+};
+
+pub const RetentionPolicy = union(enum) {
+    // No page deletion.
+    all: void,
+    // Remove pages with zero reference count.
+    interest: void,
+    // Don't delete from sequence, before by interest.
+    from_sequence: u64,
+};
+
+pub const Options = struct {
+    page_size: u32,
+    ack_policy: AckPolicy = .none,
+    deliver_policy: DeliverPolicy = .{ .all = {} },
+    retention_policy: RetentionPolicy = .{ .all = {} },
+};
 
 pub const Store = struct {
     const Self = @This();
 
     allocator: mem.Allocator,
-    page_size: u32,
+    options: Options,
     pages: std.ArrayList(Page),
 
-    pub fn init(allocator: mem.Allocator, page_size: u32) Self {
+    pub fn init(allocator: mem.Allocator, options: Options) Self {
         return .{
             .allocator = allocator,
-            .page_size = page_size,
+            .options = options,
             .pages = std.ArrayList(Page).init(allocator),
         };
     }
@@ -102,7 +128,7 @@ pub const Store = struct {
             try self.pages.append(
                 Page{
                     .sequence = 1 + if (self.pages.items.len == 0) 0 else self.pages.getLast().last(),
-                    .buf = try self.allocator.alloc(u8, @max(self.page_size, bytes.len)),
+                    .buf = try self.allocator.alloc(u8, @max(self.options.page_size, bytes.len)),
                     .offsets = std.ArrayList(u32).init(self.allocator),
                 },
             );
@@ -115,51 +141,49 @@ pub const Store = struct {
         return &self.pages.items[self.pages.items.len - 1];
     }
 
-    fn nextChunk(self: *Self, sequence: *u64) ?[]const u8 {
-        return self.next(sequence, chunk_ready_count);
+    fn firstPage(self: *Self) *Page {
+        return &self.pages.items[0];
+    }
+
+    fn nextPage(self: *Self, sequence: *u64) ?[]const u8 {
+        const max_ready_count = std.math.maxInt(u32);
+        return self.next(sequence, max_ready_count);
     }
 
     pub fn next(self: *Self, sequence: *u64, ready_count: u32) ?[]const u8 {
         if (self.pages.items.len == 0 or ready_count == 0) return null;
+        const ack_policy = self.options.ack_policy;
 
-        // Deliver all:
-        if (sequence.* == sequence_deliver_all) {
-            var seg = &self.pages.items[0];
-            seg.rc += 1;
-            sequence.* = seg.first() - 1;
-            return seg.next(sequence, ready_count);
+        const first_page = self.firstPage();
+        if (sequence.* < first_page.first()) {
+            first_page.rc += 1;
+            sequence.* = first_page.first() - 1;
+            return first_page.next(sequence, ready_count, ack_policy);
         }
 
         const last_page = self.lastPage();
         const last_sequence = last_page.last();
 
-        // Deliver new: start receiving messages created after the consumer was created.
-        if (sequence.* == sequence_deliver_new) {
-            sequence.* = last_sequence;
-            last_page.rc += 1;
-            return null;
-        }
-
         assert(sequence.* <= last_sequence);
         if (sequence.* == last_sequence) return null;
 
-        // Find page which contains previous sequence
+        // Find page which contains sequence
         var i: usize = self.pages.items.len;
         while (i > 0) {
             i -= 1;
-            var seg = &self.pages.items[i];
-            if (seg.contains(sequence.*)) {
-                if (seg.last() == sequence.*) {
-                    seg.rc -= 1;
-                    seg = &self.pages.items[i + 1];
-                    seg.rc += 1;
-                    return seg.next(sequence, ready_count);
+            var page = &self.pages.items[i];
+            if (page.contains(sequence.*)) {
+                if (page.last() == sequence.*) {
+                    // switch to next page
+                    page.rc -= 1;
+                    page = &self.pages.items[i + 1];
+                    page.rc += 1;
+                    return page.next(sequence, ready_count, ack_policy);
                 }
-                return seg.next(sequence, ready_count);
+                return page.next(sequence, ready_count, ack_policy);
             }
         }
 
-        // Sequence not in any page
         unreachable;
     }
 
@@ -167,9 +191,9 @@ pub const Store = struct {
         var i: usize = self.pages.items.len;
         while (i > 0) {
             i -= 1;
-            var seg = &self.pages.items[i];
-            if (seg.contains(sequence)) {
-                seg.rc -= 1;
+            var page = &self.pages.items[i];
+            if (page.contains(sequence)) {
+                page.rc -= 1;
                 return;
             }
         }
@@ -177,7 +201,7 @@ pub const Store = struct {
 };
 
 test "append/next/nextChunk" {
-    var store = Store.init(testing.allocator, 8);
+    var store = Store.init(testing.allocator, .{ .page_size = 8, .ack_policy = .explicit });
     defer store.deinit();
     {
         try testing.expectEqual(0, store.pages.items.len);
@@ -217,13 +241,14 @@ test "append/next/nextChunk" {
         try testing.expectEqual(0, store.pages.items[0].rc);
         try testing.expectEqual(2, store.pages.items[1].rc);
     }
-    { // chunk read
+    { // With ack_policy none
+        store.options.ack_policy = .none;
         var sequence: u64 = 0;
-        try testing.expectEqualStrings("01234567", store.nextChunk(&sequence).?);
+        try testing.expectEqualStrings("01234567", store.nextPage(&sequence).?);
         try testing.expectEqual(1, store.pages.items[0].rc);
         try testing.expectEqual(2, store.pages.items[1].rc);
         try testing.expectEqual(3, sequence);
-        try testing.expectEqualStrings("89", store.nextChunk(&sequence).?);
+        try testing.expectEqualStrings("89", store.nextPage(&sequence).?);
         try testing.expectEqual(0, store.pages.items[0].rc);
         try testing.expectEqual(3, store.pages.items[1].rc);
     }
