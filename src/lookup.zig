@@ -9,10 +9,9 @@ const testing = std.testing;
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
-const Topic = @import("simple_topic.zig").SimpleTopic([]const u8, Conn, Conn.pullTopic);
 const RecvBuf = @import("tcp.zig").RecvBuf;
-const Server = @import("tcp.zig").Server;
 const Options = @import("Options.zig");
+const Store = @import("store.zig").Store;
 
 const log = std.log.scoped(.lookup);
 
@@ -21,11 +20,10 @@ pub const Connector = struct {
 
     allocator: mem.Allocator,
     io: *Io,
-    server: *Server,
     connections: std.ArrayList(*Conn),
     identify: []const u8,
     ticker_op: Op = .{},
-    topic: Topic,
+    store: Store,
     state: State,
     const State = enum {
         connected,
@@ -37,7 +35,6 @@ pub const Connector = struct {
         self: *Self,
         allocator: mem.Allocator,
         io: *Io,
-        server: *Server,
         lookup_tcp_addresses: []net.Address,
         options: Options,
     ) !void {
@@ -53,11 +50,10 @@ pub const Connector = struct {
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .server = server,
             .connections = std.ArrayList(*Conn).init(allocator),
-            .topic = Topic.init(allocator),
             .identify = identify,
             .state = .connected,
+            .store = Store.init(allocator, .{ .ack_policy = .none, .page_size = 64 * 1024 }),
         };
         errdefer self.deinit();
         try self.connections.ensureUnusedCapacity(lookup_tcp_addresses.len);
@@ -88,7 +84,7 @@ pub const Connector = struct {
         }
         self.connections.deinit();
         self.allocator.free(self.identify);
-        self.topic.deinit();
+        self.store.deinit();
     }
 
     fn onTick(self: *Self) void {
@@ -114,11 +110,8 @@ pub const Connector = struct {
     }
 
     fn register(self: *Self, comptime fmt: []const u8, args: anytype) void {
-        if (self.state != .connected or !self.topic.hasConsumers()) return;
         self.tryRegister(fmt, args) catch |err| {
-            // Disconnect all connections. On next connect they will get fresh
-            // current state.
-            for (self.connections.items) |conn| conn.shutdown();
+            // TODO: what now
             log.err("add registration failed {}", .{err});
         };
     }
@@ -126,27 +119,8 @@ pub const Connector = struct {
     fn tryRegister(self: *Self, comptime fmt: []const u8, args: anytype) !void {
         const buf = try std.fmt.allocPrint(self.allocator, fmt, args);
         errdefer self.allocator.free(buf);
-        assert(try self.topic.append(buf));
-    }
-
-    fn connect(self: *Self, conn: *Conn) !void {
-        if (self.server.topics.count() > 0) {
-            try self.topic.setFirst(try self.registrations());
-        }
-        try self.topic.subscribe(conn);
-    }
-
-    fn disconnect(self: *Self, conn: *Conn) void {
-        self.topic.unsubscribe(conn);
-    }
-
-    // Current state for newly connected lookupd
-    fn registrations(self: *Self) ![]const u8 {
-        if (self.server.topics.count() == 0) return "";
-
-        var writer = RegistrationsWriter.init(self.allocator);
-        try self.server.iterateNames(&writer);
-        return try writer.toOwned();
+        try self.store.append(buf);
+        for (self.connections.items) |conn| conn.wakeup();
     }
 };
 
@@ -187,6 +161,7 @@ const Conn = struct {
     recv_op: Op = .{},
     close_op: Op = .{},
     state: State = .closed,
+    sequence: u64 = 0,
 
     const ping_msg = "PING\n";
 
@@ -224,7 +199,7 @@ const Conn = struct {
     }
 
     fn ping(self: *Self) Error!void {
-        if (!self.send_op.active()) try self.send(ping_msg);
+        if (!self.send_op.active()) self.send(ping_msg);
     }
 
     fn reconnect(self: *Self) Error!void {
@@ -245,6 +220,7 @@ const Conn = struct {
         );
         self.io.submit(&self.connect_op);
         self.state = .connecting;
+        self.sequence = 0;
     }
 
     fn onConnect(self: *Self, socket: socket_t) Error!void {
@@ -256,10 +232,9 @@ const Conn = struct {
     }
 
     fn setup(self: *Self) !void {
-        try self.send(self.connector.identify);
+        self.send(self.connector.identify);
         self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
         self.io.submit(&self.recv_op);
-        try self.connector.connect(self);
         self.state = .connected;
         log.debug("{} connected", .{self.address});
     }
@@ -270,7 +245,7 @@ const Conn = struct {
         self.shutdown();
     }
 
-    fn send(self: *Self, buf: []const u8) !void {
+    fn send(self: *Self, buf: []const u8) void {
         assert(!self.send_op.active());
         assert(buf.len > 0);
         self.send_op = Op.send(self.socket, buf, self, onSend, onSendFail);
@@ -278,13 +253,15 @@ const Conn = struct {
     }
 
     fn onSend(self: *Self) Error!void {
-        try self.pullTopic();
+        self.wakeup();
     }
 
-    fn pullTopic(self: *Self) !void {
-        if (self.send_op.active() or self.state != .connected) return;
-        if (self.connector.topic.next(self)) |buf| {
-            try self.send(buf);
+    fn wakeup(self: *Self) void {
+        if (self.send_op.active()) return;
+        if (self.state != .connected) return;
+
+        if (self.connector.store.next(&self.sequence, 1024)) |buf| {
+            self.send(buf);
         }
     }
 
@@ -350,7 +327,7 @@ const Conn = struct {
         // log.debug("{} shutdown state: {s}", .{ self.address, @tagName(self.state) });
         switch (self.state) {
             .connecting, .connected => {
-                self.connector.disconnect(self);
+                // self.connector.disconnect(self);
                 self.recv_buf.free();
                 self.state = .closing;
                 self.shutdown();

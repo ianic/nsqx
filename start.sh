@@ -78,6 +78,7 @@ echo nsql: $nsql_pid
 wait $nsql_pid
 wait $lookupd_pid
 
+exit 0
 
 # for ti in $(seq 99); do
 #     for ci in $(seq 9); do
@@ -85,3 +86,15 @@ wait $lookupd_pid
 #         echo $ti-$ci  | to_nsq -nsqd-tcp-address localhost:4150 -topic topic-$ti
 #     done
 # done
+
+for ti in $(seq 99); do
+  for ci in $(seq 9); do
+    curl "http://127.0.0.1:4151/channel/create?topic=topic-$ti&channel=channel-$ci"
+  done
+done
+
+for ti in $(seq 99); do
+  curl -X POST "http://127.0.0.1:4151/topic/delete?topic=topic-$ti"
+  curl -X POST "http://127.0.0.1:4161/topic/delete?topic=topic-$ti"
+  curl -X POST "http://127.0.0.1:4163/topic/delete?topic=topic-$ti"
+done
