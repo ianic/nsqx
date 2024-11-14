@@ -7,9 +7,16 @@ const Page = struct {
     const Self = @This();
 
     buf: []u8,
-    sequence: u64 = 0,
+    first_sequence: u64 = 0,
     rc: u32 = 0, // reference counter
     offsets: std.ArrayList(u32),
+
+    fn alloc(self: *Self, bytes_count: u32) ![]u8 {
+        assert(self.free() >= bytes_count);
+        const wp = self.writePos();
+        try self.offsets.append(wp + bytes_count);
+        return self.buf[wp..][0..bytes_count];
+    }
 
     fn append(self: *Self, bytes: []const u8) !void {
         assert(self.free() >= bytes.len);
@@ -30,39 +37,53 @@ const Page = struct {
         return self.capacity() - self.writePos();
     }
 
-    fn next(self: *Self, sequence: *u64, ready_count: u32, ack_policy: AckPolicy) ?[]const u8 {
+    fn next(self: *Self, sequence: u64, ready_count: u32, ack_policy: AckPolicy) NextResult {
         assert(ready_count > 0);
-        assert(sequence.* < self.last());
+        assert(sequence < self.last());
         const msgs_count = self.offsets.items.len;
 
-        if (sequence.* < self.first()) {
+        if (sequence < self.first()) {
             const no_msgs = @min(msgs_count, ready_count);
             const end_idx = no_msgs - 1;
             if (ack_policy == .explicit) self.rc += no_msgs;
-            sequence.* = self.first() + end_idx;
-            return self.buf[0..self.offsets.items[end_idx]];
+            const data = self.buf[0..self.offsets.items[end_idx]];
+            return .{
+                .data = data,
+                .sequence = .{ .from = self.first(), .to = self.first() + end_idx },
+            };
         }
+        assert(sequence >= self.first());
 
-        const start_idx: u32 = @intCast(sequence.* - self.sequence);
+        const start_idx: u32 = @intCast(sequence - self.first());
         const end_idx: u32 = @min(msgs_count - 1, start_idx + ready_count);
         const no_msgs: u32 = end_idx - start_idx;
         if (ack_policy == .explicit) self.rc += no_msgs;
-        sequence.* += no_msgs;
-
-        return self.buf[self.offsets.items[start_idx]..self.offsets.items[end_idx]];
+        const data = self.buf[self.offsets.items[start_idx]..self.offsets.items[end_idx]];
+        return .{
+            .data = data,
+            .sequence = .{ .from = sequence + 1, .to = sequence + no_msgs },
+        };
     }
 
     fn first(self: *Self) u64 {
-        return self.sequence;
+        return self.first_sequence;
     }
 
     fn last(self: Self) u64 {
-        return self.sequence + self.offsets.items.len - 1;
+        return self.first_sequence + self.offsets.items.len - 1;
     }
 
     fn contains(self: *Self, sequence: u64) bool {
         return self.first() <= sequence and self.last() >= sequence;
     }
+};
+
+pub const NextResult = struct {
+    data: []const u8,
+    sequence: struct {
+        from: u64,
+        to: u64,
+    },
 };
 
 pub const DeliverPolicy = union(enum) {
@@ -104,6 +125,8 @@ pub const Store = struct {
     allocator: mem.Allocator,
     options: Options,
     pages: std.ArrayList(Page),
+    consumers: u32 = 0,
+    last_sequence: u64 = 0,
 
     pub fn init(allocator: mem.Allocator, options: Options) Self {
         return .{
@@ -121,27 +144,60 @@ pub const Store = struct {
         self.pages.deinit();
     }
 
+    const AllocResult = struct {
+        data: []u8,
+        sequence: u64,
+    };
+
+    pub fn alloc(self: *Self, bytes_count: u32) !AllocResult {
+        if (self.pages.items.len == 0 or self.pages.getLast().free() < bytes_count) {
+            // add new page
+            try self.pages.append(
+                Page{
+                    .rc = if (self.pages.items.len == 0) self.consumers else 0,
+                    .first_sequence = 1 + self.last_sequence,
+                    .buf = try self.allocator.alloc(u8, @max(self.options.page_size, bytes_count)),
+                    .offsets = std.ArrayList(u32).init(self.allocator),
+                },
+            );
+        }
+        self.last_sequence += 1;
+        const page = self.lastPage().?;
+        const data = try page.alloc(bytes_count);
+        assert(self.last_sequence == page.last());
+        return .{ .data = data, .sequence = self.last_sequence };
+    }
+
     pub fn append(self: *Self, bytes: []const u8) !void {
         if (self.pages.items.len == 0 or
             self.pages.getLast().free() < bytes.len)
         { // add new page
             try self.pages.append(
                 Page{
-                    .sequence = 1 + if (self.pages.items.len == 0) 0 else self.pages.getLast().last(),
+                    .rc = if (self.pages.items.len == 0) self.consumers else 0,
+                    .first_sequence = 1 + self.last_sequence,
                     .buf = try self.allocator.alloc(u8, @max(self.options.page_size, bytes.len)),
                     .offsets = std.ArrayList(u32).init(self.allocator),
                 },
             );
         }
+        self.last_sequence += 1;
         // Append to last page
-        return self.lastPage().append(bytes);
+        return self.lastPage().?.append(bytes);
     }
 
-    fn lastPage(self: *Self) *Page {
+    fn lastPage(self: *Self) ?*Page {
+        if (self.pages.items.len == 0) return null;
         return &self.pages.items[self.pages.items.len - 1];
     }
 
-    fn firstPage(self: *Self) *Page {
+    pub fn lastSequence(self: *Self) u64 {
+        if (self.pages.items.len == 0) return 0;
+        return self.lastPage().last();
+    }
+
+    fn firstPage(self: *Self) ?*Page {
+        if (self.pages.items.len == 0) return null;
         return &self.pages.items[0];
     }
 
@@ -150,38 +206,90 @@ pub const Store = struct {
         return self.next(sequence, max_ready_count);
     }
 
-    pub fn next(self: *Self, sequence: *u64, ready_count: u32) ?[]const u8 {
-        if (self.pages.items.len == 0 or ready_count == 0) return null;
-        const ack_policy = self.options.ack_policy;
+    fn isEmpty(self: Self) bool {
+        return self.pages.items.len == 0;
+    }
 
-        const first_page = self.firstPage();
-        if (sequence.* < first_page.first()) {
-            first_page.rc += 1;
-            sequence.* = first_page.first() - 1;
-            return first_page.next(sequence, ready_count, ack_policy);
-        }
-
-        const last_page = self.lastPage();
-        const last_sequence = last_page.last();
-
-        assert(sequence.* <= last_sequence);
-        if (sequence.* == last_sequence) return null;
-
-        // Find page which contains sequence
+    fn findPage(self: Self, sequence: u64) ?*Page {
         var i: usize = self.pages.items.len;
         while (i > 0) {
             i -= 1;
             var page = &self.pages.items[i];
-            if (page.contains(sequence.*)) {
-                if (page.last() == sequence.*) {
-                    // switch to next page
-                    page.rc -= 1;
-                    page = &self.pages.items[i + 1];
-                    page.rc += 1;
-                    return page.next(sequence, ready_count, ack_policy);
+            if (page.contains(sequence)) return page;
+        }
+        return null;
+    }
+
+    pub fn subscribe(self: *Self) u64 {
+        self.consumers += 1;
+        switch (self.options.deliver_policy) {
+            .new => {
+                if (self.lastPage()) |p| p.rc += 1;
+            },
+            .all => {
+                if (self.firstPage()) |p| {
+                    p.rc += 1;
+                    return p.first() - 1;
                 }
-                return page.next(sequence, ready_count, ack_policy);
+            },
+            .from_sequence => |seq| {
+                if (self.findPage(seq)) |p| {
+                    p.rc += 1;
+                    return seq;
+                }
+            },
+        }
+        return self.last_sequence;
+    }
+
+    pub fn unsubscribe(self: *Self, sequence: u64) void {
+        self.consumers -= 1;
+        if (self.findPage(sequence)) |p| {
+            p.rc -= 1;
+            if (p.rc == 0) self.cleanupPages();
+        }
+    }
+
+    const FindResult = struct {
+        page: *Page,
+        cleared: bool = false,
+    };
+
+    fn findReadPage(self: *Self, sequence: u64) ?FindResult {
+        if (self.firstPage()) |fp| {
+            if (sequence < fp.first()) return .{ .page = fp };
+        }
+
+        if (self.findPage(sequence)) |page| {
+            if (page.last() > sequence) return .{ .page = page };
+
+            if (self.findPage(sequence + 1)) |next_page| {
+                page.rc -= 1;
+                next_page.rc += 1;
+                return .{ .page = next_page, .cleared = page.rc == 0 };
             }
+        }
+        return null;
+    }
+
+    fn cleanupPages(self: *Self) void {
+        if (self.options.retention_policy != .interest) return;
+        while (self.pages.items.len > 0 and self.pages.items[0].rc == 0) {
+            var fp = self.pages.orderedRemove(0);
+            self.allocator.free(fp.buf);
+            fp.offsets.deinit();
+        }
+    }
+
+    pub fn next(self: *Self, sequence: u64, ready_count: u32) ?NextResult {
+        if (self.pages.items.len == 0 or
+            ready_count == 0 or
+            sequence == self.last_sequence)
+            return null;
+
+        if (self.findReadPage(sequence)) |res| {
+            defer if (res.cleared) self.cleanupPages();
+            return res.page.next(sequence, ready_count, self.options.ack_policy);
         }
 
         unreachable;
@@ -194,62 +302,296 @@ pub const Store = struct {
             var page = &self.pages.items[i];
             if (page.contains(sequence)) {
                 page.rc -= 1;
+                if (page.rc == 0) self.cleanupPages();
                 return;
             }
         }
     }
 };
 
-test "append/next/nextChunk" {
-    var store = Store.init(testing.allocator, .{ .page_size = 8, .ack_policy = .explicit });
+test "topic usage" {
+    var store = Store.init(testing.allocator, .{
+        .page_size = 8,
+        .ack_policy = .explicit,
+        .deliver_policy = .all,
+        .retention_policy = .all,
+    });
     defer store.deinit();
+    store.last_sequence = 100;
+
     {
-        try testing.expectEqual(0, store.pages.items.len);
+        // page 0
         try store.append("0123");
-        try testing.expectEqual(1, store.pages.items.len);
-        try testing.expectEqual(1, store.lastPage().first());
-        try testing.expectEqual(1, store.lastPage().last());
         try store.append("45");
-        try testing.expectEqual(1, store.lastPage().first());
-        try testing.expectEqual(2, store.lastPage().last());
         try store.append("67");
-        try testing.expectEqual(3, store.lastPage().last());
+        // page 1
         try store.append("89");
-        try testing.expectEqual(2, store.pages.items.len);
-        try testing.expectEqual(4, store.lastPage().first());
-        try testing.expectEqual(4, store.lastPage().last());
+        try store.append("0123");
+        // page 2
+        try store.append("4567");
     }
+
+    // first subscriber gets all the messages
+    var sub_1_seq = store.subscribe();
+    try testing.expectEqual(100, sub_1_seq);
+
+    // change policy after first subscriber
+    store.options.retention_policy = .interest;
+    store.options.deliver_policy = .new;
+
+    // other subscribers get new messages
+    const sub_2_seq = store.subscribe();
+    try testing.expectEqual(106, sub_2_seq);
+    try testing.expect(store.next(sub_2_seq, 1) == null);
+
+    // references hold
+    try testing.expectEqual(1, store.pages.items[0].rc);
+    try testing.expectEqual(0, store.pages.items[1].rc);
+    try testing.expectEqual(1, store.pages.items[2].rc);
+
+    // subscriber 1
     {
-        var sequence: u64 = 0;
-        try testing.expect((store.next(&sequence, 0)) == null);
-        try testing.expectEqual(0, sequence);
-        try testing.expectEqual(0, store.pages.items[0].rc);
+        const res1 = store.next(sub_1_seq, 10).?;
+        try testing.expectEqualStrings("01234567", res1.data);
+        sub_1_seq = res1.sequence.to;
 
-        try testing.expectEqualStrings("0123", store.next(&sequence, 1).?);
-        try testing.expectEqual(1, sequence);
-        try testing.expectEqual(2, store.pages.items[0].rc);
-        try testing.expectEqualStrings("4567", store.next(&sequence, 3).?);
-        try testing.expectEqual(3, sequence);
+        // each message holds reference when ack is explicit
         try testing.expectEqual(4, store.pages.items[0].rc);
-        store.fin(1);
-        store.fin(2);
-        store.fin(3);
-        try testing.expectEqual(1, store.pages.items[0].rc);
+        try testing.expectEqual(0, store.pages.items[1].rc);
+        try testing.expectEqual(1, store.pages.items[2].rc);
 
-        try testing.expectEqualStrings("89", store.next(&sequence, 123).?);
-        try testing.expectEqual(4, sequence);
-        try testing.expectEqual(0, store.pages.items[0].rc);
-        try testing.expectEqual(2, store.pages.items[1].rc);
-    }
-    { // With ack_policy none
-        store.options.ack_policy = .none;
-        var sequence: u64 = 0;
-        try testing.expectEqualStrings("01234567", store.nextPage(&sequence).?);
-        try testing.expectEqual(1, store.pages.items[0].rc);
-        try testing.expectEqual(2, store.pages.items[1].rc);
-        try testing.expectEqual(3, sequence);
-        try testing.expectEqualStrings("89", store.nextPage(&sequence).?);
-        try testing.expectEqual(0, store.pages.items[0].rc);
+        const res2 = store.next(sub_1_seq, 10).?;
+        try testing.expectEqualStrings("890123", res2.data);
+
+        // subscriber's reference is moved to the second page
+        try testing.expectEqual(3, store.pages.items[0].rc);
         try testing.expectEqual(3, store.pages.items[1].rc);
+        try testing.expectEqual(1, store.pages.items[2].rc);
+
+        // fin messages in flight release first page
+        try testing.expectEqual(3, store.pages.items.len);
+        for (res1.sequence.from..res1.sequence.to + 1) |seq| store.fin(seq);
+        try testing.expectEqual(2, store.pages.items.len);
     }
+}
+
+test "append/alloc" {
+    var store = Store.init(testing.allocator, .{ .page_size = 8 });
+    store.last_sequence = 100;
+    defer store.deinit();
+    try testing.expectEqual(0, store.pages.items.len);
+
+    // page 1
+    try store.append("01234");
+    try testing.expectEqual(1, store.pages.items.len);
+    try testing.expectEqual(101, store.pages.items[0].first_sequence);
+    try testing.expectEqual(101, store.last_sequence);
+    try testing.expectEqual(8, store.pages.items[0].buf.len);
+
+    try store.append("5");
+    try testing.expectEqual(102, store.last_sequence);
+    try testing.expectEqual(101, store.pages.items[0].first_sequence);
+    try testing.expectEqual(102, store.pages.items[0].last());
+    try store.append("6");
+    try testing.expectEqual(103, store.last_sequence);
+    try testing.expectEqual(103, store.pages.items[0].last());
+
+    // page 2
+    var res = try store.alloc(2);
+    try testing.expectEqual(2, store.pages.items.len);
+    try testing.expectEqual(2, res.data.len);
+    try testing.expectEqual(104, res.sequence);
+    try testing.expectEqual(104, store.last_sequence);
+    try testing.expectEqual(104, store.pages.items[1].first_sequence);
+    try testing.expectEqual(8, store.pages.items[1].buf.len);
+
+    // page 3 of size 9
+    res = try store.alloc(9);
+    try testing.expectEqual(3, store.pages.items.len);
+    try testing.expectEqual(9, res.data.len);
+    try testing.expectEqual(105, res.sequence);
+    try testing.expectEqual(105, store.last_sequence);
+    try testing.expectEqual(9, store.pages.items[2].buf.len);
+    try testing.expectEqual(105, store.pages.items[2].first_sequence);
+}
+
+test "delivery policy" {
+    var store = Store.init(testing.allocator, .{ .page_size = 8, .deliver_policy = .all });
+    store.last_sequence = 100;
+    defer store.deinit();
+
+    {
+        // page 0
+        try store.append("0123");
+        try store.append("45");
+        try store.append("67");
+        // page 1
+        try store.append("89");
+        try store.append("0123");
+        // page 2
+        try store.append("4567");
+    }
+
+    for (0..2) |_| {
+        var sequence = store.subscribe();
+        try testing.expectEqual(100, sequence);
+        try testing.expectEqual(1, store.consumers);
+        var res = store.next(sequence, 2).?;
+        try testing.expectEqualStrings("012345", res.data);
+        try testing.expectEqual(101, res.sequence.from);
+        try testing.expectEqual(102, res.sequence.to);
+        try testing.expectEqual(1, store.pages.items[0].rc);
+        try testing.expectEqual(0, store.pages.items[1].rc);
+        try testing.expectEqual(0, store.pages.items[2].rc);
+        sequence = res.sequence.to;
+
+        res = store.next(sequence, 2).?;
+        try testing.expectEqualStrings("67", res.data);
+        try testing.expectEqual(103, res.sequence.from);
+        try testing.expectEqual(103, res.sequence.to);
+        try testing.expectEqual(1, store.pages.items[0].rc);
+        try testing.expectEqual(0, store.pages.items[1].rc);
+        try testing.expectEqual(0, store.pages.items[2].rc);
+        sequence = res.sequence.to;
+
+        res = store.next(sequence, 10).?;
+        try testing.expectEqualStrings("890123", res.data);
+        try testing.expectEqual(104, res.sequence.from);
+        try testing.expectEqual(105, res.sequence.to);
+        try testing.expectEqual(0, store.pages.items[0].rc);
+        try testing.expectEqual(1, store.pages.items[1].rc);
+        try testing.expectEqual(0, store.pages.items[2].rc);
+        sequence = res.sequence.to;
+
+        res = store.next(sequence, 10).?;
+        try testing.expectEqualStrings("4567", res.data);
+        try testing.expectEqual(106, res.sequence.from);
+        try testing.expectEqual(106, res.sequence.to);
+        try testing.expectEqual(0, store.pages.items[0].rc);
+        try testing.expectEqual(0, store.pages.items[1].rc);
+        try testing.expectEqual(1, store.pages.items[2].rc);
+        sequence = res.sequence.to;
+
+        store.unsubscribe(sequence);
+        try testing.expectEqual(0, store.pages.items[0].rc);
+        try testing.expectEqual(0, store.pages.items[1].rc);
+        try testing.expectEqual(0, store.pages.items[2].rc);
+        try testing.expectEqual(0, store.consumers);
+    }
+
+    store.options.deliver_policy = .new;
+    {
+        var sequence = store.subscribe();
+        try testing.expectEqual(106, sequence);
+        try testing.expectEqual(0, store.pages.items[0].rc);
+        try testing.expectEqual(0, store.pages.items[1].rc);
+        try testing.expectEqual(1, store.pages.items[2].rc);
+        try testing.expect(store.next(sequence, 2) == null);
+
+        try store.append("89012"); // page 3
+        try store.append("3");
+        try store.append("4");
+        try store.append("5");
+        const res = store.next(sequence, 10).?;
+        try testing.expectEqualStrings("89012345", res.data);
+        try testing.expectEqual(107, res.sequence.from);
+        try testing.expectEqual(110, res.sequence.to);
+        try testing.expectEqual(0, store.pages.items[0].rc);
+        try testing.expectEqual(0, store.pages.items[1].rc);
+        try testing.expectEqual(0, store.pages.items[2].rc);
+        try testing.expectEqual(1, store.pages.items[3].rc);
+        sequence = res.sequence.to;
+
+        store.unsubscribe(sequence);
+        try testing.expectEqual(0, store.pages.items[3].rc);
+    }
+
+    store.options.deliver_policy = .{ .from_sequence = 104 };
+    {
+        var sequence = store.subscribe();
+        try testing.expectEqual(0, store.pages.items[0].rc);
+        try testing.expectEqual(1, store.pages.items[1].rc);
+        try testing.expectEqual(0, store.pages.items[2].rc);
+        try testing.expectEqual(0, store.pages.items[3].rc);
+
+        const res = store.next(sequence, 10).?;
+        try testing.expectEqualStrings("0123", res.data);
+        try testing.expectEqual(105, res.sequence.from);
+        try testing.expectEqual(105, res.sequence.to);
+        sequence = res.sequence.to;
+        store.unsubscribe(sequence);
+        try testing.expectEqual(0, store.pages.items[0].rc);
+        try testing.expectEqual(0, store.pages.items[1].rc);
+        try testing.expectEqual(0, store.pages.items[2].rc);
+        try testing.expectEqual(0, store.pages.items[3].rc);
+    }
+}
+
+test "retention policy" {
+    var store = Store.init(testing.allocator, .{ .page_size = 8, .deliver_policy = .all, .retention_policy = .all });
+    store.last_sequence = 100;
+    defer store.deinit();
+
+    {
+        // page 0
+        try store.append("0123");
+        try store.append("45");
+        try store.append("67");
+        // page 1
+        try store.append("89");
+        try store.append("0123");
+        // page 2
+        try store.append("4567");
+    }
+
+    var sequence_all_1 = store.subscribe();
+    try testing.expectEqual(100, sequence_all_1);
+    try testing.expectEqual(1, store.consumers);
+
+    var sequence_all_2 = store.subscribe();
+    try testing.expectEqual(100, sequence_all_2);
+    try testing.expectEqual(2, store.consumers);
+
+    store.options.retention_policy = .interest;
+    store.options.deliver_policy = .new;
+
+    var res = store.next(sequence_all_1, 10).?;
+    try testing.expectEqualStrings("01234567", res.data);
+    sequence_all_1 = res.sequence.to;
+    res = store.next(sequence_all_1, 10).?;
+    try testing.expectEqualStrings("890123", res.data);
+    sequence_all_1 = res.sequence.to;
+
+    try testing.expectEqual(1, store.pages.items[0].rc);
+    try testing.expectEqual(1, store.pages.items[1].rc);
+    try testing.expectEqual(0, store.pages.items[2].rc);
+
+    res = store.next(sequence_all_2, 10).?;
+    try testing.expectEqualStrings("01234567", res.data);
+    sequence_all_2 = res.sequence.to;
+    res = store.next(sequence_all_2, 1).?;
+    try testing.expectEqualStrings("89", res.data);
+    sequence_all_2 = res.sequence.to;
+
+    try testing.expectEqual(2, store.pages.items.len);
+    try testing.expectEqual(2, store.pages.items[0].rc);
+    try testing.expectEqual(0, store.pages.items[1].rc);
+
+    try testing.expectEqual(104, sequence_all_2);
+    try testing.expectEqual(105, sequence_all_1);
+
+    store.unsubscribe(sequence_all_2);
+    try testing.expectEqual(2, store.pages.items.len);
+    try testing.expectEqual(1, store.pages.items[0].rc);
+    try testing.expectEqual(0, store.pages.items[1].rc);
+
+    store.unsubscribe(sequence_all_1);
+    try testing.expectEqual(0, store.pages.items.len);
+
+    try testing.expectEqual(106, store.last_sequence);
+    try store.append("8");
+    try testing.expectEqual(1, store.pages.items.len);
+    try testing.expectEqual(107, store.last_sequence);
+    store.cleanupPages();
+    try testing.expectEqual(0, store.pages.items.len);
 }

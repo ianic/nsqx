@@ -53,7 +53,12 @@ pub const Connector = struct {
             .connections = std.ArrayList(*Conn).init(allocator),
             .identify = identify,
             .state = .connected,
-            .store = Store.init(allocator, .{ .ack_policy = .none, .page_size = 64 * 1024 }),
+            .store = Store.init(allocator, .{
+                .ack_policy = .none,
+                .deliver_policy = .all,
+                .retention_policy = .all,
+                .page_size = 64 * 1024,
+            }),
         };
         errdefer self.deinit();
         try self.connections.ensureUnusedCapacity(lookup_tcp_addresses.len);
@@ -94,32 +99,32 @@ pub const Connector = struct {
     }
 
     pub fn topicCreated(self: *Self, name: []const u8) void {
-        self.register("REGISTER {s}\n", .{name});
+        self.append("REGISTER {s}\n", .{name});
     }
 
     pub fn channelCreated(self: *Self, topic_name: []const u8, name: []const u8) void {
-        self.register("REGISTER {s} {s}\n", .{ topic_name, name });
+        self.append("REGISTER {s} {s}\n", .{ topic_name, name });
     }
 
     pub fn topicDeleted(self: *Self, name: []const u8) void {
-        self.register("UNREGISTER {s}\n", .{name});
+        self.append("UNREGISTER {s}\n", .{name});
     }
 
     pub fn channelDeleted(self: *Self, topic_name: []const u8, name: []const u8) void {
-        self.register("UNREGISTER {s} {s}\n", .{ topic_name, name });
+        self.append("UNREGISTER {s} {s}\n", .{ topic_name, name });
     }
 
-    fn register(self: *Self, comptime fmt: []const u8, args: anytype) void {
-        self.tryRegister(fmt, args) catch |err| {
+    fn append(self: *Self, comptime fmt: []const u8, args: anytype) void {
+        self.storeAppend(fmt, args) catch |err| {
             // TODO: what now
             log.err("add registration failed {}", .{err});
         };
     }
 
-    fn tryRegister(self: *Self, comptime fmt: []const u8, args: anytype) !void {
-        const buf = try std.fmt.allocPrint(self.allocator, fmt, args);
-        errdefer self.allocator.free(buf);
-        try self.store.append(buf);
+    fn storeAppend(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+        const bytes_count = std.fmt.count(fmt, args);
+        const res = try self.store.alloc(@intCast(bytes_count));
+        _ = try std.fmt.bufPrint(res.data, fmt, args);
         for (self.connections.items) |conn| conn.wakeup();
     }
 };
@@ -220,7 +225,6 @@ const Conn = struct {
         );
         self.io.submit(&self.connect_op);
         self.state = .connecting;
-        self.sequence = 0;
     }
 
     fn onConnect(self: *Self, socket: socket_t) Error!void {
@@ -236,6 +240,7 @@ const Conn = struct {
         self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
         self.io.submit(&self.recv_op);
         self.state = .connected;
+        self.sequence = self.connector.store.subscribe();
         log.debug("{} connected", .{self.address});
     }
 
@@ -260,8 +265,10 @@ const Conn = struct {
         if (self.send_op.active()) return;
         if (self.state != .connected) return;
 
-        if (self.connector.store.next(&self.sequence, 1024)) |buf| {
-            self.send(buf);
+        if (self.connector.store.next(self.sequence, 2)) |res| {
+            log.debug("sending msgs {} - {} len: {}", .{ res.sequence.from, res.sequence.to, res.data.len });
+            self.send(res.data);
+            self.sequence = res.sequence.to;
         }
     }
 
@@ -327,7 +334,7 @@ const Conn = struct {
         // log.debug("{} shutdown state: {s}", .{ self.address, @tagName(self.state) });
         switch (self.state) {
             .connecting, .connected => {
-                // self.connector.disconnect(self);
+                self.connector.store.unsubscribe(self.sequence);
                 self.recv_buf.free();
                 self.state = .closing;
                 self.shutdown();
