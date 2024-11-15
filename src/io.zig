@@ -317,7 +317,7 @@ pub const Op = struct {
             .send => |*arg| _ = try io.ring.send(@intFromPtr(op), arg.socket, arg.buf, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
             .timer => |*arg| _ = try io.ring.timeout(@intFromPtr(op), &arg.ts, arg.count, arg.flags),
             .socket => |*arg| _ = try io.ring.socket(@intFromPtr(op), arg.domain, arg.socket_type, arg.protocol, 0),
-            .shutdown => |socket| _ = try io.ring.shutdown(@intFromPtr(op), socket, 2),
+            .shutdown => |socket| _ = try io.ring.shutdown(@intFromPtr(op), socket, posix.SHUT.RDWR),
             .cancel => |op_to_cancel| switch (op_to_cancel.args) {
                 .timer => _ = try io.ring.timeout_remove(@intFromPtr(op), @intFromPtr(op_to_cancel), 0),
                 else => _ = try io.ring.cancel(@intFromPtr(op), @intFromPtr(op_to_cancel), 0),
