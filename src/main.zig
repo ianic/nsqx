@@ -176,11 +176,12 @@ fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
     while (ti.next()) |te| {
         const topic_name = te.key_ptr.*;
         const topic = te.value_ptr.*;
-        print("  {s} depth: {d} bytes: {d} sequence: {}\n", .{
+        print("  {s} depth: {d} bytes: {d} sequence: {} pages: {}\n", .{
             topic_name,
             topic.metric.depth,
             topic.metric.depth_bytes,
-            topic.sequence,
+            topic.store.last_sequence,
+            topic.store.pages.items.len,
         });
 
         var ci = topic.channels.iterator();

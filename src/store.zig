@@ -2,6 +2,7 @@ const std = @import("std");
 const mem = std.mem;
 const assert = std.debug.assert;
 const testing = std.testing;
+const log = std.log.scoped(.storeg);
 
 const Page = struct {
     const Self = @This();
@@ -75,6 +76,14 @@ const Page = struct {
 
     fn contains(self: *Self, sequence: u64) bool {
         return self.first() <= sequence and self.last() >= sequence;
+    }
+
+    fn message(self: *Self, sequence: u64) []const u8 {
+        assert(self.contains(sequence));
+        const idx: u32 = @intCast(sequence - self.first());
+        if (idx == 0)
+            return self.buf[0..self.offsets.items[idx]];
+        return self.buf[self.offsets.items[idx - 1]..self.offsets.items[idx]];
     }
 };
 
@@ -244,10 +253,11 @@ pub const Store = struct {
 
     pub fn unsubscribe(self: *Self, sequence: u64) void {
         self.consumers -= 1;
-        if (self.findPage(sequence)) |p| {
-            p.rc -= 1;
-            if (p.rc == 0) self.cleanupPages();
-        }
+        self.fin(sequence);
+        // if (self.findPage(sequence)) |p| {
+        //     p.rc -= 1;
+        //     if (p.rc == 0) self.cleanupPages();
+        // }
     }
 
     const FindResult = struct {
@@ -276,6 +286,7 @@ pub const Store = struct {
         if (self.options.retention_policy != .interest) return;
         while (self.pages.items.len > 0 and self.pages.items[0].rc == 0) {
             var fp = self.pages.orderedRemove(0);
+            // log.warn("page remove {}-{}", .{ fp.first(), fp.last() });
             self.allocator.free(fp.buf);
             fp.offsets.deinit();
         }
@@ -295,17 +306,30 @@ pub const Store = struct {
         unreachable;
     }
 
+    pub fn hasNext(self: *Self, sequence: u64) bool {
+        return self.pages.items.len > 0 and sequence < self.last_sequence;
+    }
+
+    pub fn message(self: *Self, sequence: u64) []const u8 {
+        const page = self.findPage(sequence).?;
+        return page.message(sequence);
+    }
+
     pub fn fin(self: *Self, sequence: u64) void {
-        var i: usize = self.pages.items.len;
-        while (i > 0) {
-            i -= 1;
-            var page = &self.pages.items[i];
-            if (page.contains(sequence)) {
-                page.rc -= 1;
-                if (page.rc == 0) self.cleanupPages();
-                return;
-            }
-        }
+        const page = self.findPage(sequence).?;
+        page.rc -= 1;
+        if (page.rc == 0) self.cleanupPages();
+
+        // var i: usize = self.pages.items.len;
+        // while (i > 0) {
+        //     i -= 1;
+        //     var page = &self.pages.items[i];
+        //     if (page.contains(sequence)) {
+        //         page.rc -= 1;
+        //         if (page.rc == 0) self.cleanupPages();
+        //         return;
+        //     }
+        // }
     }
 };
 
@@ -594,4 +618,56 @@ test "retention policy" {
     try testing.expectEqual(107, store.last_sequence);
     store.cleanupPages();
     try testing.expectEqual(0, store.pages.items.len);
+}
+
+test "ack policy" {
+    var store = Store.init(testing.allocator, .{
+        .page_size = 8,
+        .ack_policy = .explicit,
+        .deliver_policy = .all,
+        .retention_policy = .all,
+    });
+    store.last_sequence = 100;
+    defer store.deinit();
+
+    {
+        // page 0
+        try store.append("0");
+        try store.append("1");
+        try store.append("2");
+        try store.append("3");
+        try store.append("45");
+        try store.append("67");
+    }
+
+    try testing.expectEqual(0, store.pages.items[0].rc);
+    var res = store.next(100, 2).?;
+    try testing.expectEqual(101, res.sequence.from);
+    try testing.expectEqual(102, res.sequence.to);
+    try testing.expectEqual(2, store.pages.items[0].rc);
+
+    res = store.next(102, 2).?;
+    try testing.expectEqual(103, res.sequence.from);
+    try testing.expectEqual(104, res.sequence.to);
+    try testing.expectEqual(4, store.pages.items[0].rc);
+
+    res = store.next(102, 2).?;
+    try testing.expectEqual(103, res.sequence.from);
+    try testing.expectEqual(104, res.sequence.to);
+    try testing.expectEqual(6, store.pages.items[0].rc);
+
+    res = store.next(104, 10).?;
+    try testing.expectEqual(105, res.sequence.from);
+    try testing.expectEqual(106, res.sequence.to);
+    try testing.expectEqual(8, store.pages.items[0].rc);
+
+    res = store.next(100, 6).?;
+    try testing.expectEqual(101, res.sequence.from);
+    try testing.expectEqual(106, res.sequence.to);
+    try testing.expectEqual(8 + 6, store.pages.items[0].rc);
+
+    try testing.expectEqualStrings("0", store.message(101));
+    try testing.expectEqualStrings("1", store.message(102));
+    try testing.expectEqualStrings("45", store.message(105));
+    try testing.expectEqualStrings("67", store.message(106));
 }

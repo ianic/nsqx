@@ -155,7 +155,7 @@ pub const Conn = struct {
         try self.send_op.init(allocator, socket, self, onSend, onSendFail);
         errdefer self.send_op.deinit(allocator);
 
-        self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
+        self.recv_op = Op.recv(socket, self, onRecv, onRecvFail);
         self.io.submit(&self.recv_op);
 
         log.debug("{} connected", .{socket});
@@ -177,7 +177,7 @@ pub const Conn = struct {
 
     /// Is connection ready to send messages
     pub fn ready(self: *Conn) bool {
-        return !(self.send_op.active() or self.in_flight >= self.ready_count);
+        return !(self.send_op.active() or self.in_flight >= self.ready_count or self.state != .connected);
     }
 
     /// When channel is deleted via web interface
@@ -188,7 +188,7 @@ pub const Conn = struct {
 
     /// Pull messages from channel and send.
     pub fn wakeup(self: *Conn) !void {
-        if (self.send_op.active()) return;
+        if (self.send_op.active() or self.state != .connected) return;
 
         { // resize sendv
             const want_send_capacity = @max(
@@ -208,18 +208,26 @@ pub const Conn = struct {
         { // prepare messages
             if (self.channel) |channel| {
                 if (self.in_flight < self.ready_count) {
-                    var ready_count = self.ready_count - self.in_flight;
+                    const ready_count = self.ready_count - self.in_flight;
 
-                    while (self.send_op.free() > 1 and ready_count > 0) : (ready_count -= 1) {
-                        var msg = try channel.popMsg(self) orelse break;
-
-                        self.send_op.prep(&msg.header);
-                        const body = msg.body();
-                        if (body.len > 0) self.send_op.prep(body);
-
-                        self.metric.send +%= 1;
-                        self.in_flight += 1;
+                    if (self.send_op.free() > 0) {
+                        if (channel.popMsgs(self.socket, self.msgTimeout(), ready_count)) |res| {
+                            self.send_op.prep(res.data);
+                            self.metric.send +%= res.msgs_count;
+                            self.in_flight += res.msgs_count;
+                        }
                     }
+
+                    // while (self.send_op.free() > 1 and ready_count > 0) : (ready_count -= 1) {
+                    //     var msg = try channel.popMsg(self) orelse break;
+
+                    //     self.send_op.prep(&msg.header);
+                    //     const body = msg.body();
+                    //     if (body.len > 0) self.send_op.prep(body);
+
+                    //     self.metric.send +%= 1;
+                    //     self.in_flight += 1;
+                    // }
                 }
             }
         }
@@ -231,7 +239,6 @@ pub const Conn = struct {
     // IO callbacks -----------------
 
     pub fn onTimer(self: *Conn, _: u64) void {
-        // log.debug("{} on timer {}", .{ self.socket, now });
         if (self.state == .closing) return;
         if (self.outstanding_heartbeats > 4) {
             log.debug("{} no heartbeat, closing", .{self.socket});
@@ -405,25 +412,28 @@ pub const Conn = struct {
     }
 
     pub fn shutdown(self: *Conn) void {
-        // log.debug("{} shutdown state: {s}", .{ self.socket, @tagName(self.state) });
-
         switch (self.state) {
             .connected => {
                 // Start shutdown.
-                self.ready_count = 0;
-                // self.pending_response = null;
+                self.ready_count = 0; // stop sending
                 self.state = .closing;
-                if (self.channel) |channel| channel.unsubscribe(self);
                 self.shutdown_op = Op.shutdown(self.socket, self, onClose);
                 self.io.submit(&self.shutdown_op);
             },
             .closing => {
-                // Shutdown already in process.
+                // Close recv if not closed by shutdown
+                if (self.recv_op.active() and !self.shutdown_op.active()) {
+                    self.shutdown_op = Op.cancel(&self.recv_op, self, onClose);
+                    self.io.submit(&self.shutdown_op);
+                    return;
+                }
                 // Wait for all operation to finish.
                 if (self.recv_op.active() or
                     self.send_op.active() or
                     self.shutdown_op.active())
                     return;
+
+                if (self.channel) |channel| channel.unsubscribe(self);
 
                 log.debug("{} closed", .{self.socket});
                 self.deinit();
