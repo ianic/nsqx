@@ -108,6 +108,7 @@ pub const Conn = struct {
 
     recv_op: Op = .{},
     send_op: SendOp = .{},
+    send_chunk: ?Channel.PopResult = null,
     shutdown_op: Op = .{},
     pending_responses: std.ArrayList(Response),
     ready_count: u32 = 0,
@@ -117,7 +118,6 @@ pub const Conn = struct {
     outstanding_heartbeats: u8 = 0,
     recv_buf: RecvBuf, // Unprocessed bytes from previous receive
     send_buf: [34]u8 = undefined, // Send buffer for control messages
-    sent_at: u64 = 0, // Timestamp of the last finished send
 
     channel: ?*Channel = null,
     identify: protocol.Identify = .{},
@@ -190,13 +190,13 @@ pub const Conn = struct {
     pub fn wakeup(self: *Conn) !void {
         if (self.send_op.active() or self.state != .connected) return;
 
-        { // resize sendv
-            const want_send_capacity = @max(
-                self.ready_count * 2,
-                self.pending_responses.items.len,
-            );
-            try self.send_op.ensureCapacity(self.allocator, want_send_capacity);
-        }
+        // { // resize sendv
+        //     const want_send_capacity = @max(
+        //         self.ready_count * 2,
+        //         self.pending_responses.items.len,
+        //     );
+        //     try self.send_op.ensureCapacity(self.allocator, want_send_capacity);
+        // }
 
         { // prepare pending responses
             while (self.send_op.free() > 0) {
@@ -213,21 +213,11 @@ pub const Conn = struct {
                     if (self.send_op.free() > 0) {
                         if (channel.popMsgs(self.socket, self.msgTimeout(), ready_count)) |res| {
                             self.send_op.prep(res.data);
+                            self.send_chunk = res;
                             self.metric.send +%= res.msgs_count;
                             self.in_flight += res.msgs_count;
                         }
                     }
-
-                    // while (self.send_op.free() > 1 and ready_count > 0) : (ready_count -= 1) {
-                    //     var msg = try channel.popMsg(self) orelse break;
-
-                    //     self.send_op.prep(&msg.header);
-                    //     const body = msg.body();
-                    //     if (body.len > 0) self.send_op.prep(body);
-
-                    //     self.metric.send +%= 1;
-                    //     self.in_flight += 1;
-                    // }
                 }
             }
         }
@@ -271,12 +261,19 @@ pub const Conn = struct {
     }
 
     fn onSend(self: *Conn) Error!void {
-        self.sent_at = self.io.now();
+        self.sendDone();
         try self.wakeup();
     }
 
+    fn sendDone(self: *Conn) void {
+        if (self.send_chunk) |sc| {
+            sc.done();
+            self.send_chunk = null;
+        }
+    }
+
     fn onSendFail(self: *Conn, err: anyerror) Error!void {
-        self.sent_at = self.io.now();
+        self.sendDone();
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.err("{} send failed {}", .{ self.socket, err }),
@@ -365,8 +362,12 @@ pub const Conn = struct {
                 var channel = self.channel orelse return error.NotSubscribed;
                 self.in_flight -|= 1;
                 const res = channel.finish(msg_id);
-                if (res) self.metric.finish += 1;
-                log.debug("{} finish {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
+                if (res) {
+                    self.metric.finish += 1;
+                    log.debug("{} finish {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
+                } else {
+                    log.warn("{} finish {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
+                }
             },
             .requeue => |arg| {
                 var channel = self.channel orelse return error.NotSubscribed;
@@ -381,7 +382,7 @@ pub const Conn = struct {
             },
             .touch => |msg_id| {
                 var channel = self.channel orelse return error.NotSubscribed;
-                const res = channel.touch(msg_id, self.identify.msg_timeout);
+                const res = channel.touch(msg_id, self.msgTimeout());
                 log.debug("{} touch {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
             },
             .close => {

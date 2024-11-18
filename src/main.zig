@@ -13,9 +13,9 @@ const http = @import("http.zig");
 const lookup = @import("lookup.zig");
 const statsd = @import("statsd.zig");
 
-// pub const std_options = std.Options{
-//     .log_level = .info,
-// };
+pub const std_options = std.Options{
+    .log_level = if (builtin.mode == .ReleaseFast) .warn else .debug,
+};
 
 const log = std.log.scoped(.main);
 

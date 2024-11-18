@@ -26,7 +26,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         pub const Channel = ChannelType();
 
         allocator: mem.Allocator,
-        channel_msg_pool: std.heap.MemoryPool(Channel.Msg),
+        // channel_msg_pool: std.heap.MemoryPool(Channel.Msg),
         // topic_msg_pool: std.heap.MemoryPool(Topic.Msg),
         topics: std.StringHashMap(*Topic),
         notifier: *Notifier,
@@ -46,7 +46,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         pub fn init(allocator: mem.Allocator, notifier: *Notifier, now: u64, limits: Limits) Server {
             return .{
                 .allocator = allocator,
-                .channel_msg_pool = std.heap.MemoryPool(Channel.Msg).init(allocator),
+                //.channel_msg_pool = std.heap.MemoryPool(Channel.Msg).init(allocator),
                 // .topic_msg_pool = std.heap.MemoryPool(Topic.Msg).init(allocator),
                 .topics = std.StringHashMap(*Topic).init(allocator),
                 .notifier = notifier,
@@ -62,7 +62,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
             while (iter.next()) |e| self.deinitTopic(e.value_ptr.*);
             self.topics.deinit();
             self.timers.deinit();
-            self.channel_msg_pool.deinit();
+            // self.channel_msg_pool.deinit();
             // self.topic_msg_pool.deinit();
         }
 
@@ -803,15 +803,15 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     // msg: *Topic.Msg,
                     // header: [34]u8,
                     sequence: u64,
-                    sent_at: u64 = 0,
+                    // sent_at: u64 = 0,
                     in_flight_socket: socket_t = 0,
                     // Timestamp in nanoseconds. When in flight and timestamp is reached message should
                     // be re-queued. If deferred message should not be delivered until timestamp
                     // is reached.
                     // TODO: rename to timeout
                     timestamp: u64 = 0,
-                    //attempts: u16 = 1,
-                    payload: []u8 = &.{},
+                    attempts: u16 = 1,
+                    // payload: []u8 = &.{},
 
                     // fn destroy(self: *Msg, pool: *std.heap.MemoryPool(Channel.Msg)) void {
                     //     self.msg.release(); // release inner topic message
@@ -822,52 +822,51 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     //     return self.msg.body;
                     // }
 
-                    fn incAttempts(self: *Msg) void {
-                        const buf = self.payload[16..18];
-                        const v = mem.readInt(u16, buf, .big) +% 1;
-                        mem.writeInt(u16, buf, v, .big);
+                    fn setAttempts(self: Msg, payload: []u8) void {
+                        const buf = payload[16..18];
+                        mem.writeInt(u16, buf, self.attempts, .big);
                     }
 
                     // fn sequence(self: Msg) u64 {
                     //     return self.msg.sequence;
                     // }
 
-                    fn attempts(self: Msg) u16 {
-                        const buf = self.payload[16..18];
-                        return mem.readInt(u16, buf, .big);
-                    }
+                    // fn attempts(self: Msg) u16 {
+                    //     const buf = self.payload[16..18];
+                    //     return mem.readInt(u16, buf, .big);
+                    // }
 
                     // fn id(self: Msg) [16]u8 {
                     //     return self.header[18..34].*;
                     // }
 
-                    fn less(_: void, a: *Msg, b: *Msg) math.Order {
+                    fn less(_: void, a: Msg, b: Msg) math.Order {
                         if (a.timestamp != b.timestamp)
                             return math.order(a.timestamp, b.timestamp);
                         return math.order(a.sequence, b.sequence);
                     }
 
-                    test incAttempts {
-                        var payload = [_]u8{
-                            0x00, 0x00, 0x00, 0x022, 0x00, 0x00, 0x00, 0x02,
-                            0x08, 0x09, 0x0a, 0x0b,  0x0c, 0x0d, 0x0e, 0x0f,
-                            0x00, 0x01, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
-                            0x00, 0x00, 0x00, 0x01,  0x02, 0x03, 0x04, 0x05,
-                            0x06, 0x07,
-                        };
-                        var m = Msg{
-                            .sequence = 1,
-                            .payload = &payload,
-                        };
+                    // test incAttempts {
+                    //     var payload = [_]u8{
+                    //         0x00, 0x00, 0x00, 0x022, 0x00, 0x00, 0x00, 0x02,
+                    //         0x08, 0x09, 0x0a, 0x0b,  0x0c, 0x0d, 0x0e, 0x0f,
+                    //         0x00, 0x01, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+                    //         0x00, 0x00, 0x00, 0x01,  0x02, 0x03, 0x04, 0x05,
+                    //         0x06, 0x07,
+                    //     };
+                    //     var m = Msg{
+                    //         .sequence = 1,
+                    //         .payload = &payload,
+                    //     };
 
-                        try testing.expectEqual(1, m.attempts());
-                        try testing.expectEqual(1, m.payload[17]);
-                        m.incAttempts();
-                        try testing.expectEqual(2, m.payload[17]);
-                        m.incAttempts();
-                        try testing.expectEqual(3, m.attempts());
-                        try testing.expectEqual(3, m.payload[17]);
-                    }
+                    //     try testing.expectEqual(1, m.attempts());
+                    //     try testing.expectEqual(1, m.payload[17]);
+                    //     m.incAttempts();
+                    //     try testing.expectEqual(2, m.payload[17]);
+                    //     m.incAttempts();
+                    //     try testing.expectEqual(3, m.attempts());
+                    //     try testing.expectEqual(3, m.payload[17]);
+                    // }
 
                     pub fn seqFromId(msg_id: [16]u8) u64 {
                         return mem.readInt(u64, msg_id[8..], .big);
@@ -881,7 +880,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 };
 
                 allocator: mem.Allocator,
-                msg_pool: *std.heap.MemoryPool(Channel.Msg),
+                // msg_pool: *std.heap.MemoryPool(Channel.Msg),
                 name: []const u8,
                 topic: *Topic,
                 consumers: std.ArrayList(*Consumer),
@@ -892,9 +891,9 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 timers: *TimerQueue(Channel),
                 now: *u64,
                 // Sent but not jet acknowledged (fin) messages.
-                in_flight: std.AutoArrayHashMap(u64, *Msg),
+                in_flight: std.AutoArrayHashMap(u64, Msg),
                 // Re-queued by consumer, timed-out or defer published messages.
-                deferred: std.PriorityQueue(*Msg, void, Msg.less),
+                deferred: std.PriorityQueue(Msg, void, Msg.less),
                 // Pointer to the next message in the topic, null if we reached
                 // end of the topic.
                 // next: ?*Topic.Msg = null,
@@ -931,14 +930,14 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         .topic = topic,
                         .consumers = std.ArrayList(*Consumer).init(allocator),
                         .consumers_iterator = .{ .channel = self },
-                        .in_flight = std.AutoArrayHashMap(u64, *Msg).init(allocator),
-                        .deferred = std.PriorityQueue(*Msg, void, Msg.less).init(allocator, {}),
+                        .in_flight = std.AutoArrayHashMap(u64, Msg).init(allocator),
+                        .deferred = std.PriorityQueue(Msg, void, Msg.less).init(allocator, {}),
                         .timers = &topic.server.timers,
                         .now = &topic.server.now,
                         .timer_ts = infinite,
                         // Channel starts at the last topic message at the moment of channel creation
                         //.next = null,
-                        .msg_pool = &topic.server.channel_msg_pool,
+                        // .msg_pool = &topic.server.channel_msg_pool,
                         .ephemeral = protocol.isEphemeral(name),
                     };
                 }
@@ -949,14 +948,14 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
                 fn deinit(self: *Channel) void {
                     self.timers.remove(self);
-                    for (self.in_flight.values()) |cm| {
-                        self.allocator.free(cm.payload);
-                        self.msg_pool.destroy(cm);
-                    }
-                    while (self.deferred.removeOrNull()) |cm| {
-                        self.allocator.free(cm.payload);
-                        self.msg_pool.destroy(cm);
-                    }
+                    // for (self.in_flight.values()) |cm| {
+                    //     //self.allocator.free(cm.payload);
+                    //     self.msg_pool.destroy(cm);
+                    // }
+                    // while (self.deferred.removeOrNull()) |cm| {
+                    //     //self.allocator.free(cm.payload);
+                    //     self.msg_pool.destroy(cm);
+                    // }
                     self.in_flight.deinit();
                     self.deferred.deinit();
                     self.consumers.deinit();
@@ -1064,59 +1063,69 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     return self.topic.server.tsFromDelay(delay_ms);
                 }
 
-                fn addInFlightMany(
+                // Add many in flight messages with sequences from - to.
+                fn addInFlight(
                     self: *Channel,
                     from_sequence: u64,
                     to_sequence: u64,
                     socket: socket_t,
                     msg_timeout: u32,
                 ) !void {
-                    for (from_sequence..to_sequence + 1) |sequence|
-                        try self.addInFlight(sequence, socket, msg_timeout);
-                }
+                    const msgs_count: usize = @intCast(to_sequence - from_sequence + 1);
+                    try self.in_flight.ensureUnusedCapacity(msgs_count);
 
-                fn addInFlight(self: *Channel, sequence: u64, socket: socket_t, msg_timeout: u32) !void {
-                    try self.in_flight.ensureUnusedCapacity(1);
-                    const msg = try self.msg_pool.create();
-                    msg.* = .{
-                        .sequence = sequence,
-                        .sent_at = self.now.*,
-                        .in_flight_socket = socket,
-                        .timestamp = self.tsFromDelay(msg_timeout),
-                        .payload = &.{},
-                    };
-                    self.updateTimer(msg.timestamp);
-                    self.in_flight.putAssumeCapacityNoClobber(sequence, msg);
+                    const timestamp = self.tsFromDelay(msg_timeout);
+                    for (from_sequence..to_sequence + 1) |sequence| {
+                        const msg = Msg{
+                            .sequence = sequence,
+                            .in_flight_socket = socket,
+                            .timestamp = timestamp,
+                            .attempts = 1,
+                        };
+                        self.in_flight.putAssumeCapacityNoClobber(sequence, msg);
+                    }
+                    self.updateTimer(timestamp);
                 }
 
                 // Defer in flight message.
-                // Moves message from in_flight to the deferred.
-                fn deferInFlight(self: *Channel, msg: *Msg, delay: u32) !void {
+                // Moves message from in-flight to the deferred.
+                fn deferInFlight(self: *Channel, msg: Msg, delay: u32) !void {
                     try self.deferred.ensureUnusedCapacity(1);
-                    if (msg.payload.len == 0) {
-                        msg.payload = try self.allocator.dupe(u8, self.topic.store.message(msg.sequence));
-                        self.topic.store.fin(msg.sequence);
-                    }
-                    msg.incAttempts();
-                    msg.in_flight_socket = 0;
-                    msg.timestamp = if (delay == 0) 0 else self.tsFromDelay(delay);
-                    if (msg.timestamp > 0) self.updateTimer(msg.timestamp);
-                    self.deferred.add(msg) catch unreachable; // capacity is ensured
+                    const dmsg = Msg{
+                        .sequence = msg.sequence,
+                        .timestamp = if (delay == 0) 0 else self.tsFromDelay(delay),
+                        .in_flight_socket = 0,
+                        .attempts = msg.attempts + 1,
+                    };
+                    if (dmsg.timestamp > 0) self.updateTimer(dmsg.timestamp);
+                    self.deferred.add(dmsg) catch unreachable; // capacity is ensured
                     assert(self.in_flight.swapRemove(msg.sequence));
                 }
 
-                fn popDeferreed(self: *Channel, socket: socket_t, msg_timeout: u32) ?*Msg {
-                    if (self.deferred.peek()) |msg| if (msg.timestamp <= self.now.*) {
-                        self.in_flight.putNoClobber(msg.sequence, msg) catch |err| {
+                // Find deferred message, make copy of that message, set
+                // increased attempts to message payload, put it in-flight and
+                // return payload.
+                fn popDeferred(self: *Channel, socket: socket_t, msg_timeout: u32) ?[]const u8 {
+                    if (self.deferred.peek()) |dmsg| if (dmsg.timestamp <= self.now.*) {
+                        const payload = self.allocator.dupe(u8, self.topic.store.message(dmsg.sequence)) catch |err| {
+                            log.err("failed to duplicate message {}", .{err});
+                            return null;
+                        };
+                        dmsg.setAttempts(payload);
+                        self.in_flight.ensureUnusedCapacity(1) catch |err| {
                             log.err("failed to add in flight message {}", .{err});
                             return null;
                         };
-                        msg.sent_at = self.now.*;
-                        msg.timestamp = self.tsFromDelay(msg_timeout);
-                        msg.in_flight_socket = socket;
+                        const msg = Msg{
+                            .sequence = dmsg.sequence,
+                            .timestamp = self.tsFromDelay(msg_timeout),
+                            .in_flight_socket = socket,
+                            .attempts = dmsg.attempts,
+                        };
                         self.updateTimer(msg.timestamp);
+                        self.in_flight.putAssumeCapacityNoClobber(msg.sequence, msg);
                         _ = self.deferred.remove();
-                        return msg;
+                        return payload;
                     };
                     return null;
                 }
@@ -1151,22 +1160,40 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 // deferred queue.
                 // Returns next timeout for in flight messages.
                 fn inFlightTimeout(self: *Channel, now: u64) !u64 {
-                    var msgs = std.ArrayList(*Msg).init(self.allocator);
-                    defer msgs.deinit();
                     var ts: u64 = infinite;
-                    for (self.in_flight.values()) |msg| {
+
+                    const values = self.in_flight.values();
+                    var i = values.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const msg = values[i];
                         if (msg.timestamp <= now) {
-                            try msgs.append(msg);
+                            try self.deferInFlight(msg, 0);
+                            self.metric.timeout += 1;
+                            log.warn("{} message timeout {}", .{ msg.in_flight_socket, msg.sequence });
                         } else {
                             if (ts > msg.timestamp) ts = msg.timestamp;
                         }
                     }
-                    for (msgs.items) |msg| {
-                        log.warn("{} message timeout {}", .{ msg.in_flight_socket, msg.sequence });
-                        try self.deferInFlight(msg, 0);
-                    }
-                    self.metric.timeout += msgs.items.len;
+
                     return ts;
+
+                    // var msgs = std.ArrayList(Msg).init(self.allocator);
+                    // defer msgs.deinit();
+                    // var ts: u64 = infinite;
+                    // for (self.in_flight.values()) |msg| {
+                    //     if (msg.timestamp <= now) {
+                    //         try msgs.append(msg);
+                    //     } else {
+                    //         if (ts > msg.timestamp) ts = msg.timestamp;
+                    //     }
+                    // }
+                    // for (msgs.items) |msg| {
+                    //     log.warn("{} message timeout {}", .{ msg.in_flight_socket, msg.sequence });
+                    //     try self.deferInFlight(msg, 0);
+                    // }
+                    // self.metric.timeout += msgs.items.len;
+                    // return ts;
                 }
 
                 const ConsumersIterator = struct {
@@ -1194,29 +1221,42 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 pub const PopResult = struct {
                     data: []const u8,
                     msgs_count: u32 = 1,
+
+                    store: ?*Store = null,
+                    sequence: u64 = 0,
+                    allocator: ?mem.Allocator = null,
+
+                    pub fn done(self: PopResult) void {
+                        if (self.store) |store| {
+                            store.fin(self.sequence);
+                        }
+                        if (self.allocator) |allocator| {
+                            allocator.free(self.data);
+                        }
+                    }
                 };
 
                 pub fn popMsgs(self: *Channel, socket: socket_t, msg_timeout: u32, ready_count: u32) ?PopResult {
                     assert(ready_count > 0);
 
-                    if (self.popDeferreed(socket, msg_timeout)) |msg| {
-                        assert(msg.payload.len >= 34);
+                    if (self.popDeferred(socket, msg_timeout)) |data| {
+                        assert(data.len >= 34);
                         return .{
-                            .data = msg.payload,
+                            .data = data,
                             .msgs_count = 1,
+                            .allocator = self.allocator,
                         };
                     }
 
                     if (self.topic.store.next(self.sequence, ready_count)) |res| {
                         const msgs_count: u32 = @intCast(res.sequence.to - res.sequence.from + 1);
-                        self.addInFlightMany(res.sequence.from, res.sequence.to, socket, msg_timeout) catch |err| {
+                        self.addInFlight(res.sequence.from, res.sequence.to, socket, msg_timeout) catch |err| {
+                            // release store references
+                            self.topic.store.fin(res.sequence.from);
                             for (res.sequence.from..res.sequence.to + 1) |sequence| {
-                                if (self.in_flight.fetchSwapRemove(sequence)) |kv| {
-                                    self.msg_pool.destroy(kv.value);
-                                }
                                 self.topic.store.fin(sequence);
                             }
-                            log.err("failed to add {} in flight messages {}", .{ msgs_count, err });
+                            log.err("failed to add {} messages to in flight {}", .{ msgs_count, err });
                             return null;
                         };
 
@@ -1225,41 +1265,29 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         return .{
                             .data = res.data,
                             .msgs_count = msgs_count,
+                            .store = &self.topic.store,
+                            .sequence = res.sequence.from,
                         };
                     }
                     return null;
                 }
 
-                /// Consumer pops single message when ready to send more messages.
-                // pub fn popMsg(self: *Channel, consumer: *Consumer) !?*Msg {
-                //     var msg = (try self.nextMsg(consumer.msgTimeout())) orelse return null;
-                //     msg.sent_at = self.now.*;
-                //     msg.in_flight_socket = consumer.socket;
-                //     return msg;
-                // }
-
                 pub fn finish(self: *Channel, msg_id: [16]u8) bool {
                     const seq = Msg.seqFromId(msg_id);
-                    if (self.in_flight.fetchSwapRemove(seq)) |kv| {
-                        //std.debug.print("{} ", .{seq});
-                        const msg: *Msg = kv.value;
+                    if (self.in_flight.fetchSwapRemove(seq)) |_| {
                         self.metric.finish += 1;
                         self.metric.depth -= 1;
-                        if (msg.payload.len > 0)
-                            self.allocator.free(msg.payload)
-                        else
-                            self.topic.store.fin(seq);
-                        self.msg_pool.destroy(msg);
+                        self.topic.store.fin(seq);
                         return true;
                     }
                     return false;
                 }
 
-                /// Extend message timeout for interval (nanoseconds).
-                pub fn touch(self: *Channel, msg_id: [16]u8, interval: u64) bool {
+                /// Extend message timeout for interval (milliseconds).
+                pub fn touch(self: *Channel, msg_id: [16]u8, interval: u32) bool {
                     const seq = Msg.seqFromId(msg_id);
-                    if (self.in_flight.get(seq)) |msg| {
-                        msg.timestamp += interval;
+                    if (self.in_flight.getPtr(seq)) |msg| {
+                        msg.timestamp += nsFromMs(interval);
                         return true;
                     }
                     return false;
@@ -1294,14 +1322,17 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 // Requeue all messages which are in-flight on some consumer.
                 fn requeueAll(self: *Channel, consumer: *Consumer) !void {
                     const in_flight_socket = consumer.socket;
-                    var msgs = std.ArrayList(*Msg).init(self.allocator);
-                    defer msgs.deinit();
-                    for (self.in_flight.values()) |msg| {
-                        if (msg.in_flight_socket == in_flight_socket)
-                            try msgs.append(msg);
+
+                    const values = self.in_flight.values();
+                    var i = values.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const msg = values[i];
+                        if (msg.in_flight_socket == in_flight_socket) {
+                            try self.deferInFlight(msg, 0);
+                            self.metric.requeue += 1;
+                        }
                     }
-                    for (msgs.items) |msg| try self.deferInFlight(msg, 0);
-                    self.metric.requeue += msgs.items.len;
                 }
 
                 // Http admin interface  -----------------
@@ -2309,4 +2340,29 @@ test "dump/restore" {
     }
 
     try std.fs.cwd().deleteTree(dir_name);
+}
+
+test "hash map" {
+    var m = std.AutoArrayHashMap(usize, usize).init(testing.allocator);
+    defer m.deinit();
+
+    for (0..128) |i| {
+        try m.put(i, i);
+    }
+    const keys = m.keys();
+    assert(keys.len == 128);
+    var i = keys.len;
+    while (i > 0) {
+        i -= 1;
+        //for (m.keys()) |k| {
+        const k = keys[i];
+        if (k % 2 == 0) {
+            std.debug.print("removing k={}\n", .{k});
+            assert(m.swapRemove(k));
+        }
+    }
+    for (m.keys()) |k| {
+        std.debug.print("k={}\n", .{k});
+    }
+    assert(m.keys().len == 64);
 }

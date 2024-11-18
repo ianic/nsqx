@@ -38,6 +38,10 @@ const Page = struct {
         return self.capacity() - self.writePos();
     }
 
+    // With explicit ack_policy reference is raised for each message and one more
+    // for the first message. That first reference should be released when
+    // buffer is no more required by kernel. Other references should be released
+    // when that message is no more needed.
     fn next(self: *Self, sequence: u64, ready_count: u32, ack_policy: AckPolicy) NextResult {
         assert(ready_count > 0);
         assert(sequence < self.last());
@@ -46,7 +50,7 @@ const Page = struct {
         if (sequence < self.first()) {
             const no_msgs = @min(msgs_count, ready_count);
             const end_idx = no_msgs - 1;
-            if (ack_policy == .explicit) self.rc += no_msgs;
+            if (ack_policy == .explicit) self.rc += no_msgs + 1;
             const data = self.buf[0..self.offsets.items[end_idx]];
             return .{
                 .data = data,
@@ -58,7 +62,7 @@ const Page = struct {
         const start_idx: u32 = @intCast(sequence - self.first());
         const end_idx: u32 = @min(msgs_count - 1, start_idx + ready_count);
         const no_msgs: u32 = end_idx - start_idx;
-        if (ack_policy == .explicit) self.rc += no_msgs;
+        if (ack_policy == .explicit) self.rc += no_msgs + 1;
         const data = self.buf[self.offsets.items[start_idx]..self.offsets.items[end_idx]];
         return .{
             .data = data,
@@ -380,7 +384,7 @@ test "topic usage" {
         sub_1_seq = res1.sequence.to;
 
         // each message holds reference when ack is explicit
-        try testing.expectEqual(4, store.pages.items[0].rc);
+        try testing.expectEqual(5, store.pages.items[0].rc);
         try testing.expectEqual(0, store.pages.items[1].rc);
         try testing.expectEqual(1, store.pages.items[2].rc);
 
@@ -388,13 +392,14 @@ test "topic usage" {
         try testing.expectEqualStrings("890123", res2.data);
 
         // subscriber's reference is moved to the second page
-        try testing.expectEqual(3, store.pages.items[0].rc);
-        try testing.expectEqual(3, store.pages.items[1].rc);
+        try testing.expectEqual(4, store.pages.items[0].rc);
+        try testing.expectEqual(4, store.pages.items[1].rc);
         try testing.expectEqual(1, store.pages.items[2].rc);
 
         // fin messages in flight release first page
         try testing.expectEqual(3, store.pages.items.len);
         for (res1.sequence.from..res1.sequence.to + 1) |seq| store.fin(seq);
+        store.fin(res1.sequence.from);
         try testing.expectEqual(2, store.pages.items.len);
     }
 }
@@ -644,27 +649,27 @@ test "ack policy" {
     var res = store.next(100, 2).?;
     try testing.expectEqual(101, res.sequence.from);
     try testing.expectEqual(102, res.sequence.to);
-    try testing.expectEqual(2, store.pages.items[0].rc);
-
-    res = store.next(102, 2).?;
-    try testing.expectEqual(103, res.sequence.from);
-    try testing.expectEqual(104, res.sequence.to);
-    try testing.expectEqual(4, store.pages.items[0].rc);
+    try testing.expectEqual(3, store.pages.items[0].rc);
 
     res = store.next(102, 2).?;
     try testing.expectEqual(103, res.sequence.from);
     try testing.expectEqual(104, res.sequence.to);
     try testing.expectEqual(6, store.pages.items[0].rc);
 
+    res = store.next(102, 2).?;
+    try testing.expectEqual(103, res.sequence.from);
+    try testing.expectEqual(104, res.sequence.to);
+    try testing.expectEqual(9, store.pages.items[0].rc);
+
     res = store.next(104, 10).?;
     try testing.expectEqual(105, res.sequence.from);
     try testing.expectEqual(106, res.sequence.to);
-    try testing.expectEqual(8, store.pages.items[0].rc);
+    try testing.expectEqual(12, store.pages.items[0].rc);
 
     res = store.next(100, 6).?;
     try testing.expectEqual(101, res.sequence.from);
     try testing.expectEqual(106, res.sequence.to);
-    try testing.expectEqual(8 + 6, store.pages.items[0].rc);
+    try testing.expectEqual(19, store.pages.items[0].rc);
 
     try testing.expectEqualStrings("0", store.message(101));
     try testing.expectEqualStrings("1", store.message(102));

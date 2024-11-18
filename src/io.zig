@@ -700,8 +700,8 @@ pub const SendOp = struct {
     // limits number of messages in a batch to 512.
     // ref: https://man7.org/linux/man-pages/man2/readv.2.html
     const max_capacity = 1024;
-    // Start with one message (header and body) capacity
-    const initial_capacity = 2;
+    // Start with few messages (header and body) capacity
+    const initial_capacity = 8;
     const Self = @This();
 
     pub fn init(
