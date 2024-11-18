@@ -108,7 +108,7 @@ pub const Conn = struct {
 
     recv_op: Op = .{},
     send_op: SendOp = .{},
-    send_chunk: ?Channel.PopResult = null,
+    send_chunk: ?Channel.SendChunk = null,
     shutdown_op: Op = .{},
     pending_responses: std.ArrayList(Response),
     ready_count: u32 = 0,
@@ -170,6 +170,10 @@ pub const Conn = struct {
 
     // Channel api -----------------
 
+    pub fn id(self: *Conn) u32 {
+        return @intCast(self.socket);
+    }
+
     /// Consumer setting
     pub fn msgTimeout(self: *Conn) u32 {
         return self.identify.msg_timeout;
@@ -211,7 +215,7 @@ pub const Conn = struct {
                     const ready_count = self.ready_count - self.in_flight;
 
                     if (self.send_op.free() > 0) {
-                        if (channel.popMsgs(self.socket, self.msgTimeout(), ready_count)) |res| {
+                        if (channel.popMsgs(self.id(), self.msgTimeout(), ready_count)) |res| {
                             self.send_op.prep(res.data);
                             self.send_chunk = res;
                             self.metric.send +%= res.msgs_count;
@@ -298,6 +302,9 @@ pub const Conn = struct {
                 error.TopicMemoryOverflow,
                 error.TopicMessagesOverflow,
                 => try self.respond(.pub_failed),
+                error.MessageNotInFlight => {
+                    log.warn("{} message not in flight, operation {s} ", .{ self.socket, @tagName(msg) });
+                },
                 else => return err,
             };
         }
@@ -361,13 +368,9 @@ pub const Conn = struct {
             .finish => |msg_id| {
                 var channel = self.channel orelse return error.NotSubscribed;
                 self.in_flight -|= 1;
-                const res = channel.finish(msg_id);
-                if (res) {
-                    self.metric.finish += 1;
-                    log.debug("{} finish {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
-                } else {
-                    log.warn("{} finish {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
-                }
+                try channel.finish(self.id(), msg_id);
+                self.metric.finish += 1;
+                log.debug("{} finish {}", .{ self.socket, Msg.seqFromId(msg_id) });
             },
             .requeue => |arg| {
                 var channel = self.channel orelse return error.NotSubscribed;
@@ -376,14 +379,14 @@ pub const Conn = struct {
                     options.max_req_timeout
                 else
                     arg.delay;
-                const res = try channel.requeue(arg.msg_id, delay);
-                if (res) self.metric.requeue += 1;
-                log.debug("{} requeue {} {}", .{ self.socket, Msg.seqFromId(arg.msg_id), res });
+                try channel.requeue(self.id(), arg.msg_id, delay);
+                self.metric.requeue += 1;
+                log.debug("{} requeue {}", .{ self.socket, Msg.seqFromId(arg.msg_id) });
             },
             .touch => |msg_id| {
                 var channel = self.channel orelse return error.NotSubscribed;
-                const res = channel.touch(msg_id, self.msgTimeout());
-                log.debug("{} touch {} {}", .{ self.socket, Msg.seqFromId(msg_id), res });
+                try channel.touch(self.id(), msg_id, self.msgTimeout());
+                log.debug("{} touch {}", .{ self.socket, Msg.seqFromId(msg_id) });
             },
             .close => {
                 self.ready_count = 0;
