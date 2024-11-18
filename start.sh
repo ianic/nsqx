@@ -23,14 +23,14 @@ lookupd3_pid=$!
 lookupd_pid=$!
 
 # starting another lookupd
-~/Code/go/nsq/apps/nsqlookupd/nsqlookupd \
+~/Code/go/nsq/build/nsqlookupd \
     -http-address localhost:4163 \
     -tcp-address localhost:4162  \
     -broadcast-address localhost > tmp/lookupd2 2>&1 &
 lookupd2_pid=$!
 
 # admin
-~/Code/go/nsq/apps/nsqadmin/nsqadmin \
+~/Code/go/nsq/build/nsqadmin \
     -lookupd-http-address localhost:4161 \
     -lookupd-http-address localhost:4163 > tmp/nsqadmin 2>&1 &
 admin_pid=$!

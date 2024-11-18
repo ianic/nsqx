@@ -22,9 +22,9 @@ go build
 cd ~/Code/nsql
 rm -f ./tmp/nsql.dump ./tmp/sub_bench
 
-#./zig-out/bin/nsql --statsd-address localhost --statsd-prefix "" > tmp/nsql 2>&1 &
+# ./zig-out/bin/nsql --statsd-address localhost --statsd-prefix "" > tmp/nsql 2>&1 &
 ./zig-out/bin/nsql --data-path ./tmp > tmp/nsql 2>&1 &
-# valgrind --tool=callgrind ./zig-out/bin/nsql --data-path ./tmp > tmp/nsql 2>&1 &
+# sudo valgrind --tool=callgrind ./zig-out/bin/nsql --data-path ./tmp > tmp/nsql 2>&1 &
 # ~/Code/go/nsq/apps/nsqd/nsqd --mem-queue-size=100000000 > tmp/nsql 2>&1 &
 nsqd_pid=$!
 
@@ -38,7 +38,7 @@ writer_pid=$!
 sh -c 'while ~/Code/go/nsq/bench/bench_reader/bench_reader --size 200 --runfor 10s; do : ; done' &
 reader_pid=$!
 
-~/Code/go/nsq/apps/nsqadmin/nsqadmin --nsqd-http-address localhost:4151 >> /dev/null 2>&1 &
+~/Code/go/nsq/build/nsqadmin --nsqd-http-address localhost:4151 >> /dev/null 2>&1 &
 admin_pid=$!
 
 cleanup() {
