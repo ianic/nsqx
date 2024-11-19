@@ -24,8 +24,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         pub const Channel = ChannelType();
 
         allocator: mem.Allocator,
-        // channel_msg_pool: std.heap.MemoryPool(Channel.Msg),
-        // topic_msg_pool: std.heap.MemoryPool(Topic.Msg),
         topics: std.StringHashMap(*Topic),
         notifier: *Notifier,
         limits: Limits,
@@ -44,8 +42,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         pub fn init(allocator: mem.Allocator, notifier: *Notifier, now: u64, limits: Limits) Server {
             return .{
                 .allocator = allocator,
-                //.channel_msg_pool = std.heap.MemoryPool(Channel.Msg).init(allocator),
-                // .topic_msg_pool = std.heap.MemoryPool(Topic.Msg).init(allocator),
                 .topics = std.StringHashMap(*Topic).init(allocator),
                 .notifier = notifier,
                 .started_at = now,
@@ -60,8 +56,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
             while (iter.next()) |e| self.deinitTopic(e.value_ptr.*);
             self.topics.deinit();
             self.timers.deinit();
-            // self.channel_msg_pool.deinit();
-            // self.topic_msg_pool.deinit();
         }
 
         fn deinitTopic(self: *Server, topic: *Topic) void {
@@ -485,7 +479,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 paused: bool = false,
                 metric: Metric = .{},
                 metric_prev: Metric = .{},
-                // msg_pool: *std.heap.MemoryPool(Msg),
 
                 store: Store,
 
@@ -518,7 +511,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         .name = name,
                         .channels = std.StringHashMap(*Channel).init(allocator),
                         .server = server,
-                        // .msg_pool = &server.topic_msg_pool,
                         .store = Store.init(allocator, .{
                             .ack_policy = .explicit,
                             .deliver_policy = .all,
