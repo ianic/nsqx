@@ -16,7 +16,7 @@ const Error = @import("io.zig").Error;
 const lookup = @import("lookup.zig");
 pub const Server = @import("server.zig").ServerType(Conn, lookup.Connector);
 const Channel = Server.Channel;
-const Msg = Server.Channel.Msg;
+const seqFromId = Server.Channel.InFlightMsg.seqFromId;
 const TimerQueue = @import("server.zig").TimerQueue;
 
 const log = std.log.scoped(.tcp);
@@ -370,7 +370,7 @@ pub const Conn = struct {
                 self.in_flight -|= 1;
                 try channel.finish(self.id(), msg_id);
                 self.metric.finish += 1;
-                log.debug("{} finish {}", .{ self.socket, Msg.seqFromId(msg_id) });
+                log.debug("{} finish {}", .{ self.socket, seqFromId(msg_id) });
             },
             .requeue => |arg| {
                 var channel = self.channel orelse return error.NotSubscribed;
@@ -381,12 +381,12 @@ pub const Conn = struct {
                     arg.delay;
                 try channel.requeue(self.id(), arg.msg_id, delay);
                 self.metric.requeue += 1;
-                log.debug("{} requeue {}", .{ self.socket, Msg.seqFromId(arg.msg_id) });
+                log.debug("{} requeue {}", .{ self.socket, seqFromId(arg.msg_id) });
             },
             .touch => |msg_id| {
                 var channel = self.channel orelse return error.NotSubscribed;
                 try channel.touch(self.id(), msg_id, self.msgTimeout());
-                log.debug("{} touch {}", .{ self.socket, Msg.seqFromId(msg_id) });
+                log.debug("{} touch {}", .{ self.socket, seqFromId(msg_id) });
             },
             .close => {
                 self.ready_count = 0;
