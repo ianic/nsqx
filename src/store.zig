@@ -224,10 +224,7 @@ pub const Store = struct {
     }
 
     fn findPage(self: Self, sequence: u64) ?*Page {
-        var i: usize = self.pages.items.len;
-        while (i > 0) {
-            i -= 1;
-            var page = &self.pages.items[i];
+        for (self.pages.items) |*page| {
             if (page.contains(sequence)) return page;
         }
         return null;
