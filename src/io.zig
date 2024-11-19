@@ -231,6 +231,7 @@ pub const Op = struct {
         sendv: struct {
             socket: socket_t,
             msghdr: *posix.msghdr_const,
+            zero_copy: bool,
         },
         send: struct {
             socket: socket_t,
@@ -313,7 +314,10 @@ pub const Op = struct {
             .connect => |*arg| _ = try io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen()),
             .close => |*arg| _ = try io.ring.close(@intFromPtr(op), arg.socket),
             .recv => |socket| _ = try io.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
-            .sendv => |*arg| _ = try io.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
+            .sendv => |*arg| _ = if (arg.zero_copy)
+                try io.ring.sendmsg_zc(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL)
+            else
+                try io.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
             .send => |*arg| _ = try io.ring.send(@intFromPtr(op), arg.socket, arg.buf, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
             .timer => |*arg| _ = try io.ring.timeout(@intFromPtr(op), &arg.ts, arg.count, arg.flags),
             .socket => |*arg| _ = try io.ring.socket(@intFromPtr(op), arg.domain, arg.socket_type, arg.protocol, 0),
@@ -417,36 +421,62 @@ pub const Op = struct {
         comptime success: fn (@TypeOf(context)) Error!void,
         comptime fail: fn (@TypeOf(context), anyerror) Error!void,
     ) Op {
+        return sendv_(socket, msghdr, context, success, fail, false);
+    }
+
+    pub fn sendv_zc(
+        socket: socket_t,
+        msghdr: *posix.msghdr_const,
+        context: anytype,
+        comptime success: fn (@TypeOf(context)) Error!void,
+        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
+    ) Op {
+        return sendv_(socket, msghdr, context, success, fail, true);
+    }
+
+    fn sendv_(
+        socket: socket_t,
+        msghdr: *posix.msghdr_const,
+        context: anytype,
+        comptime success: fn (@TypeOf(context)) Error!void,
+        comptime fail: fn (@TypeOf(context), anyerror) Error!void,
+        zero_copy: bool,
+    ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
             fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
-                        const n: usize = @intCast(cqe.res);
-                        io.metric.send_bytes +%= n;
+                        const sent_bytes: usize = @intCast(cqe.res);
+                        io.metric.send_bytes +%= sent_bytes;
 
-                        // zero copy send handling
-                        // if (cqe.flags & linux.IORING_CQE_F_MORE > 0) {
-                        //     log.debug("{} send_zc f_more {}", .{ op.args.sendv.socket, n });
-                        //     return .has_more;
-                        // }
-                        // if (cqe.flags & linux.IORING_CQE_F_NOTIF > 0) {
-                        //     log.debug("{} send_zc f_notif {}", .{ op.args.sendv.socket, n });
-                        //     try sent(ctx, n);
-                        //     return .done;
-                        // }
+                        var data_len: usize = 0;
+                        const mh = op.args.sendv.msghdr;
+                        for (0..@intCast(mh.iovlen)) |i| data_len += mh.iov[i].len;
 
-                        var m: usize = 0;
-                        for (0..@intCast(op.args.sendv.msghdr.iovlen)) |i|
-                            m += op.args.sendv.msghdr.iov[i].len;
+                        if (op.args.sendv.zero_copy) {
+                            if (cqe.flags & linux.IORING_CQE_F_NOTIF > 0) {
+                                op.args.sendv.msghdr.iovlen = 0;
+                                return try success(ctx);
+                            } else if (cqe.flags & linux.IORING_CQE_F_MORE > 0) {
+                                op.args.sendv.msghdr.iovlen = 0;
+                                if (sent_bytes < data_len) {
+                                    log.err("{} unexpected short send len: {} sent: {}", .{ op.args.sendv.socket, data_len, sent_bytes });
+                                    return fail(ctx, error.ShortSend);
+                                }
+                                return;
+                            }
+                            unreachable;
+                        }
+
                         // While sending with MSG_WAITALL we don't expect to get short send
-                        if (n < m) {
-                            log.warn("{} unexpected short send len: {} sent: {}", .{ op.args.sendv.socket, m, n });
+                        if (sent_bytes < data_len) {
+                            log.warn("{} unexpected short send len: {} sent: {}", .{ op.args.sendv.socket, data_len, sent_bytes });
                             var v: []posix.iovec_const = undefined;
                             v.ptr = @constCast(op.args.sendv.msghdr.iov);
                             v.len = @intCast(op.args.sendv.msghdr.iovlen);
-                            v = resizeIovec(v, n);
+                            v = resizeIovec(v, sent_bytes);
                             if (v.len > 0) { // restart on short send
                                 op.args.sendv.msghdr.iov = v.ptr;
                                 op.args.sendv.msghdr.iovlen = @intCast(v.len);
@@ -468,7 +498,7 @@ pub const Op = struct {
             .context = @intFromPtr(context),
             .callback = wrapper.complete,
             .args = .{
-                .sendv = .{ .socket = socket, .msghdr = msghdr },
+                .sendv = .{ .socket = socket, .msghdr = msghdr, .zero_copy = zero_copy },
             },
         };
     }
@@ -732,10 +762,20 @@ pub const SendOp = struct {
 
     /// Submit io operation with all prepared buffers.
     pub fn send(self: *Self, io: *Io) void {
+        self.op.args.sendv.zero_copy = false;
+        self.send_(io);
+    }
+
+    fn send_(self: *Self, io: *Io) void {
         assert(self.msghdr.iov == self.iov.ptr);
         assert(self.op.args.sendv.msghdr == &self.msghdr);
         io.submit(&self.op);
         // io will reset msghdr to 0 after operation completion
+    }
+
+    pub fn send_zc(self: *Self, io: *Io) void {
+        self.op.args.sendv.zero_copy = true;
+        self.send_(io);
     }
 
     /// Extends iov to want_capacity if that is less then max_capacity.

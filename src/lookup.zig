@@ -334,7 +334,8 @@ const Conn = struct {
         // log.debug("{} shutdown state: {s}", .{ self.address, @tagName(self.state) });
         switch (self.state) {
             .connecting, .connected => {
-                self.connector.store.unsubscribe(self.sequence);
+                if (self.state == .connected)
+                    self.connector.store.unsubscribe(self.sequence);
                 self.recv_buf.free();
                 self.state = .closing;
                 self.shutdown();

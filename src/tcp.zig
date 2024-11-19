@@ -194,14 +194,6 @@ pub const Conn = struct {
     pub fn wakeup(self: *Conn) !void {
         if (self.send_op.active() or self.state != .connected) return;
 
-        // { // resize sendv
-        //     const want_send_capacity = @max(
-        //         self.ready_count * 2,
-        //         self.pending_responses.items.len,
-        //     );
-        //     try self.send_op.ensureCapacity(self.allocator, want_send_capacity);
-        // }
-
         { // prepare pending responses
             while (self.send_op.free() > 0) {
                 const rsp = self.pending_responses.popOrNull() orelse break;
@@ -217,6 +209,7 @@ pub const Conn = struct {
                     if (self.send_op.free() > 0) {
                         if (channel.popMsgs(self.id(), self.msgTimeout(), ready_count)) |res| {
                             self.send_op.prep(res.data);
+
                             self.send_chunk = res;
                             self.metric.send +%= res.msgs_count;
                             self.in_flight += res.msgs_count;

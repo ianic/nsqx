@@ -142,6 +142,7 @@ pub const Store = struct {
     last_sequence: u64 = 0,
 
     pub fn init(allocator: mem.Allocator, options: Options) Self {
+        assert(options.page_size > 0);
         return .{
             .allocator = allocator,
             .options = options,
@@ -164,6 +165,10 @@ pub const Store = struct {
 
     pub fn alloc(self: *Self, bytes_count: u32) !AllocResult {
         if (self.pages.items.len == 0 or self.pages.getLast().free() < bytes_count) {
+            // if (self.pages.items.len > 2) {
+            //     self.options.page_size *|= 2;
+            // }
+            // std.debug.print("{} page size {}\n", .{ self.pages.items.len, self.options.page_size });
             // add new page
             try self.pages.append(
                 Page{
@@ -182,21 +187,8 @@ pub const Store = struct {
     }
 
     pub fn append(self: *Self, bytes: []const u8) !void {
-        if (self.pages.items.len == 0 or
-            self.pages.getLast().free() < bytes.len)
-        { // add new page
-            try self.pages.append(
-                Page{
-                    .rc = if (self.pages.items.len == 0) self.consumers else 0,
-                    .first_sequence = 1 + self.last_sequence,
-                    .buf = try self.allocator.alloc(u8, @max(self.options.page_size, bytes.len)),
-                    .offsets = std.ArrayList(u32).init(self.allocator),
-                },
-            );
-        }
-        self.last_sequence += 1;
-        // Append to last page
-        return self.lastPage().?.append(bytes);
+        const res = try self.alloc(@intCast(bytes.len));
+        @memcpy(res.data, bytes);
     }
 
     fn lastPage(self: *Self) ?*Page {

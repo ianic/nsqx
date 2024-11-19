@@ -523,7 +523,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                             .ack_policy = .explicit,
                             .deliver_policy = .all,
                             .retention_policy = .all,
-                            .page_size = 1 * 1024 * 1024,
+                            .page_size = 1024 * 1024,
                         }),
                     };
                 }
@@ -565,11 +565,9 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     const channel = try self.getOrCreateChannel(name);
                     try channel.subscribe(consumer);
 
-                    if (first_channel) { // First channel gets all messages from the topic
-                        // Move hard pointer to channel, makes first weak.
-                        // channel.next = self.first;
+                    if (first_channel) {
+                        // First channel gets all messages from the topic
                         channel.metric.depth = self.metric.depth;
-
                         self.store.options.retention_policy = .interest;
                         self.store.options.deliver_policy = .new;
                     }
@@ -735,8 +733,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     var iter = self.channels.valueIterator();
                     while (iter.next()) |ptr| {
                         const channel = ptr.*;
-                        channel.topicAppended();
-                        channel.metric.depth += msgs;
+                        channel.topicAppended(msgs);
                     }
                 }
 
@@ -901,7 +898,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 // -----------------
 
                 // Called from topic when new topic message is created.
-                fn topicAppended(self: *Channel) void {
+                fn topicAppended(self: *Channel, msgs: u32) void {
+                    self.metric.depth += msgs;
                     self.wakeup() catch |err| {
                         if (!builtin.is_test)
                             log.err("fail to wakeup channel {s}: {}", .{ self.name, err });
@@ -1145,10 +1143,10 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     const ifm = self.in_flight.get(sequence) orelse return error.MessageNotInFlight;
                     if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
 
-                    self.metric.finish += 1;
-                    self.metric.depth -= 1;
                     self.topic.store.fin(sequence);
                     assert(self.in_flight.swapRemove(sequence));
+                    self.metric.finish += 1;
+                    self.metric.depth -|= 1;
                 }
 
                 /// Extend message timeout for interval (milliseconds).
@@ -2235,4 +2233,8 @@ test "hash map" {
 test "sizeOf" {
     std.debug.print("{}\n", .{@sizeOf(TestServer.Channel.InFlightMsg)});
     std.debug.print("{}\n", .{@sizeOf(TestServer.Channel.DeferredMsg)});
+
+    var x: u64 = 0;
+    x -|= 1;
+    std.debug.print("x={}\n", .{x});
 }
