@@ -826,7 +826,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 timers: *TimerQueue(Channel),
                 now: *u64,
                 // Sent but not jet acknowledged (fin) messages.
-                in_flight: std.AutoArrayHashMap(u64, InFlightMsg),
+                in_flight: std.AutoHashMap(u64, InFlightMsg),
                 // Re-queued by consumer, timed-out or defer published messages.
                 deferred: std.PriorityQueue(DeferredMsg, void, DeferredMsg.less),
 
@@ -863,7 +863,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         .topic = topic,
                         .consumers = std.ArrayList(*Consumer).init(allocator),
                         .consumers_iterator = .{ .channel = self },
-                        .in_flight = std.AutoArrayHashMap(u64, InFlightMsg).init(allocator),
+                        .in_flight = std.AutoHashMap(u64, InFlightMsg).init(allocator),
                         .deferred = std.PriorityQueue(DeferredMsg, void, DeferredMsg.less).init(allocator, {}),
                         .timers = &topic.server.timers,
                         .now = &topic.server.now,
@@ -940,7 +940,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     consumer_id: u32,
                     msg_timeout: u32,
                 ) !void {
-                    const msgs_count: usize = @intCast(to_sequence - from_sequence + 1);
+                    const msgs_count: u32 = @intCast(to_sequence - from_sequence + 1);
                     try self.in_flight.ensureUnusedCapacity(msgs_count);
 
                     const timeout_at = self.tsFromDelay(msg_timeout);
@@ -966,7 +966,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     };
                     if (dm.defer_until > 0) self.updateTimer(dm.defer_until);
                     self.deferred.add(dm) catch unreachable; // capacity is ensured
-                    assert(self.in_flight.swapRemove(sequence));
+                    assert(self.in_flight.remove(sequence));
                 }
 
                 // Find deferred message, make copy of that message, set
@@ -1026,25 +1026,32 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 // deferred queue.
                 // Returns next timeout for in flight messages.
                 fn inFlightTimeout(self: *Channel, now: u64) !u64 {
-                    var ts: u64 = infinite;
+                    var next_timeout: u64 = infinite;
 
-                    const keys = self.in_flight.keys();
-                    const values = self.in_flight.values();
-                    var i = values.len;
-                    while (i > 0) {
-                        i -= 1;
-                        const msg = values[i];
-                        if (msg.timeout_at <= now) {
-                            const sequence = keys[i];
-                            try self.deferInFlight(sequence, msg, 0);
-                            self.metric.timeout += 1;
-                            log.warn("{} message timeout {}", .{ msg.consumer_id, sequence });
+                    // iterate over all in_flight messages
+                    // find expired and next timeout
+                    var expired = std.ArrayList(u64).init(self.allocator);
+                    var iter = self.in_flight.iterator();
+                    while (iter.next()) |e| {
+                        const timeout_at = e.value_ptr.timeout_at;
+                        if (timeout_at <= now) {
+                            const sequence = e.key_ptr.*;
+                            try expired.append(sequence);
                         } else {
-                            if (ts > msg.timeout_at) ts = msg.timeout_at;
+                            if (next_timeout > timeout_at)
+                                next_timeout = timeout_at;
                         }
                     }
 
-                    return ts;
+                    // defer expired messages
+                    for (expired.items) |sequence| {
+                        const msg = self.in_flight.get(sequence).?;
+                        try self.deferInFlight(sequence, msg, 0);
+                        self.metric.timeout += 1;
+                        log.warn("{} message timeout {}", .{ msg.consumer_id, sequence });
+                    }
+
+                    return next_timeout;
                 }
 
                 const ConsumersIterator = struct {
@@ -1136,7 +1143,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
 
                     self.topic.store.fin(sequence);
-                    assert(self.in_flight.swapRemove(sequence));
+                    assert(self.in_flight.remove(sequence));
                     self.metric.finish += 1;
                     self.metric.depth -|= 1;
                 }
@@ -1177,17 +1184,20 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
                 // Re-queue all messages which are in-flight on some consumer.
                 fn requeueAll(self: *Channel, consumer: *Consumer) !void {
-                    const keys = self.in_flight.keys();
-                    const values = self.in_flight.values();
-                    var i = values.len;
-                    while (i > 0) {
-                        i -= 1;
-                        const msg = values[i];
-                        if (msg.consumer_id == consumer.id()) {
-                            const sequence = keys[i];
-                            try self.deferInFlight(sequence, msg, 0);
-                            self.metric.requeue += 1;
+                    var sequences = std.ArrayList(u64).init(self.allocator);
+                    var iter = self.in_flight.iterator();
+                    while (iter.next()) |e| {
+                        if (e.value_ptr.consumer_id == consumer.id()) {
+                            const sequence = e.key_ptr.*;
+                            try sequences.append(sequence);
                         }
+                    }
+
+                    for (sequences.items) |sequence| {
+                        const msg = self.in_flight.get(sequence).?;
+                        try self.deferInFlight(sequence, msg, 0);
+                        self.metric.requeue += 1;
+                        // log.debug("{} message requeue {}", .{ msg.consumer_id, sequence });
                     }
                 }
 
@@ -1203,35 +1213,25 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn empty(self: *Channel) !void {
-                    _ = self;
-                    // { // Remove in-flight messages that are not currently in the kernel.
-                    //     var msgs = std.ArrayList(*Msg).init(self.allocator);
-                    //     defer msgs.deinit();
-                    //     for (self.consumers.items) |consumer| { // For each consumer
-                    //         for (self.in_flight.values()) |cm| {
-                    //             if (cm.in_flight_socket == consumer.socket and // If that messages is in-flight on that consumer
-                    //                 cm.sent_at < consumer.sent_at) // And send is returned from kernel
-                    //                 try msgs.append(cm);
-                    //         }
-                    //     }
-                    //     if (msgs.items.len == self.in_flight.count()) { // Hopefully there is no messages in the kernel
-                    //         // Remove all
-                    //         for (self.in_flight.values()) |cm| cm.destroy(self.msg_pool);
-                    //         self.in_flight.clearAndFree();
-                    //     } else {
-                    //         // Selectively remove
-                    //         for (msgs.items) |cm| {
-                    //             assert(self.in_flight.swapRemove(cm.sequence()));
-                    //             cm.destroy(self.msg_pool);
-                    //         }
-                    //     }
-                    // }
-                    // // Remove all deferred messages.
-                    // while (self.deferred.removeOrNull()) |cm| cm.destroy(self.msg_pool);
-                    // // Position to the end of the topic.
-                    // if (self.next) |n| n.release();
-                    // self.next = null;
-                    // self.metric.depth = self.in_flight.count();
+                    { // release in_flight messages
+                        var iter = self.in_flight.keyIterator();
+                        while (iter.next()) |e| {
+                            self.topic.store.fin(e.*);
+                        }
+                        self.in_flight.clearAndFree();
+                    }
+                    { // release deferred messages
+                        var iter = self.deferred.iterator();
+                        while (iter.next()) |dm| {
+                            self.topic.store.fin(dm.sequence);
+                        }
+                        self.deferred.shrinkAndFree(0);
+                    }
+                    { // move store pointer
+                        self.topic.store.unsubscribe(self.sequence);
+                        self.sequence = self.topic.store.subscribe();
+                        self.metric.depth = 0;
+                    }
                 }
             };
         }
