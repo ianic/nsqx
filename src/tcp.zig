@@ -207,7 +207,10 @@ pub const Conn = struct {
                     const ready_count = self.ready_count - self.in_flight;
 
                     if (self.send_op.free() > 0) {
-                        if (channel.popMsgs(self.id(), self.msgTimeout(), ready_count)) |res| {
+                        if (channel.pull(self.id(), self.msgTimeout(), ready_count) catch |err| brk: {
+                            log.err("{} failed to pull from channel {}", .{ self.socket, err });
+                            break :brk null;
+                        }) |res| {
                             self.send_op.prep(res.data);
 
                             self.send_chunk = res;
@@ -331,7 +334,7 @@ pub const Conn = struct {
                 log.debug("{} identify {}", .{ self.socket, identify });
             },
             .subscribe => |arg| {
-                self.channel = try server.subscribe(self, arg.topic, arg.channel);
+                try server.subscribe(self, arg.topic, arg.channel);
                 try self.respond(.ok);
                 log.debug("{} subscribe: {s} {s}", .{ self.socket, arg.topic, arg.channel });
             },

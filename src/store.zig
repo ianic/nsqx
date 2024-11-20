@@ -174,11 +174,13 @@ pub const Store = struct {
             // }
             // std.debug.print("{} page size {}\n", .{ self.pages.items.len, self.options.page_size });
             // add new page
+            const buf = try self.allocator.alloc(u8, @max(self.options.page_size, bytes_count));
+            errdefer self.allocator.free(buf);
             try self.pages.append(
                 Page{
                     .rc = if (self.pages.items.len == 0) self.consumers.head else 0,
                     .first_sequence = 1 + self.last_sequence,
-                    .buf = try self.allocator.alloc(u8, @max(self.options.page_size, bytes_count)),
+                    .buf = buf,
                     .offsets = std.ArrayList(u32).init(self.allocator),
                 },
             );
@@ -263,7 +265,7 @@ pub const Store = struct {
     pub fn unsubscribe(self: *Self, sequence: u64) void {
         self.consumers.count -= 1;
         if (sequence == 0) {
-            self.consumers.head -= 1;
+            self.consumers.head -|= 1;
             return;
         }
         if (sequence == self.last_sequence) {
