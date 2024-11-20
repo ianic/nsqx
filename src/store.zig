@@ -138,7 +138,11 @@ pub const Store = struct {
     allocator: mem.Allocator,
     options: Options,
     pages: std.ArrayList(Page),
-    consumers: u32 = 0,
+    consumers: struct {
+        count: u32 = 0,
+        head: u32 = 0,
+        tail: u32 = 0,
+    } = .{},
     last_sequence: u64 = 0,
 
     pub fn init(allocator: mem.Allocator, options: Options) Self {
@@ -172,7 +176,7 @@ pub const Store = struct {
             // add new page
             try self.pages.append(
                 Page{
-                    .rc = if (self.pages.items.len == 0) self.consumers else 0,
+                    .rc = if (self.pages.items.len == 0) self.consumers.head else 0,
                     .first_sequence = 1 + self.last_sequence,
                     .buf = try self.allocator.alloc(u8, @max(self.options.page_size, bytes_count)),
                     .offsets = std.ArrayList(u32).init(self.allocator),
@@ -180,6 +184,8 @@ pub const Store = struct {
             );
         }
         self.last_sequence += 1;
+        self.consumers.tail = 0;
+
         const page = self.lastPage().?;
         const data = try page.alloc(bytes_count);
         assert(self.last_sequence == page.last());
@@ -223,18 +229,28 @@ pub const Store = struct {
     }
 
     pub fn subscribe(self: *Self) u64 {
-        self.consumers += 1;
+        self.consumers.count += 1;
         switch (self.options.deliver_policy) {
             .new => {
-                if (self.lastPage()) |p| p.rc += 1;
-            },
-            .all => {
-                if (self.firstPage()) |p| {
+                if (self.lastPage()) |p| {
                     p.rc += 1;
-                    return p.first() - 1;
+                    self.consumers.tail += 1;
+                    return self.last_sequence;
+                } else {
+                    self.consumers.head += 1;
+                    return 0;
                 }
             },
+            .all => {
+                self.consumers.head += 1;
+                return 0;
+                // if (self.firstPage()) |p| {
+                //     p.rc += 1;
+                //     return p.first() - 1;
+                // }
+            },
             .from_sequence => |seq| {
+                // TODO...
                 if (self.findPage(seq)) |p| {
                     p.rc += 1;
                     return seq;
@@ -245,12 +261,15 @@ pub const Store = struct {
     }
 
     pub fn unsubscribe(self: *Self, sequence: u64) void {
-        self.consumers -= 1;
+        self.consumers.count -= 1;
+        if (sequence == 0) {
+            self.consumers.head -= 1;
+            return;
+        }
+        if (sequence == self.last_sequence) {
+            self.consumers.tail -= 1;
+        }
         self.fin(sequence);
-        // if (self.findPage(sequence)) |p| {
-        //     p.rc -= 1;
-        //     if (p.rc == 0) self.cleanupPages();
-        // }
     }
 
     const FindResult = struct {
@@ -259,9 +278,11 @@ pub const Store = struct {
     };
 
     fn findReadPage(self: *Self, sequence: u64) ?FindResult {
-        if (self.firstPage()) |fp| {
-            if (sequence < fp.first()) return .{ .page = fp };
-        }
+        if (self.firstPage()) |fp| if (sequence < fp.first()) {
+            if (sequence == 0) self.consumers.head -= 1;
+            fp.rc += 1;
+            return .{ .page = fp };
+        };
 
         if (self.findPage(sequence)) |page| {
             if (page.last() > sequence) return .{ .page = page };
@@ -276,7 +297,9 @@ pub const Store = struct {
     }
 
     fn cleanupPages(self: *Self) void {
-        if (self.options.retention_policy != .interest) return;
+        if (self.options.retention_policy != .interest or
+            self.consumers.head > 0) return;
+
         while (self.pages.items.len > 0 and self.pages.items[0].rc == 0) {
             var fp = self.pages.orderedRemove(0);
             // log.warn("page remove {}-{}", .{ fp.first(), fp.last() });
@@ -291,12 +314,33 @@ pub const Store = struct {
             sequence == self.last_sequence)
             return null;
 
-        if (self.findReadPage(sequence)) |res| {
-            defer if (res.cleared) self.cleanupPages();
-            return res.page.next(sequence, ready_count, self.options.ack_policy);
-        }
+        var cleanup = false;
+        const page = brk: {
+            if (self.firstPage()) |first_page| if (sequence < first_page.first()) {
+                if (sequence == 0) self.consumers.head -= 1;
+                first_page.rc += 1;
+                break :brk first_page;
+            };
 
-        unreachable;
+            if (self.findPage(sequence)) |page| {
+                if (page.last() > sequence) break :brk page;
+
+                if (self.findPage(sequence + 1)) |next_page| {
+                    page.rc -= 1;
+                    next_page.rc += 1;
+                    cleanup = page.rc == 0;
+                    break :brk next_page;
+                }
+            }
+
+            return null;
+        };
+
+        const res = page.next(sequence, ready_count, self.options.ack_policy);
+        if (cleanup) self.cleanupPages();
+        if (res.sequence.to == self.last_sequence)
+            self.consumers.tail += 1;
+        return res;
     }
 
     pub fn hasNext(self: *Self, sequence: u64) bool {
@@ -350,7 +394,13 @@ test "topic usage" {
 
     // first subscriber gets all the messages
     var sub_1_seq = store.subscribe();
-    try testing.expectEqual(100, sub_1_seq);
+    try testing.expectEqual(0, sub_1_seq);
+    try testing.expectEqual(0, store.pages.items[0].rc);
+    try testing.expectEqual(1, store.consumers.head);
+    store.unsubscribe(sub_1_seq);
+    try testing.expectEqual(0, store.pages.items[0].rc);
+    try testing.expectEqual(0, store.consumers.head);
+    sub_1_seq = store.subscribe();
 
     // change policy after first subscriber
     store.options.retention_policy = .interest;
@@ -362,7 +412,8 @@ test "topic usage" {
     try testing.expect(store.next(sub_2_seq, 1) == null);
 
     // references hold
-    try testing.expectEqual(1, store.pages.items[0].rc);
+    try testing.expectEqual(1, store.consumers.head);
+    try testing.expectEqual(0, store.pages.items[0].rc);
     try testing.expectEqual(0, store.pages.items[1].rc);
     try testing.expectEqual(1, store.pages.items[2].rc);
 
@@ -373,6 +424,7 @@ test "topic usage" {
         sub_1_seq = res1.sequence.to;
 
         // each message holds reference when ack is explicit
+        try testing.expectEqual(0, store.consumers.head);
         try testing.expectEqual(5, store.pages.items[0].rc);
         try testing.expectEqual(0, store.pages.items[1].rc);
         try testing.expectEqual(1, store.pages.items[2].rc);
@@ -452,8 +504,8 @@ test "delivery policy" {
 
     for (0..2) |_| {
         var sequence = store.subscribe();
-        try testing.expectEqual(100, sequence);
-        try testing.expectEqual(1, store.consumers);
+        try testing.expectEqual(0, sequence);
+        try testing.expectEqual(1, store.consumers.count);
         var res = store.next(sequence, 2).?;
         try testing.expectEqualStrings("012345", res.data);
         try testing.expectEqual(101, res.sequence.from);
@@ -494,7 +546,7 @@ test "delivery policy" {
         try testing.expectEqual(0, store.pages.items[0].rc);
         try testing.expectEqual(0, store.pages.items[1].rc);
         try testing.expectEqual(0, store.pages.items[2].rc);
-        try testing.expectEqual(0, store.consumers);
+        try testing.expectEqual(0, store.consumers.count);
     }
 
     store.options.deliver_policy = .new;
@@ -563,24 +615,34 @@ test "retention policy" {
     }
 
     var sequence_all_1 = store.subscribe();
-    try testing.expectEqual(100, sequence_all_1);
-    try testing.expectEqual(1, store.consumers);
+    try testing.expectEqual(0, sequence_all_1);
+    try testing.expectEqual(1, store.consumers.count);
 
     var sequence_all_2 = store.subscribe();
-    try testing.expectEqual(100, sequence_all_2);
-    try testing.expectEqual(2, store.consumers);
+    try testing.expectEqual(0, sequence_all_2);
+    try testing.expectEqual(2, store.consumers.count);
 
     store.options.retention_policy = .interest;
     store.options.deliver_policy = .new;
 
+    try testing.expectEqual(2, store.consumers.head);
+    try testing.expectEqual(0, store.pages.items[0].rc);
+    try testing.expectEqual(0, store.pages.items[1].rc);
+    try testing.expectEqual(0, store.pages.items[2].rc);
+
     var res = store.next(sequence_all_1, 10).?;
     try testing.expectEqualStrings("01234567", res.data);
     sequence_all_1 = res.sequence.to;
+
+    try testing.expectEqual(1, store.pages.items[0].rc);
+    try testing.expectEqual(0, store.pages.items[1].rc);
+    try testing.expectEqual(0, store.pages.items[2].rc);
+
     res = store.next(sequence_all_1, 10).?;
     try testing.expectEqualStrings("890123", res.data);
     sequence_all_1 = res.sequence.to;
 
-    try testing.expectEqual(1, store.pages.items[0].rc);
+    try testing.expectEqual(0, store.pages.items[0].rc);
     try testing.expectEqual(1, store.pages.items[1].rc);
     try testing.expectEqual(0, store.pages.items[2].rc);
 
@@ -638,30 +700,91 @@ test "ack policy" {
     var res = store.next(100, 2).?;
     try testing.expectEqual(101, res.sequence.from);
     try testing.expectEqual(102, res.sequence.to);
-    try testing.expectEqual(3, store.pages.items[0].rc);
+    try testing.expectEqual(4, store.pages.items[0].rc);
 
     res = store.next(102, 2).?;
     try testing.expectEqual(103, res.sequence.from);
     try testing.expectEqual(104, res.sequence.to);
-    try testing.expectEqual(6, store.pages.items[0].rc);
+    try testing.expectEqual(7, store.pages.items[0].rc);
 
     res = store.next(102, 2).?;
     try testing.expectEqual(103, res.sequence.from);
     try testing.expectEqual(104, res.sequence.to);
-    try testing.expectEqual(9, store.pages.items[0].rc);
+    try testing.expectEqual(10, store.pages.items[0].rc);
 
     res = store.next(104, 10).?;
     try testing.expectEqual(105, res.sequence.from);
     try testing.expectEqual(106, res.sequence.to);
-    try testing.expectEqual(12, store.pages.items[0].rc);
+    try testing.expectEqual(13, store.pages.items[0].rc);
 
     res = store.next(100, 6).?;
     try testing.expectEqual(101, res.sequence.from);
     try testing.expectEqual(106, res.sequence.to);
-    try testing.expectEqual(19, store.pages.items[0].rc);
+    try testing.expectEqual(21, store.pages.items[0].rc);
 
     try testing.expectEqualStrings("0", store.message(101));
     try testing.expectEqualStrings("1", store.message(102));
     try testing.expectEqualStrings("45", store.message(105));
     try testing.expectEqualStrings("67", store.message(106));
+}
+
+test "subscribe/unsubscribe" {
+    var store = Store.init(testing.allocator, .{
+        .page_size = 8,
+        .ack_policy = .explicit,
+        .deliver_policy = .new,
+        .retention_policy = .all,
+    });
+    store.last_sequence = 100;
+    defer store.deinit();
+
+    store.options.deliver_policy = .all;
+    {
+        const sequence = store.subscribe();
+        try testing.expectEqual(sequence, 0);
+        try testing.expectEqual(1, store.consumers.count);
+        try testing.expectEqual(1, store.consumers.head);
+        try testing.expectEqual(0, store.consumers.tail);
+        store.unsubscribe(sequence);
+        try testing.expectEqual(0, store.consumers.count);
+        try testing.expectEqual(0, store.consumers.head);
+        try testing.expectEqual(0, store.consumers.tail);
+    }
+    store.options.deliver_policy = .new;
+    {
+        const sequence = store.subscribe();
+        try testing.expectEqual(sequence, 0);
+        try testing.expectEqual(1, store.consumers.count);
+        try testing.expectEqual(1, store.consumers.head);
+        try testing.expectEqual(0, store.consumers.tail);
+        store.unsubscribe(sequence);
+        try testing.expectEqual(0, store.consumers.count);
+        try testing.expectEqual(0, store.consumers.head);
+        try testing.expectEqual(0, store.consumers.tail);
+    }
+    try store.append("0");
+    store.options.deliver_policy = .all;
+    {
+        const sequence = store.subscribe();
+        try testing.expectEqual(sequence, 0);
+        try testing.expectEqual(1, store.consumers.count);
+        try testing.expectEqual(1, store.consumers.head);
+        try testing.expectEqual(0, store.consumers.tail);
+        store.unsubscribe(sequence);
+        try testing.expectEqual(0, store.consumers.count);
+        try testing.expectEqual(0, store.consumers.head);
+        try testing.expectEqual(0, store.consumers.tail);
+    }
+    store.options.deliver_policy = .new;
+    {
+        const sequence = store.subscribe();
+        try testing.expectEqual(sequence, 101);
+        try testing.expectEqual(1, store.consumers.count);
+        try testing.expectEqual(0, store.consumers.head);
+        try testing.expectEqual(1, store.consumers.tail);
+        store.unsubscribe(sequence);
+        try testing.expectEqual(0, store.consumers.count);
+        try testing.expectEqual(0, store.consumers.head);
+        try testing.expectEqual(0, store.consumers.tail);
+    }
 }
