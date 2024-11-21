@@ -580,7 +580,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         mem.writeInt(u32, header[22..26], res.page, .big); // 4 bytes, page no
                         mem.writeInt(u64, header[26..34], res.sequence, .big); // 8 bytes, sequence
                     }
-                    log.debug("topic {s} store append {} {}", .{ self.name, res.sequence, data.len });
+                    // log.debug("topic {s} store append {} {}", .{ self.name, res.sequence, data.len });
                     @memcpy(body, data);
                     self.metric.inc(data.len, self.channels.count() == 0);
                 }
@@ -1059,7 +1059,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     // else find next chunk in store
                     if (self.topic.paused) return null;
                     if (self.topic.store.next(self.sequence, ready_count)) |res| {
-                        errdefer res.release(&self.topic.store);
+                        errdefer res.revert(&self.topic.store, self.sequence);
 
                         { // add all sequence to in_flight
                             try self.in_flight.ensureUnusedCapacity(res.count);

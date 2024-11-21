@@ -109,10 +109,13 @@ pub const NextResult = struct {
     },
     page: u32,
 
-    pub fn release(self: NextResult, store: *Store) void {
-        if (store.options.ack_policy != .explicit) return;
-        const page = store.findPageByNo(self.page).?;
-        page.rc -= (self.count + 1);
+    pub fn revert(self: NextResult, store: *Store, sequence: u64) void {
+        if (store.options.ack_policy == .explicit) {
+            const page = store.findPageByNo(self.page).?;
+            page.rc -= (self.count + 1);
+        }
+        if (sequence == 0) store.consumers.head += 1;
+        if (self.sequence.to == store.last_sequence) store.consumers.tail -= 1;
     }
 };
 
@@ -191,7 +194,6 @@ pub const Store = struct {
             // if (self.pages.items.len > 2) {
             //     self.options.page_size *|= 2;
             // }
-            // std.debug.print("{} page size {}\n", .{ self.pages.items.len, self.options.page_size });
             // add new page
             const buf = try self.allocator.alloc(u8, @max(self.options.page_size, bytes_count));
             errdefer self.allocator.free(buf);
@@ -286,7 +288,7 @@ pub const Store = struct {
     pub fn unsubscribe(self: *Self, sequence: u64) void {
         self.consumers.count -= 1;
         if (sequence == 0) {
-            self.consumers.head -|= 1;
+            self.consumers.head -= 1;
             return;
         }
         if (sequence == self.last_sequence) {
@@ -337,8 +339,7 @@ pub const Store = struct {
 
         const res = page.next(sequence, ready_count, self.options.ack_policy);
         if (cleanup) self.cleanupPages();
-        if (res.sequence.to == self.last_sequence)
-            self.consumers.tail += 1;
+        if (res.sequence.to == self.last_sequence) self.consumers.tail += 1;
         return res;
     }
 
