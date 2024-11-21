@@ -2,13 +2,14 @@ const std = @import("std");
 const mem = std.mem;
 const assert = std.debug.assert;
 const testing = std.testing;
-const log = std.log.scoped(.storeg);
+const log = std.log.scoped(.store);
 
-const Page = struct {
+pub const Page = struct {
     const Self = @This();
 
     buf: []u8,
-    first_sequence: u64 = 0,
+    no: u32,
+    first_sequence: u64,
     rc: u32 = 0, // reference counter
     offsets: std.ArrayList(u32),
 
@@ -38,6 +39,10 @@ const Page = struct {
         return self.capacity() - self.writePos();
     }
 
+    pub fn release(self: *Self, refs: u32) void {
+        self.rc -= refs;
+    }
+
     // With explicit ack_policy reference is raised for each message and one more
     // for the first message. That first reference should be released when
     // buffer is no more required by kernel. Other references should be released
@@ -48,25 +53,29 @@ const Page = struct {
         const msgs_count = self.offsets.items.len;
 
         if (sequence < self.first()) {
-            const no_msgs = @min(msgs_count, ready_count);
-            const end_idx = no_msgs - 1;
-            if (ack_policy == .explicit) self.rc += no_msgs + 1;
+            const count = @min(msgs_count, ready_count);
+            const end_idx = count - 1;
+            if (ack_policy == .explicit) self.rc += count + 1;
             const data = self.buf[0..self.offsets.items[end_idx]];
             return .{
                 .data = data,
+                .count = count,
                 .sequence = .{ .from = self.first(), .to = self.first() + end_idx },
+                .page = self.no,
             };
         }
         assert(sequence >= self.first());
 
         const start_idx: u32 = @intCast(sequence - self.first());
         const end_idx: u32 = @min(msgs_count - 1, start_idx + ready_count);
-        const no_msgs: u32 = end_idx - start_idx;
-        if (ack_policy == .explicit) self.rc += no_msgs + 1;
+        const count: u32 = end_idx - start_idx;
+        if (ack_policy == .explicit) self.rc += count + 1;
         const data = self.buf[self.offsets.items[start_idx]..self.offsets.items[end_idx]];
         return .{
             .data = data,
-            .sequence = .{ .from = sequence + 1, .to = sequence + no_msgs },
+            .count = count,
+            .sequence = .{ .from = sequence + 1, .to = sequence + count },
+            .page = self.no,
         };
     }
 
@@ -93,10 +102,18 @@ const Page = struct {
 
 pub const NextResult = struct {
     data: []const u8,
+    count: u32,
     sequence: struct {
         from: u64,
         to: u64,
     },
+    page: u32,
+
+    pub fn release(self: NextResult, store: *Store) void {
+        if (store.options.ack_policy != .explicit) return;
+        const page = store.findPageByNo(self.page).?;
+        page.rc -= (self.count + 1);
+    }
 };
 
 pub const DeliverPolicy = union(enum) {
@@ -144,6 +161,7 @@ pub const Store = struct {
         tail: u32 = 0,
     } = .{},
     last_sequence: u64 = 0,
+    last_page: u32 = 0,
 
     pub fn init(allocator: mem.Allocator, options: Options) Self {
         assert(options.page_size > 0);
@@ -165,6 +183,7 @@ pub const Store = struct {
     const AllocResult = struct {
         data: []u8,
         sequence: u64,
+        page: u32,
     };
 
     pub fn alloc(self: *Self, bytes_count: u32) !AllocResult {
@@ -179,19 +198,21 @@ pub const Store = struct {
             try self.pages.append(
                 Page{
                     .rc = 0,
-                    .first_sequence = 1 + self.last_sequence,
+                    .first_sequence = 1 +% self.last_sequence,
+                    .no = 1 +% self.last_page,
                     .buf = buf,
                     .offsets = std.ArrayList(u32).init(self.allocator),
                 },
             );
+            self.last_page +%= 1;
         }
-        self.last_sequence += 1;
-        self.consumers.tail = 0;
-
         const page = self.lastPage().?;
         const data = try page.alloc(bytes_count);
+
+        self.last_sequence +%= 1;
+        self.consumers.tail = 0;
         assert(self.last_sequence == page.last());
-        return .{ .data = data, .sequence = self.last_sequence };
+        return .{ .data = data, .sequence = self.last_sequence, .page = page.no };
     }
 
     pub fn append(self: *Self, bytes: []const u8) !void {
@@ -335,6 +356,28 @@ pub const Store = struct {
         page.rc -= 1;
         if (page.rc == 0) self.cleanupPages();
     }
+
+    fn findPageByNo(self: *Self, no: u32) ?*Page {
+        const first_no = self.pages.items[0].no;
+        if (no >= first_no) {
+            const idx = no - first_no;
+            if (idx < self.pages.items.len)
+                return &self.pages.items[idx];
+        }
+        return null;
+    }
+
+    pub fn release(self: *Self, no: u32, sequence: u64) void {
+        const page = brk: {
+            if (self.findPageByNo(no)) |page| break :brk page;
+            if (self.findPage(sequence)) |page| break :brk page;
+
+            log.err("release: page not found page: {} sequence: {}", .{ no, sequence });
+            return;
+        };
+        page.rc -= 1;
+        if (page.rc == 0) self.cleanupPages();
+    }
 };
 
 test "topic usage" {
@@ -429,12 +472,15 @@ test "append/alloc" {
     try testing.expectEqual(102, store.last_sequence);
     try testing.expectEqual(101, store.pages.items[0].first_sequence);
     try testing.expectEqual(102, store.pages.items[0].last());
-    try store.append("6");
+    //try store.append("6");
+    var res = try store.alloc(2);
+    try testing.expectEqual(1, res.page);
     try testing.expectEqual(103, store.last_sequence);
     try testing.expectEqual(103, store.pages.items[0].last());
 
     // page 2
-    var res = try store.alloc(2);
+    res = try store.alloc(2);
+    try testing.expectEqual(2, res.page);
     try testing.expectEqual(2, store.pages.items.len);
     try testing.expectEqual(2, res.data.len);
     try testing.expectEqual(104, res.sequence);
@@ -444,6 +490,7 @@ test "append/alloc" {
 
     // page 3 of size 9
     res = try store.alloc(9);
+    try testing.expectEqual(3, res.page);
     try testing.expectEqual(3, store.pages.items.len);
     try testing.expectEqual(9, res.data.len);
     try testing.expectEqual(105, res.sequence);

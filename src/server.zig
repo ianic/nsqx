@@ -15,7 +15,23 @@ fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
 }
 
-const empty_payload: []u8 = &.{};
+pub const MsgId = struct {
+    page: u32,
+    sequence: u64,
+
+    pub fn parse(msg_id: [16]u8) MsgId {
+        return .{
+            .page = mem.readInt(u32, msg_id[4..8], .big),
+            .sequence = mem.readInt(u64, msg_id[8..], .big),
+        };
+    }
+
+    fn encode(sequence: u64) [16]u8 {
+        var msg_id: [16]u8 = .{0} ** 16;
+        mem.writeInt(u64, msg_id[8..16], sequence, .big);
+        return msg_id;
+    }
+};
 
 pub fn ServerType(Consumer: type, Notifier: type) type {
     return struct {
@@ -555,12 +571,14 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     const header = res.data[0..34];
                     const body = res.data[34..];
                     {
-                        mem.writeInt(u32, header[0..4], @intCast(data.len + 30), .big); // size
+                        mem.writeInt(u32, header[0..4], @intCast(data.len + 30), .big); // size (without 4 bytes size field)
                         mem.writeInt(u32, header[4..8], @intFromEnum(protocol.FrameType.message), .big); // frame type
                         mem.writeInt(u64, header[8..16], self.server.now, .big); // timestamp
                         mem.writeInt(u16, header[16..18], 1, .big); // attempts
-                        mem.writeInt(u64, header[18..26], 0, .big); // message id, first 8 bytes, unused
-                        mem.writeInt(u64, header[26..34], res.sequence, .big); // message id, second 8 bytes
+                        // 16 bytes message id
+                        mem.writeInt(u32, header[18..22], 0, .big); // first 4 bytes, unused
+                        mem.writeInt(u32, header[22..26], res.page, .big); // 4 bytes, page no
+                        mem.writeInt(u64, header[26..34], res.sequence, .big); // 8 bytes, sequence
                     }
                     log.debug("topic {s} store append {} {}", .{ self.name, res.sequence, data.len });
                     @memcpy(body, data);
@@ -740,15 +758,15 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         mem.writeInt(u16, buf, self.attempts, .big);
                     }
 
-                    pub fn seqFromId(msg_id: [16]u8) u64 {
-                        return mem.readInt(u64, msg_id[8..], .big);
-                    }
+                    // pub fn seqFromId(msg_id: [16]u8) u64 {
+                    //     return mem.readInt(u64, msg_id[8..], .big);
+                    // }
 
-                    fn idFromSeq(seq: u64) [16]u8 {
-                        var msg_id: [16]u8 = .{0} ** 16;
-                        mem.writeInt(u64, msg_id[8..16], seq, .big);
-                        return msg_id;
-                    }
+                    // fn idFromSeq(seq: u64) [16]u8 {
+                    //     var msg_id: [16]u8 = .{0} ** 16;
+                    //     mem.writeInt(u64, msg_id[8..16], seq, .big);
+                    //     return msg_id;
+                    // }
                 };
 
                 const DeferredMsg = struct {
@@ -884,29 +902,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     return self.topic.server.tsFromDelay(delay_ms);
                 }
 
-                // Add many in flight messages with sequences from - to.
-                fn addInFlight(
-                    self: *Channel,
-                    from_sequence: u64,
-                    to_sequence: u64,
-                    consumer_id: u32,
-                    msg_timeout: u32,
-                ) !void {
-                    const msgs_count: u32 = @intCast(to_sequence - from_sequence + 1);
-                    try self.in_flight.ensureUnusedCapacity(msgs_count);
-
-                    const timeout_at = self.tsFromDelay(msg_timeout);
-                    for (from_sequence..to_sequence + 1) |sequence| {
-                        const ifm = InFlightMsg{
-                            .timeout_at = timeout_at,
-                            .consumer_id = consumer_id,
-                            .attempts = 1,
-                        };
-                        self.in_flight.putAssumeCapacityNoClobber(sequence, ifm);
-                    }
-                    self.updateTimer(timeout_at);
-                }
-
                 // Defer in flight message.
                 // Moves message from in-flight to the deferred.
                 fn deferInFlight(self: *Channel, sequence: u64, ifm: InFlightMsg, delay: u32) !void {
@@ -942,8 +937,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
                         return .{
                             .data = payload,
-                            .sequence = dm.sequence,
-                            .msgs_count = 1,
+                            .count = 1,
                             .allocator = self.allocator,
                         };
                     };
@@ -1034,10 +1028,10 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 // Chunk of data to send to the consumer
                 pub const SendChunk = struct {
                     data: []const u8,
-                    msgs_count: u32 = 1,
+                    count: u32 = 1,
 
                     store: ?*Store = null,
-                    sequence: u64 = 0,
+                    page: u32 = 0,
                     allocator: ?mem.Allocator = null,
 
                     // Consumer should call this when data is no more in use by
@@ -1046,12 +1040,10 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     // or deallocate buffer (in case op copied message;
                     // deferred).
                     pub fn done(self: SendChunk) void {
-                        if (self.store) |store| {
-                            store.fin(self.sequence);
-                        }
-                        if (self.allocator) |allocator| {
+                        if (self.store) |store|
+                            store.release(self.page, 0);
+                        if (self.allocator) |allocator|
                             allocator.free(self.data);
-                        }
                     }
                 };
 
@@ -1060,58 +1052,66 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     assert(consumer_id > 0);
                     if (self.paused) return null;
 
+                    // if there is deferred message return one
                     if (try self.popDeferred(consumer_id, msg_timeout)) |sc| return sc;
 
+                    // else find next chunk in store
                     if (self.topic.paused) return null;
                     if (self.topic.store.next(self.sequence, ready_count)) |res| {
-                        const msgs_count: u32 = @intCast(res.sequence.to - res.sequence.from + 1);
-                        self.addInFlight(res.sequence.from, res.sequence.to, consumer_id, msg_timeout) catch |err| {
-                            // release store references
-                            self.topic.store.fin(res.sequence.from);
-                            for (res.sequence.from..res.sequence.to + 1) |sequence|
-                                self.topic.store.fin(sequence);
+                        errdefer res.release(&self.topic.store);
 
-                            return err;
-                        };
+                        { // add all sequence to in_flight
+                            try self.in_flight.ensureUnusedCapacity(res.count);
+                            const timeout_at = self.tsFromDelay(msg_timeout);
+                            for (res.sequence.from..res.sequence.to + 1) |sequence| {
+                                const ifm = InFlightMsg{
+                                    .timeout_at = timeout_at,
+                                    .consumer_id = consumer_id,
+                                    .attempts = 1,
+                                };
+                                self.in_flight.putAssumeCapacityNoClobber(sequence, ifm);
+                            }
+                            self.updateTimer(timeout_at);
+                        }
 
-                        self.metric.pull += msgs_count;
+                        self.metric.pull += res.count;
                         self.sequence = res.sequence.to;
                         return .{
                             .data = res.data,
-                            .msgs_count = msgs_count,
+                            .count = res.count,
                             .store = &self.topic.store,
-                            .sequence = res.sequence.from,
+                            .page = res.page,
                         };
                     }
                     return null;
                 }
 
                 pub fn finish(self: *Channel, consumer_id: u32, msg_id: [16]u8) !void {
-                    const sequence = InFlightMsg.seqFromId(msg_id);
-                    const ifm = self.in_flight.get(sequence) orelse return error.MessageNotInFlight;
+                    const id = MsgId.parse(msg_id);
+                    const ifm = self.in_flight.get(id.sequence) orelse return error.MessageNotInFlight;
                     if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
 
-                    self.topic.store.fin(sequence);
-                    assert(self.in_flight.remove(sequence));
+                    self.topic.store.release(id.page, id.sequence);
+                    assert(self.in_flight.remove(id.sequence));
                     self.metric.finish += 1;
                     self.metric.depth -|= 1;
                 }
 
                 /// Extend message timeout for interval (milliseconds).
                 pub fn touch(self: *Channel, consumer_id: u32, msg_id: [16]u8, interval: u32) !void {
-                    const sequence = InFlightMsg.seqFromId(msg_id);
-                    const ifm = self.in_flight.getPtr(sequence) orelse return error.MessageNotInFlight;
+                    const id = MsgId.parse(msg_id);
+                    const ifm = self.in_flight.getPtr(id.sequence) orelse return error.MessageNotInFlight;
                     if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
 
                     ifm.timeout_at += nsFromMs(interval);
                 }
 
                 pub fn requeue(self: *Channel, consumer_id: u32, msg_id: [16]u8, delay: u32) !void {
-                    const sequence = InFlightMsg.seqFromId(msg_id);
-                    const ifm = self.in_flight.get(sequence) orelse return error.MessageNotInFlight;
+                    const id = MsgId.parse(msg_id);
+                    const ifm = self.in_flight.get(id.sequence) orelse return error.MessageNotInFlight;
                     if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
 
-                    try self.deferInFlight(sequence, ifm, delay);
+                    try self.deferInFlight(id.sequence, ifm, delay);
                     self.metric.requeue += 1;
                 }
 
@@ -1266,7 +1266,7 @@ test "channel fin req" {
     }
     { // consumer is ready
         try consumer.pull();
-        try testing.expectEqual(1, consumer.lastSeq());
+        try testing.expectEqual(1, consumer.lastSequence());
         // 1 is in flight
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
@@ -1281,14 +1281,14 @@ test "channel fin req" {
     }
     { // send seq 2, 1 msg in flight
         try consumer.pull();
-        try testing.expectEqual(2, consumer.lastSeq());
+        try testing.expectEqual(2, consumer.lastSequence());
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(2, channel.sequence);
     }
     { // send seq 3, 2 msgs in flight
         try consumer.pull();
-        try testing.expectEqual(3, consumer.lastSeq());
+        try testing.expectEqual(3, consumer.lastSequence());
         try testing.expectEqual(2, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(3, channel.sequence);
@@ -1308,7 +1308,7 @@ test "channel fin req" {
         try testing.expectEqual(1, channel.deferred.count());
         try consumer.pull();
         try testing.expectEqual(4, consumer.sequences.items.len);
-        try testing.expectEqual(2, consumer.lastSeq());
+        try testing.expectEqual(2, consumer.lastSequence());
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
     }
@@ -1339,8 +1339,6 @@ const TestConsumer = struct {
     ready_count: u32 = 0,
     _id: u32 = 1,
 
-    const idFromSeq = TestServer.Channel.InFlightMsg.idFromSeq;
-
     fn init(allocator: mem.Allocator) Self {
         return .{
             .allocator = allocator,
@@ -1368,9 +1366,17 @@ const TestConsumer = struct {
         }
         while (self.ready_count > 0) {
             const sc = try self.channel.?.pull(self.id(), self.msgTimeout(), self.ready_count) orelse break;
-            for (sc.sequence..sc.sequence + sc.msgs_count) |sequence|
+            var pos: usize = 0;
+            while (pos < sc.data.len) {
+                const header = sc.data[pos .. pos + 34];
+                const size = mem.readInt(u32, header[0..4], .big);
+                const page = mem.readInt(u32, header[22..26], .big);
+                const sequence = mem.readInt(u64, header[26..34], .big);
+                pos += 4 + size;
+                try testing.expectEqual(1, page);
                 try self.sequences.append(sequence);
-            self.ready_count -= sc.msgs_count;
+            }
+            self.ready_count -= sc.count;
             sc.done();
         }
     }
@@ -1380,11 +1386,11 @@ const TestConsumer = struct {
     }
 
     fn finish(self: *Self, sequence: u64) !void {
-        try self.channel.?.finish(self.id(), idFromSeq(sequence));
+        try self.channel.?.finish(self.id(), MsgId.encode(sequence));
     }
 
     fn requeue(self: *Self, sequence: u64) !void {
-        try self.channel.?.requeue(self.id(), idFromSeq(sequence), 0);
+        try self.channel.?.requeue(self.id(), MsgId.encode(sequence), 0);
     }
 
     fn pull(self: *Self) !void {
@@ -1392,17 +1398,13 @@ const TestConsumer = struct {
         try self.wakeup();
     }
 
-    fn pullAndFin(self: *Self) !void {
+    fn pullFinish(self: *Self) !void {
         try self.pull();
-        try self.finish(self.lastSeq());
+        try self.finish(self.lastSequence());
     }
 
-    fn lastSeq(self: *Self) u64 {
+    fn lastSequence(self: *Self) u64 {
         return self.sequences.items[self.sequences.items.len - 1];
-    }
-
-    fn lastId(self: *Self) [16]u8 {
-        return idFromSeq(self.lastSeq());
     }
 
     fn channelClosed(self: *Self) void {
@@ -1528,7 +1530,7 @@ test "first channel gets all messages accumulated in topic" {
 
     for (0..no) |i| {
         try testing.expectEqual(no - i, channel.metric.depth);
-        try consumer.pullAndFin();
+        try consumer.pullFinish();
     }
     try testing.expectEqual(0, channel.metric.depth);
     try testing.expectEqual(0, topic.metric.depth);
@@ -1603,7 +1605,7 @@ test "timeout messages" {
         try testing.expectEqual(0, channel.metric.finish);
     }
     { // fin last one
-        try consumer.finish(consumer.lastSeq());
+        try consumer.finish(consumer.lastSequence());
         try testing.expectEqual(1, channel.metric.finish);
         try testing.expectEqual(0, channel.in_flight.count());
     }
@@ -1838,19 +1840,19 @@ test "depth" {
 
     try testing.expectEqual(0, channel1.sequence);
     try testing.expectEqual(0, channel2.sequence);
-    try consumer1.pullAndFin();
+    try consumer1.pullFinish();
     try testing.expectEqual(1, channel1.sequence);
 
     try testing.expectEqual(0, topic.metric.depth);
     try testing.expectEqual(1, channel1.metric.depth);
     try testing.expectEqual(2, channel2.metric.depth);
 
-    try consumer2.pullAndFin();
+    try consumer2.pullFinish();
     try testing.expectEqual(0, topic.metric.depth);
     try testing.expectEqual(1, channel1.metric.depth);
     try testing.expectEqual(1, channel2.metric.depth);
 
-    try consumer2.pullAndFin();
+    try consumer2.pullFinish();
     try testing.expectEqual(0, topic.metric.depth);
     try testing.expectEqual(1, channel1.metric.depth);
     try testing.expectEqual(0, channel2.metric.depth);
@@ -1906,10 +1908,10 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try testing.expectEqual(0, channel2_consumer1.channel.?.sequence);
 
     // Consume messages
-    try channel1_consumer.pullAndFin();
-    try channel1_consumer.pullAndFin();
-    try channel2_consumer1.pullAndFin();
-    try channel2_consumer2.pullAndFin();
+    try channel1_consumer.pullFinish();
+    try channel1_consumer.pullFinish();
+    try channel2_consumer1.pullFinish();
+    try channel2_consumer2.pullFinish();
     try testing.expectEqual(0, topic.metric.depth);
     try testing.expectEqual(2, channel1_consumer.sequences.items.len);
     try testing.expectEqual(1, channel2_consumer1.sequences.items.len);
@@ -1923,11 +1925,11 @@ fn publishFinish(allocator: mem.Allocator) !void {
     // Re-queue from one consumer 1 to consumer 2
     const channel2 = channel2_consumer2.channel.?;
     try channel2_consumer1.pull();
-    try testing.expectEqual(3, channel2_consumer1.lastSeq());
+    try testing.expectEqual(3, channel2_consumer1.lastSequence());
     try channel2_consumer1.requeue(3);
     try testing.expectEqual(1, channel2.deferred.count());
     try channel2_consumer2.pull();
-    try testing.expectEqual(3, channel2_consumer2.lastSeq());
+    try testing.expectEqual(3, channel2_consumer2.lastSequence());
     // Unsubscribe consumer2
     try testing.expectEqual(1, channel2.in_flight.count());
     try channel2.requeueAll(channel2_consumer2.id());
@@ -1935,7 +1937,7 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try testing.expectEqual(0, channel2.in_flight.count());
     try testing.expectEqual(1, channel2.deferred.count());
     try channel2_consumer1.pull();
-    try testing.expectEqual(3, channel2_consumer1.lastSeq());
+    try testing.expectEqual(3, channel2_consumer1.lastSequence());
 
     try channel2.empty();
     try testing.expectEqual(0, channel2.in_flight.count());

@@ -19,7 +19,7 @@ cd ~/Code/nsql && zig run test/lookup.zig > tmp/registrations 2>&1 &
 lookupd3_pid=$!
 
 # default lookupd
-~/Code/go/nsq/apps/nsqlookupd/nsqlookupd > tmp/lookupd1 2>&1 &
+~/Code/go/nsq/build/nsqlookupd > tmp/lookupd1 2>&1 &
 lookupd_pid=$!
 
 # starting another lookupd
