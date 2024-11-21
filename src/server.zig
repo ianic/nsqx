@@ -870,9 +870,10 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
                 // Notify consumers that there are messages to pull.
                 fn wakeup(self: *Channel) !void {
+                    if (!self.topic.store.hasMore(self.sequence)) return;
                     while (self.consumers_iterator.next()) |consumer| {
-                        if (!self.topic.store.hasNext(self.sequence)) break;
                         try consumer.wakeup();
+                        if (!self.topic.store.hasMore(self.sequence)) break;
                     }
                 }
 

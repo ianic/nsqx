@@ -342,7 +342,7 @@ pub const Store = struct {
         return res;
     }
 
-    pub fn hasNext(self: *Self, sequence: u64) bool {
+    pub fn hasMore(self: *Self, sequence: u64) bool {
         return self.pages.items.len > 0 and sequence < self.last_sequence;
     }
 
