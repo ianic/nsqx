@@ -178,7 +178,7 @@ pub const Store = struct {
             errdefer self.allocator.free(buf);
             try self.pages.append(
                 Page{
-                    .rc = if (self.pages.items.len == 0) self.consumers.head else 0,
+                    .rc = 0,
                     .first_sequence = 1 + self.last_sequence,
                     .buf = buf,
                     .offsets = std.ArrayList(u32).init(self.allocator),
@@ -274,30 +274,6 @@ pub const Store = struct {
         self.fin(sequence);
     }
 
-    const FindResult = struct {
-        page: *Page,
-        cleared: bool = false,
-    };
-
-    fn findReadPage(self: *Self, sequence: u64) ?FindResult {
-        if (self.firstPage()) |fp| if (sequence < fp.first()) {
-            if (sequence == 0) self.consumers.head -= 1;
-            fp.rc += 1;
-            return .{ .page = fp };
-        };
-
-        if (self.findPage(sequence)) |page| {
-            if (page.last() > sequence) return .{ .page = page };
-
-            if (self.findPage(sequence + 1)) |next_page| {
-                page.rc -= 1;
-                next_page.rc += 1;
-                return .{ .page = next_page, .cleared = page.rc == 0 };
-            }
-        }
-        return null;
-    }
-
     fn cleanupPages(self: *Self) void {
         if (self.options.retention_policy != .interest or
             self.consumers.head > 0) return;
@@ -358,17 +334,6 @@ pub const Store = struct {
         const page = self.findPage(sequence).?;
         page.rc -= 1;
         if (page.rc == 0) self.cleanupPages();
-
-        // var i: usize = self.pages.items.len;
-        // while (i > 0) {
-        //     i -= 1;
-        //     var page = &self.pages.items[i];
-        //     if (page.contains(sequence)) {
-        //         page.rc -= 1;
-        //         if (page.rc == 0) self.cleanupPages();
-        //         return;
-        //     }
-        // }
     }
 };
 
