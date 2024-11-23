@@ -60,3 +60,13 @@ trap cleanup INT TERM #EXIT
 # echo wait $nsqd_pid
 wait $nsqd_pid
 # echo wait done
+
+
+sudo chown ianic callgrind.out.*
+mv callgrind.out.* ./tmp
+exit 0
+
+
+~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 10s
+
+~/Code/go/nsq/bench/bench_reader/bench_reader --size 200 --runfor 10s
