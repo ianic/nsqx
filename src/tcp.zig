@@ -170,24 +170,22 @@ pub const Conn = struct {
 
     // Channel api -----------------
 
+    /// Unique consumer identification. Used to know which in-flight message is
+    /// sent to which consumer.
     pub fn id(self: *Conn) u32 {
         return @intCast(self.socket);
     }
 
-    /// Consumer setting
+    /// Setting from identify message.
     pub fn msgTimeout(self: *Conn) u32 {
         return self.identify.msg_timeout;
     }
 
-    /// Is connection ready to send messages
+    /// Is connection ready to send messages.
     pub fn ready(self: *Conn) bool {
-        return !(self.send_op.active() or self.in_flight >= self.ready_count or self.state != .connected);
-    }
-
-    /// When channel is deleted via web interface
-    pub fn channelClosed(self: *Conn) void {
-        self.channel = null;
-        self.shutdown();
+        return !(self.send_op.active() or
+            self.in_flight >= self.ready_count or
+            self.state != .connected);
     }
 
     /// Pull messages from channel and send.

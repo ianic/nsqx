@@ -242,7 +242,7 @@ pub const Store = struct {
         return self.next(sequence, max_ready_count);
     }
 
-    fn isEmpty(self: Self) bool {
+    pub fn empty(self: Self) bool {
         return self.pages.items.len == 0;
     }
 
@@ -283,6 +283,13 @@ pub const Store = struct {
             },
         }
         return self.last_sequence;
+    }
+
+    pub fn subscribeAt(self: *Self, sequence: u64) void {
+        self.consumers.count += 1;
+        self.acquire(sequence);
+        if (sequence == 0) self.consumers.head += 1;
+        if (sequence == self.last_sequence) self.consumers.tail += 1;
     }
 
     pub fn unsubscribe(self: *Self, sequence: u64) void {
@@ -378,6 +385,64 @@ pub const Store = struct {
         };
         page.rc -= 1;
         if (page.rc == 0) self.cleanupPages();
+    }
+
+    pub fn acquire(self: *Self, sequence: u64) void {
+        const page = self.findPage(sequence).?;
+        page.rc += 1;
+    }
+
+    pub fn dump(self: Self, file: std.fs.File) !void {
+        var header: [16]u8 = undefined;
+        mem.writeInt(u64, header[0..8], self.last_sequence, .little);
+        mem.writeInt(u32, header[8..12], self.last_page, .little);
+        mem.writeInt(u32, header[12..16], @intCast(self.pages.items.len), .little);
+        try file.writeAll(header[0..16]);
+
+        for (self.pages.items) |page| {
+            const wp = page.writePos();
+            mem.writeInt(u64, header[0..8], page.first_sequence, .little);
+            mem.writeInt(u32, header[8..12], page.no, .little);
+            mem.writeInt(u32, header[12..16], wp, .little);
+            try file.writeAll(header[0..16]);
+            try file.writeAll(page.buf[0..wp]);
+        }
+    }
+
+    pub fn restore(self: *Self, file: std.fs.File) !void {
+        const rdr = file.reader();
+
+        var header: [16]u8 = undefined;
+        try rdr.readNoEof(header[0..16]);
+        self.last_sequence = mem.readInt(u64, header[0..8], .little);
+        self.last_page = mem.readInt(u32, header[8..12], .little);
+        const pages_count = mem.readInt(u32, header[12..16], .little);
+
+        assert(self.pages.items.len == 0);
+        for (0..pages_count) |_| {
+            try rdr.readNoEof(header[0..16]);
+            const first_sequence = mem.readInt(u64, header[0..8], .little);
+            const no = mem.readInt(u32, header[8..12], .little);
+            const buf_len = mem.readInt(u32, header[12..16], .little);
+
+            var page = Page{
+                .rc = 0,
+                .first_sequence = first_sequence,
+                .no = no,
+                .buf = try self.allocator.alloc(u8, buf_len),
+                .offsets = std.ArrayList(u32).init(self.allocator),
+            };
+            try rdr.readNoEof(page.buf);
+            {
+                var pos: u32 = 0;
+                while (pos < buf_len) {
+                    const size = mem.readInt(u32, page.buf[pos..][0..4], .big);
+                    pos += size + 4;
+                    try page.offsets.append(pos);
+                }
+            }
+            try self.pages.append(page);
+        }
     }
 };
 

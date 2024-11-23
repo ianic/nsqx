@@ -273,78 +273,62 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
         // metadata paused, topic, channel
         pub fn dump(self: *Server, dir: std.fs.Dir) !void {
-            _ = self;
-            _ = dir;
-            // var meta_file = try dir.createFile(metadata_file_name, .{});
-            // defer meta_file.close();
-            // var meta_buf_writer = std.io.bufferedWriter(meta_file.writer());
-            // var meta = meta_buf_writer.writer();
-            // // Meta file header:
-            // // | version (1) | topics count (4) |
-            // try meta.writeByte(0); // version placeholder
-            // try meta.writeInt(u32, self.topics.count(), .little);
+            var meta_file = try dir.createFile(metadata_file_name, .{});
+            defer meta_file.close();
+            var meta_buf_writer = std.io.bufferedWriter(meta_file.writer());
+            var meta = meta_buf_writer.writer();
+            // Meta file header:
+            // | version (1) | topics count (4) |
+            try meta.writeByte(0); // version placeholder
+            try meta.writeInt(u32, self.topics.count(), .little);
 
-            // var ti = self.topics.valueIterator();
-            // while (ti.next()) |topic_ptr| {
-            //     const topic = topic_ptr.*;
-            //     var messages: usize = 0;
+            var ti = self.topics.valueIterator();
+            while (ti.next()) |topic_ptr| {
+                const topic = topic_ptr.*;
 
-            //     // If there are messages in topic
-            //     if (topic.first != null) {
-            //         // Topic messages to the separate file named by topic name
-            //         // For each message in topic:
-            //         // | sequence (8) | created_at (8) | defer_until (8) | body_len (4) | body (body_len) |
-            //         var topic_file = try dir.createFile(topic.name, .{});
-            //         defer topic_file.close();
+                var topic_file = try dir.createFile(topic.name, .{});
+                defer topic_file.close();
+                try topic.store.dump(topic_file);
 
-            //         var next = topic.first;
-            //         while (next) |msg| : ({
-            //             next = msg.next;
-            //             messages += 1;
-            //         }) {
-            //             var header: [28]u8 = undefined;
-            //             mem.writeInt(u64, header[0..8], msg.sequence, .little);
-            //             mem.writeInt(u64, header[8..16], msg.created_at, .little);
-            //             mem.writeInt(u64, header[16..24], msg.defer_until, .little);
-            //             mem.writeInt(u32, header[24..28], @intCast(msg.body.len), .little);
-            //             try topic_file.writeAll(&header);
-            //             try topic_file.writeAll(msg.body);
-            //         }
-            //     }
-            //     { // Topic meta:
-            //         // | name_len (4) | name (name_len) | paused (1) | messages count (4) | channels count (4) |
-            //         try meta.writeByte(@intCast(topic.name.len));
-            //         try meta.writeAll(topic.name);
-            //         try meta.writeByte(if (topic.paused) 1 else 0);
-            //         try meta.writeInt(u32, @intCast(messages), .little);
-            //         try meta.writeInt(u32, topic.channels.count(), .little);
+                { // Topic meta:
+                    // | name_len (1) | name (name_len) | paused (1)  | channels count (4) |
+                    try meta.writeByte(@intCast(topic.name.len));
+                    try meta.writeAll(topic.name);
+                    try meta.writeByte(if (topic.paused) 1 else 0);
+                    try meta.writeInt(u32, topic.channels.count(), .little);
 
-            //         // For each channel:
-            //         // | name_len (4) | name (name_len) | paused (1) | messages count (4) | next sequence (8) |
-            //         // then for each message in channel:
-            //         // | sequence (8) | timestamp (8) |
-            //         var ci = topic.channels.valueIterator();
-            //         while (ci.next()) |channel_ptr| {
-            //             const channel = channel_ptr.*;
-            //             try meta.writeByte(@intCast(channel.name.len));
-            //             try meta.writeAll(channel.name);
-            //             try meta.writeByte(if (channel.paused) 1 else 0);
-            //             try meta.writeInt(u32, @intCast(channel.in_flight.count() + channel.deferred.count()), .little);
-            //             try meta.writeInt(u64, if (channel.next) |n| n.sequence else 0, .little);
-            //             for (channel.in_flight.values()) |msg| {
-            //                 try meta.writeInt(u64, msg.sequence(), .little);
-            //                 try meta.writeInt(u64, 0, .little);
-            //             }
-            //             var iter = channel.deferred.iterator();
-            //             while (iter.next()) |msg| {
-            //                 try meta.writeInt(u64, msg.sequence(), .little);
-            //                 try meta.writeInt(u64, msg.timestamp, .little);
-            //             }
-            //         }
-            //     }
-            //     log.debug("dump topic {s}, channels {}, messages: {} ", .{ topic.name, topic.channels.count(), messages });
-            // }
-            // try meta_buf_writer.flush();
+                    // For each channel:
+                    // | name_len (1) | name (name_len) | paused (1) | messages count (4) | sequence (8) |
+                    // then for each message in channel:
+                    // | sequence (8) | timestamp (8) | attempts (2)
+                    var ci = topic.channels.valueIterator();
+                    while (ci.next()) |channel_ptr| {
+                        const channel = channel_ptr.*;
+                        try meta.writeByte(@intCast(channel.name.len));
+                        try meta.writeAll(channel.name);
+                        try meta.writeByte(if (channel.paused) 1 else 0);
+                        try meta.writeInt(u32, @intCast(channel.in_flight.count() + channel.deferred.count()), .little);
+                        try meta.writeInt(u64, channel.sequence, .little);
+
+                        var ifi = channel.in_flight.iterator();
+                        while (ifi.next()) |e| {
+                            const sequence = e.key_ptr.*;
+                            const ifm = e.value_ptr;
+                            try meta.writeInt(u64, sequence, .little);
+                            try meta.writeInt(u64, 0, .little);
+                            try meta.writeInt(u16, ifm.attempts, .little);
+                        }
+                        var dmi = channel.deferred.iterator();
+                        while (dmi.next()) |dm| {
+                            try meta.writeInt(u64, dm.sequence, .little);
+                            try meta.writeInt(u64, dm.defer_until, .little);
+                            try meta.writeInt(u16, dm.attempts, .little);
+                        }
+                    }
+                }
+                log.debug("dump topic {s}, channels {} ", .{ topic.name, topic.channels.count() });
+            }
+            try meta_buf_writer.flush();
         }
 
         pub fn restore(self: *Server, dir: std.fs.Dir) !void {
@@ -371,52 +355,32 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 try meta.readNoEof(buf[0..name_len]);
                 var topic = try self.getOrCreateTopic(try protocol.validateName(buf[0..name_len]));
                 topic.paused = try meta.readByte() != 0;
-                const messages = try meta.readInt(u32, .little);
-                const channels = try meta.readInt(u32, .little);
+                var channels = try meta.readInt(u32, .little);
 
-                if (messages > 0) {
-                    // Topic messages
-                    var topic_file = try dir.openFile(topic.name, .{});
-                    defer topic_file.close();
-                    const rdr = topic_file.reader();
-                    var i: usize = 0;
-                    while (i < messages) : (i += 1) {
-                        const header = buf[0..28];
-                        try rdr.readNoEof(header);
-                        const sequence = mem.readInt(u64, header[0..8], .little);
-                        const created_at = mem.readInt(u64, header[8..16], .little);
-                        const defer_until = mem.readInt(u64, header[16..24], .little);
-                        const body_len = mem.readInt(u32, header[24..28], .little);
-                        const body = try self.allocator.alloc(u8, body_len);
-                        try rdr.readNoEof(body);
-                        try topic.restore(sequence, created_at, defer_until, body);
-                    }
-                }
+                // Store
+                var topic_file = try dir.openFile(topic.name, .{});
+                defer topic_file.close();
+                try topic.store.restore(topic_file);
 
                 // Channels
-                var i: usize = 0;
-                while (i < channels) : (i += 1) {
+                while (channels > 0) : (channels -= 1) {
                     // Channel meta
                     const n = try meta.readByte();
                     if (n > protocol.max_name_len) return error.InvalidName;
                     try meta.readNoEof(buf[0..n]);
                     var channel = try topic.getOrCreateChannel(buf[0..n]);
                     channel.paused = try meta.readByte() != 0;
-                    var channel_messages = try meta.readInt(u32, .little);
-                    const next_sequence = try meta.readInt(u64, .little);
-                    if (next_sequence > 0) try channel.restoreNext(next_sequence);
+                    var messages = try meta.readInt(u32, .little);
+                    try channel.restore(try meta.readInt(u64, .little));
+
                     // Channel messages
-                    while (channel_messages > 0) : (channel_messages -= 1) {
+                    while (messages > 0) : (messages -= 1) {
                         const sequence = try meta.readInt(u64, .little);
-                        const timestamp = try meta.readInt(u64, .little);
-                        try channel.restoreMsg(sequence, timestamp);
+                        const defer_until = try meta.readInt(u64, .little);
+                        const attempts = try meta.readInt(u16, .little);
+                        try channel.restoreMsg(sequence, defer_until, attempts);
                     }
                 }
-                // Release reference created during restore.
-                // It is now transferred to the channels.
-                // if (topic.channels.count() > 0) if (topic.first) |first| first.release();
-
-                log.debug("restored topic {s}, channels: {}, messages: {}", .{ topic.name, channels, messages });
             }
         }
 
@@ -841,7 +805,11 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn delete(self: *Channel) void {
-                    for (self.consumers.items) |consumer| consumer.channelClosed();
+                    for (self.consumers.items) |consumer| {
+                        consumer.channel = null;
+                        consumer.shutdown();
+                    }
+                    self.consumers.clearAndFree();
                 }
 
                 fn deinit(self: *Channel) void {
@@ -877,26 +845,24 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     }
                 }
 
-                fn restoreNext(self: *Channel, sequence: u64) !void {
-                    _ = self;
-                    _ = sequence;
-                    // var topic_msg = self.topic.findMsg(sequence) orelse return error.InvalidSequence;
-                    // self.next = topic_msg.acquire();
-                    // self.metric.depth += self.topic.last.?.sequence - topic_msg.sequence + 1;
+                fn restore(self: *Channel, sequence: u64) !void {
+                    if (sequence == self.sequence) return;
+                    self.topic.store.unsubscribe(self.sequence);
+                    self.sequence = sequence;
+                    self.topic.store.subscribeAt(sequence);
+                    self.metric.depth += self.topic.store.last_sequence - sequence;
                 }
 
-                fn restoreMsg(self: *Channel, sequence: u64, timestamp: u64) !void {
-                    _ = self;
-                    _ = sequence;
-                    _ = timestamp;
-                    // var topic_msg = self.topic.findMsg(sequence) orelse return error.InvalidSequence;
-                    // const msg = try self.msg_pool.create();
-                    // errdefer self.msg_pool.destroy(msg);
-                    // msg.* = topic_msg.asChannelMsg();
-                    // msg.timestamp = timestamp;
-                    // try self.deferred.add(msg);
-                    // _ = topic_msg.acquire();
-                    // self.metric.depth += 1;
+                fn restoreMsg(self: *Channel, sequence: u64, defer_until: u64, attempts: u16) !void {
+                    const dm = DeferredMsg{
+                        .sequence = sequence,
+                        .defer_until = if (defer_until > self.now.*) defer_until else 0,
+                        .attempts = attempts + 1,
+                    };
+                    try self.deferred.add(dm);
+                    self.topic.store.acquire(sequence);
+                    if (dm.defer_until > 0) self.updateTimer(dm.defer_until);
+                    self.metric.depth += 1;
                 }
 
                 fn tsFromDelay(self: *Channel, delay_ms: u32) u64 {
@@ -998,7 +964,11 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         const msg = self.in_flight.get(sequence).?;
                         try self.deferInFlight(sequence, msg, 0);
                         self.metric.timeout += 1;
-                        log.warn("{} message timeout {}", .{ msg.consumer_id, sequence });
+                        if (!builtin.is_test)
+                            log.warn(
+                                "{s}/{s} message timeout consumer: {}, sequence: {}",
+                                .{ self.topic.name, self.name, msg.consumer_id, sequence },
+                            );
                     }
 
                     return next_timeout;
@@ -1374,7 +1344,7 @@ const TestConsumer = struct {
                 const page = mem.readInt(u32, header[22..26], .big);
                 const sequence = mem.readInt(u64, header[26..34], .big);
                 pos += 4 + size;
-                try testing.expectEqual(1, page);
+                _ = page;
                 try self.sequences.append(sequence);
             }
             self.ready_count -= sc.count;
@@ -1408,9 +1378,7 @@ const TestConsumer = struct {
         return self.sequences.items[self.sequences.items.len - 1];
     }
 
-    fn channelClosed(self: *Self) void {
-        self.channel = null;
-    }
+    fn shutdown(_: *Self) void {}
 };
 
 pub const NoopNotifier = struct {
@@ -2056,8 +2024,6 @@ test "timer queue" {
 }
 
 test "dump/restore" {
-    if (true) return error.SkipZigTest;
-
     const ns_per_s = std.time.ns_per_s;
     const now = 1730221264 * ns_per_s;
     const allocator = testing.allocator;
@@ -2073,16 +2039,20 @@ test "dump/restore" {
     { // dump
         var server = TestServer.init(allocator, &noop_notifier, 0, .{});
         defer server.deinit();
-        var topic = try server.getOrCreateTopic(topic_name);
+        const topic = try server.getOrCreateTopic(topic_name);
 
-        var dummy = TestConsumer.init(allocator); // used only for subscribe
-        defer dummy.deinit();
-        dummy.ready_count = 0;
-        var channel1 = try server.subscribe(&dummy, topic_name, &channel1_name);
-        var channel2 = try server.subscribe(&dummy, topic_name, &channel2_name);
+        var consumer1 = TestConsumer.init(allocator);
+        defer consumer1.deinit();
+        var consumer2 = TestConsumer.init(allocator);
+        defer consumer2.deinit();
+        try server.subscribe(&consumer1, topic_name, &channel1_name);
+        var channel1 = consumer1.channel.?;
+        try server.subscribe(&consumer2, topic_name, &channel2_name);
+        var channel2 = consumer2.channel.?;
 
         { // add 3 messages to the topic
-            topic.sequence = 100;
+            topic.store.last_sequence = 100;
+            topic.store.last_page = 10;
             server.now = now;
             try server.publish(topic_name, "Iso "); // msg 1, sequence: 101
             server.now += ns_per_s;
@@ -2092,73 +2062,59 @@ test "dump/restore" {
         }
 
         // channel 1: 1-finished, 2-in flight, 3-next
-        const msg1 = try channel1.nextMsg(0);
-        _ = try channel1.nextMsg(0);
-        try testing.expect(channel1.finish(msg1.?.id()));
+        try consumer1.pullFinish();
+        try consumer1.pull();
         try testing.expectEqual(0, channel1.deferred.count());
         try testing.expectEqual(1, channel1.in_flight.count());
+        try testing.expectEqual(102, channel1.sequence);
 
         // channel 2: 1-in flight, 2-finished, 3-in flight, next null
-        _ = try channel2.nextMsg(0);
-        const msg2 = try channel2.nextMsg(0);
-        try testing.expect(try channel2.nextMsg(0) == null);
-        try testing.expect(channel2.finish(msg2.?.id()));
-        try testing.expectEqual(1, channel2.deferred.count());
-        try testing.expectEqual(1, channel2.in_flight.count());
+        try consumer2.pull();
+        try consumer2.pull();
+        try consumer2.pull();
+        try consumer2.finish(102);
+        try testing.expectEqual(2, channel2.in_flight.count());
+        try testing.expectEqual(103, channel2.sequence);
         channel1.pause();
+
         try testing.expectEqual(2, channel1.metric.depth);
         try testing.expectEqual(2, channel2.metric.depth);
 
-        try testing.expectEqual(3, topic.metric.depth);
-        try testing.expectEqual(37, topic.metric.depth_bytes);
-        try testing.expectEqual(1, topic.first.?.rc);
-        try testing.expectEqual(2, topic.first.?.next.?.rc);
-        try testing.expectEqual(3, topic.first.?.next.?.next.?.rc);
-
+        try testing.expectEqual(5, topic.store.pages.items[0].rc);
         try server.dump(dir);
     }
+
     { // restore in another instance
         var server = TestServer.init(allocator, &noop_notifier, 0, .{});
         defer server.deinit();
         try server.restore(dir);
 
         const topic = try server.getOrCreateTopic(topic_name);
-        var msg = topic.first.?;
-        try testing.expectEqual(101, msg.sequence);
-        try testing.expectEqual(now, msg.created_at);
-        try testing.expectEqual(0, msg.defer_until);
-        try testing.expectEqualStrings(msg.body, "Iso ");
-        msg = msg.next.?;
-        try testing.expectEqual(102, msg.sequence);
-        try testing.expectEqual(now + ns_per_s, msg.created_at);
-        try testing.expectEqual(0, msg.defer_until);
-        try testing.expectEqualStrings(msg.body, "medo u ducan ");
-        msg = msg.next.?;
-        try testing.expectEqual(103, msg.sequence);
-        try testing.expectEqual(now + 2 * ns_per_s, msg.created_at);
-        try testing.expectEqual(msg.created_at + 987 * std.time.ns_per_ms, msg.defer_until);
-        try testing.expectEqualStrings(msg.body, "nije reko dobar dan.");
-        try testing.expect(msg.next == null);
-        try testing.expectEqual(103, topic.sequence);
+        try testing.expectEqual(103, topic.store.last_sequence);
+        try testing.expectEqual(11, topic.store.last_page);
+        const page = topic.store.pages.items[0];
+        try testing.expectEqual(3, page.offsets.items.len);
+        try testing.expectEqual(11, page.no);
+        try testing.expectEqual(5, page.rc);
+
+        try testing.expectEqualStrings(topic.store.message(101)[34..], "Iso ");
+        try testing.expectEqualStrings(topic.store.message(102)[34..], "medo u ducan ");
+        try testing.expectEqualStrings(topic.store.message(103)[34..], "nije reko dobar dan.");
 
         try testing.expectEqual(2, topic.channels.count());
         var channel1 = try topic.getOrCreateChannel(&channel1_name);
         var channel2 = try topic.getOrCreateChannel(&channel2_name);
         try testing.expectEqual(1, channel1.deferred.count());
         try testing.expectEqual(2, channel2.deferred.count());
-        try testing.expect(channel2.next == null);
-        try testing.expectEqual(103, channel1.next.?.sequence);
+
+        try testing.expectEqual(102, channel1.sequence);
+        try testing.expectEqual(103, channel2.sequence);
 
         try testing.expect(channel1.paused);
         try testing.expect(!channel2.paused);
+
         try testing.expectEqual(2, channel1.metric.depth);
         try testing.expectEqual(2, channel2.metric.depth);
-
-        try testing.expectEqual(3, topic.metric.depth);
-        try testing.expectEqual(37, topic.metric.depth_bytes);
-        try testing.expectEqual(1, topic.first.?.rc);
-        try testing.expectEqual(2, topic.first.?.next.?.rc);
-        try testing.expectEqual(3, topic.first.?.next.?.next.?.rc);
     }
 
     try std.fs.cwd().deleteTree(dir_name);
