@@ -578,80 +578,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     self.notifyChannels(msgs);
                 }
 
-                fn restore(self: *Topic, sequence: u64, created_at: u64, defer_until: u64, body: []const u8) !void {
-                    // TODO
-                    _ = self;
-                    _ = sequence;
-                    _ = created_at;
-                    _ = defer_until;
-                    _ = body;
-                    // const msg = try self.msg_pool.create();
-                    // errdefer self.msg_pool.destroy(msg);
-                    // assert(self.sequence == 0 or self.sequence + 1 == sequence);
-                    // msg.* = .{
-                    //     .topic = self,
-                    //     .sequence = sequence,
-                    //     .created_at = created_at,
-                    //     .defer_until = defer_until,
-                    //     .body = body,
-                    //     .rc = 0,
-                    // };
-                    // try self.appendMsg(msg);
-                    // self.sequence = sequence;
-                }
-
-                // // Create Topic.Msg add it to the linked list or topic messages
-                // fn append(self: *Topic, data: []const u8) !*Msg {
-                //     try self.storeAppend(data);
-
-                //     // Allocate message and body
-                //     const msg = try self.msg_pool.create();
-                //     errdefer self.msg_pool.destroy(msg);
-                //     const body = try self.allocator.dupe(u8, data);
-                //     errdefer self.allocator.free(body);
-
-                //     // Init message
-                //     self.sequence += 1;
-                //     msg.* = .{
-                //         .topic = self,
-                //         .sequence = self.sequence,
-                //         .created_at = self.server.now,
-                //         .body = body,
-                //         .rc = 0,
-                //     };
-
-                //     try self.appendMsg(msg);
-                //     return msg;
-                // }
-
-                // fn appendMsg(self: *Topic, msg: *Msg) !void {
-                //     const bytes = msg.body.len;
-                //     self.metric.inc(bytes);
-                //     self.server.metric.inc(bytes);
-                //     { // Update last pointer
-                //         if (self.last) |prev| {
-                //             assert(prev.sequence + 1 == msg.sequence);
-                //             prev.next = msg.acquire(); // Previous points to new
-                //         }
-                //         self.last = msg;
-                //     }
-                //     // If there is no channels messages are accumulated in
-                //     // topic. We hold hard pointer to the first message (to
-                //     // prevent release).
-                //     if (self.first == null)
-                //         self.first = if (self.channels.count() == 0) msg.acquire() else msg;
-                // }
-
-                // fn destroyMessage(self: *Topic, msg: *Msg) void {
-                //     assert(self.first.? == msg); // must be in order
-                //     self.first = msg.next;
-
-                //     self.metric.dec(msg.body.len);
-                //     self.server.metric.dec(msg.body.len);
-                //     self.allocator.free(msg.body);
-                //     self.msg_pool.destroy(msg);
-                // }
-
                 // Notify all channels that there is pending messages
                 fn notifyChannels(self: *Topic, msgs: u32) void {
                     var iter = self.channels.valueIterator();
@@ -660,14 +586,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         channel.topicAppended(msgs);
                     }
                 }
-
-                // fn findMsg(self: *Topic, sequence: u64) ?*Msg {
-                //     var next = self.first;
-                //     while (next) |msg| : (next = msg.next) {
-                //         if (msg.sequence == sequence) return msg;
-                //     }
-                //     return null;
-                // }
 
                 // Http interface actions -----------------
 
@@ -721,16 +639,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         const buf = payload[16..18];
                         mem.writeInt(u16, buf, self.attempts, .big);
                     }
-
-                    // pub fn seqFromId(msg_id: [16]u8) u64 {
-                    //     return mem.readInt(u64, msg_id[8..], .big);
-                    // }
-
-                    // fn idFromSeq(seq: u64) [16]u8 {
-                    //     var msg_id: [16]u8 = .{0} ** 16;
-                    //     mem.writeInt(u64, msg_id[8..16], seq, .big);
-                    //     return msg_id;
-                    // }
                 };
 
                 const DeferredMsg = struct {
@@ -1915,6 +1823,7 @@ fn publishFinish(allocator: mem.Allocator) !void {
 
 pub const infinite: u64 = std.math.maxInt(u64);
 
+// T need to have onTimer method and timer_ts field!
 pub fn TimerQueue(comptime T: type) type {
     return struct {
         pq: PQ,
