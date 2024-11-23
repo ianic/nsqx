@@ -14,10 +14,10 @@ const SendOp = @import("io.zig").SendOp;
 const Error = @import("io.zig").Error;
 
 const lookup = @import("lookup.zig");
-pub const Server = @import("server.zig").ServerType(Conn, lookup.Connector);
+pub const Server = @import("broker.zig").BrokerType(Conn, lookup.Connector);
 const Channel = Server.Channel;
-const MsgId = @import("server.zig").MsgId;
-const TimerQueue = @import("server.zig").TimerQueue;
+const MsgId = @import("broker.zig").MsgId;
+const TimerQueue = @import("broker.zig").TimerQueue;
 
 const log = std.log.scoped(.tcp);
 
@@ -292,7 +292,7 @@ pub const Conn = struct {
         }) |msg| {
             self.receivedMsg(msg) catch |err| switch (err) {
                 error.MessageSizeOverflow,
-                error.ServerMemoryOverflow,
+                error.BrokerMemoryOverflow,
                 error.TopicMemoryOverflow,
                 error.TopicMessagesOverflow,
                 => try self.respond(.pub_failed),

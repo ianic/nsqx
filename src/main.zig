@@ -233,7 +233,7 @@ fn catchSignals() void {
 }
 
 test {
-    _ = @import("server.zig");
+    _ = @import("broker.zig");
     _ = @import("protocol.zig");
     _ = @import("Options.zig");
     _ = @import("io.zig");
