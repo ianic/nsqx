@@ -51,7 +51,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
         // Current timestamp, set in tick().
         now: u64 = 0,
         // Channels waiting for wake up at specific timestamp.
-        timers: TimerQueue(Channel),
+        channel_timers: TimerQueue(Channel),
+        topic_timers: TimerQueue(Topic),
 
         // Init/deinit -----------------
 
@@ -62,7 +63,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 .notifier = notifier,
                 .started_at = now,
                 .now = now,
-                .timers = TimerQueue(Channel).init(allocator),
+                .channel_timers = TimerQueue(Channel).init(allocator),
+                .topic_timers = TimerQueue(Topic).init(allocator),
                 .limits = limits,
             };
         }
@@ -71,7 +73,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
             var iter = self.topics.iterator();
             while (iter.next()) |e| self.deinitTopic(e.value_ptr.*);
             self.topics.deinit();
-            self.timers.deinit();
+            self.channel_timers.deinit();
+            self.topic_timers.deinit();
         }
 
         fn deinitTopic(self: *Server, topic: *Topic) void {
@@ -83,7 +86,10 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
         pub fn tick(self: *Server, ts: u64) u64 {
             self.now = ts;
-            return self.timers.tick(ts);
+            return @min(
+                self.channel_timers.tick(ts),
+                self.topic_timers.tick(ts),
+            );
         }
 
         fn tsFromDelay(self: *Server, delay_ms: u32) u64 {
@@ -285,6 +291,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
             var ti = self.topics.valueIterator();
             while (ti.next()) |topic_ptr| {
                 const topic = topic_ptr.*;
+                try topic.publishDeferred();
 
                 var topic_file = try dir.createFile(topic.name, .{});
                 defer topic_file.close();
@@ -403,6 +410,21 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
                 store: Store,
 
+                timer_ts: u64 = infinite,
+                timers: *TimerQueue(Topic),
+                deferred: std.PriorityQueue(DeferredPublish, void, DeferredPublish.less),
+
+                const DeferredPublish = struct {
+                    data: []const u8,
+                    defer_until: u64 = 0,
+
+                    const Self = @This();
+
+                    fn less(_: void, a: Self, b: Self) math.Order {
+                        return math.order(a.defer_until, b.defer_until);
+                    }
+                };
+
                 const Metric = struct {
                     // Current number of messages in the topic
                     depth: usize = 0,
@@ -440,6 +462,8 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                             .retention_policy = .all,
                             .page_size = 1024 * 1024,
                         }),
+                        .timers = &server.topic_timers,
+                        .deferred = std.PriorityQueue(DeferredPublish, void, DeferredPublish.less).init(allocator, {}),
                     };
                 }
 
@@ -448,10 +472,13 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                     var iter = self.channels.iterator();
                     while (iter.next()) |e| self.deinitChannel(e.value_ptr.*);
                     self.channels.deinit();
+                    while (self.deferred.removeOrNull()) |dp| self.allocator.free(dp.data);
+                    self.deferred.deinit();
                     self.store.deinit();
                 }
 
                 fn empty(self: *Topic) void {
+                    // TODO missing store implementation
                     // If first is hard pointer release it.
                     // if (self.channels.count() == 0) if (self.first) |n| n.release();
                     _ = self;
@@ -556,13 +583,42 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn deferredPublish(self: *Topic, data: []const u8, delay: u32) !void {
-                    // TODO
-                    try self.publish(data);
-                    _ = delay;
-                    //try self.checkLimits(1, data.len);
-                    // var msg = try self.append(data);
-                    // msg.defer_until = self.server.tsFromDelay(delay);
-                    // self.notifyChannels(msg, 1);
+                    const data_dupe = try self.allocator.dupe(u8, data);
+                    errdefer self.allocator.free(data_dupe);
+                    const defer_until = self.server.tsFromDelay(delay);
+                    try self.deferred.add(.{
+                        .data = data_dupe,
+                        .defer_until = defer_until,
+                    });
+                    if (defer_until < self.timer_ts) {
+                        self.timer_ts = defer_until;
+                        self.timers.update(self) catch {};
+                    }
+                }
+
+                fn onTimer(self: *Topic, now: u64) void {
+                    self.timer_ts = infinite;
+                    while (self.deferred.peek()) |dp| {
+                        if (dp.defer_until <= now) {
+                            self.publish(dp.data) catch |err| {
+                                log.err("fail to publish deferred message {}", .{err});
+                                return;
+                            };
+                            self.allocator.free(dp.data);
+                            _ = self.deferred.remove();
+                            continue;
+                        }
+                        self.timer_ts = dp.defer_until;
+                        return;
+                    }
+                }
+
+                fn publishDeferred(self: *Topic) !void {
+                    while (self.deferred.peek()) |dp| {
+                        try self.publish(dp.data);
+                        self.allocator.free(dp.data);
+                        _ = self.deferred.remove();
+                    }
                 }
 
                 fn multiPublish(self: *Topic, msgs: u32, data: []const u8) !void {
@@ -705,7 +761,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                         .consumers_iterator = .{ .channel = self },
                         .in_flight = std.AutoHashMap(u64, InFlightMsg).init(allocator),
                         .deferred = std.PriorityQueue(DeferredMsg, void, DeferredMsg.less).init(allocator, {}),
-                        .timers = &topic.server.timers,
+                        .timers = &topic.server.channel_timers,
                         .now = &topic.server.now,
                         .timer_ts = infinite,
                         .ephemeral = protocol.isEphemeral(name),
@@ -738,6 +794,7 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
                 // Called from topic when new topic message is created.
                 fn topicAppended(self: *Channel, msgs: u32) void {
                     self.metric.depth += msgs;
+                    if (!self.topic.store.hasMore(self.sequence)) return;
                     self.wakeup() catch |err| {
                         if (!builtin.is_test)
                             log.err("fail to wakeup channel {s}: {}", .{ self.name, err });
@@ -746,7 +803,6 @@ pub fn ServerType(Consumer: type, Notifier: type) type {
 
                 // Notify consumers that there are messages to pull.
                 fn wakeup(self: *Channel) !void {
-                    if (!self.topic.store.hasMore(self.sequence)) return;
                     while (self.consumers_iterator.next()) |consumer| {
                         try consumer.wakeup();
                         if (!self.topic.store.hasMore(self.sequence)) break;
@@ -1173,7 +1229,7 @@ test "channel fin req" {
         try testing.expectEqual(3, channel.sequence);
     }
     { // 2 is re-queued
-        try consumer.requeue(2);
+        try consumer.requeue(2, 0);
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
     }
@@ -1268,8 +1324,8 @@ const TestConsumer = struct {
         try self.channel.?.finish(self.id(), MsgId.encode(sequence));
     }
 
-    fn requeue(self: *Self, sequence: u64) !void {
-        try self.channel.?.requeue(self.id(), MsgId.encode(sequence), 0);
+    fn requeue(self: *Self, sequence: u64, delay: u32) !void {
+        try self.channel.?.requeue(self.id(), MsgId.encode(sequence), delay);
     }
 
     fn pull(self: *Self) !void {
@@ -1499,8 +1555,6 @@ test "timeout messages" {
 }
 
 test "deferred messages" {
-    if (true) return error.SkipZigTest;
-
     const allocator = testing.allocator;
     const topic_name = "topic";
     const channel_name = "channel";
@@ -1513,33 +1567,42 @@ test "deferred messages" {
     defer consumer.deinit();
     try server.subscribe(&consumer, topic_name, channel_name);
     const channel = consumer.channel.?;
+    const topic = channel.topic;
+    consumer.ready_count = 3;
 
-    { // publish two deferred messages, channel puts them into deferred queue
+    { // publish two deferred messages, topic puts them into deferred queue
         try server.deferredPublish(topic_name, "message body", 2);
         try server.deferredPublish(topic_name, "message body", 1);
-        try testing.expectEqual(2, channel.metric.depth);
+        try testing.expectEqual(0, channel.metric.depth);
         try testing.expectEqual(0, channel.in_flight.count());
-        try testing.expectEqual(2, channel.deferred.count());
+        try testing.expectEqual(0, channel.deferred.count());
+        try testing.expectEqual(2, topic.deferred.count());
+        try testing.expectEqual(0, topic.store.last_sequence);
     }
 
-    { // move now, one is in flight after wakeup
-        server.now = nsFromMs(1);
-        try channel.wakeup();
+    { // move now, one is in flight after publish from topic.onTimer
+        _ = server.tick(nsFromMs(1));
+        try testing.expectEqual(1, topic.store.last_sequence);
         try testing.expectEqual(1, channel.in_flight.count());
-        try testing.expectEqual(1, channel.deferred.count());
+        try testing.expectEqual(0, channel.deferred.count());
+        try testing.expectEqual(1, topic.deferred.count());
     }
     { // re-queue
-        try channel.requeue(consumer.id(), TestServer.Channel.InFlightMsg.idFromSeq(2), 2);
+        try consumer.requeue(1, 2);
         try testing.expectEqual(0, channel.in_flight.count());
-        try testing.expectEqual(2, channel.deferred.count());
+        try testing.expectEqual(1, channel.deferred.count());
     }
 
     { // move now to deliver both
         server.now = nsFromMs(3);
-        consumer.ready_count = 2;
         try channel.wakeup();
-        try testing.expectEqual(2, channel.in_flight.count());
+        try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
+        topic.onTimer(server.now);
+        try testing.expectEqual(2, topic.store.last_sequence);
+        try testing.expectEqual(0, topic.deferred.count());
+        try testing.expectEqual(0, channel.deferred.count());
+        try testing.expectEqual(2, channel.in_flight.count());
     }
 }
 
@@ -1803,7 +1866,7 @@ fn publishFinish(allocator: mem.Allocator) !void {
     const channel2 = channel2_consumer2.channel.?;
     try channel2_consumer1.pull();
     try testing.expectEqual(3, channel2_consumer1.lastSequence());
-    try channel2_consumer1.requeue(3);
+    try channel2_consumer1.requeue(3, 0);
     try testing.expectEqual(1, channel2.deferred.count());
     try channel2_consumer2.pull();
     try testing.expectEqual(3, channel2_consumer2.lastSequence());
@@ -1967,7 +2030,7 @@ test "dump/restore" {
             server.now += ns_per_s;
             try server.publish(topic_name, "medo u ducan "); // msg 2, sequence: 102
             server.now += ns_per_s;
-            try server.deferredPublish(topic_name, "nije reko dobar dan.", 987); // msg 3, sequence: 103
+            try server.publish(topic_name, "nije reko dobar dan."); // msg 3, sequence: 103
         }
 
         // channel 1: 1-finished, 2-in flight, 3-next
@@ -1981,6 +2044,7 @@ test "dump/restore" {
         try consumer2.pull();
         try consumer2.pull();
         try consumer2.pull();
+        try testing.expectEqual(3, channel2.in_flight.count());
         try consumer2.finish(102);
         try testing.expectEqual(2, channel2.in_flight.count());
         try testing.expectEqual(103, channel2.sequence);
