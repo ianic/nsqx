@@ -39,6 +39,10 @@ pub const Page = struct {
         return self.capacity() - self.writePos();
     }
 
+    fn messagesCount(self: Self) u32 {
+        return @intCast(self.offsets.items.len);
+    }
+
     pub fn release(self: *Self, refs: u32) void {
         self.rc -= refs;
     }
@@ -194,7 +198,11 @@ pub const Store = struct {
             // if (self.pages.items.len > 2) {
             //     self.options.page_size *|= 2;
             // }
+
             // add new page
+            var offsets = std.ArrayList(u32).init(self.allocator);
+            try offsets.ensureTotalCapacity(if (self.lastPage()) |page| page.messagesCount() else 128);
+            errdefer offsets.deinit();
             const buf = try self.allocator.alloc(u8, @max(self.options.page_size, bytes_count));
             errdefer self.allocator.free(buf);
             try self.pages.append(
@@ -203,9 +211,10 @@ pub const Store = struct {
                     .first_sequence = 1 +% self.last_sequence,
                     .no = 1 +% self.last_page,
                     .buf = buf,
-                    .offsets = std.ArrayList(u32).init(self.allocator),
+                    .offsets = offsets,
                 },
             );
+
             self.last_page +%= 1;
         }
         const page = self.lastPage().?;
