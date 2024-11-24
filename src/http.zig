@@ -225,8 +225,8 @@ const Stat = struct {
     const Topic = struct {
         topic_name: []const u8,
         depth: usize = 0,
-        message_count: usize = 0,
-        message_bytes: usize = 0,
+        message_count: usize,
+        message_bytes: usize,
         paused: bool,
         channels: []Channel,
         e2e_processing_latency: struct { count: usize = 0 } = .{},

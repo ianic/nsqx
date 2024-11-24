@@ -26,10 +26,16 @@ pub const MsgId = struct {
         };
     }
 
-    fn encode(sequence: u64) [16]u8 {
-        var msg_id: [16]u8 = .{0} ** 16;
-        mem.writeInt(u64, msg_id[8..16], sequence, .big);
+    fn fromSequence(sequence: u64) [16]u8 {
+        var msg_id: [16]u8 = undefined;
+        encode(&msg_id, 0, sequence);
         return msg_id;
+    }
+
+    fn encode(buf: *[16]u8, page: u32, sequence: u64) void {
+        mem.writeInt(u32, buf[0..4], 0, .big); // first 4 bytes, unused
+        mem.writeInt(u32, buf[4..8], page, .big); // 4 bytes, page no
+        mem.writeInt(u64, buf[8..16], sequence, .big); // 8 bytes, sequence
     }
 };
 
@@ -394,21 +400,14 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         fn TopicType() type {
             return struct {
                 allocator: mem.Allocator,
-                name: []const u8,
                 broker: *Broker,
-                channels: std.StringHashMap(*Channel),
-                // Topic message sequence, used for message id.
-                sequence: u64 = 0,
-                // Hard pointer to the first message when topic has no channels.
-                // Weak pointer if topic has channels.
-                // first: ?*Msg = null,
-                // Weak pointer to the end of linked list of topic messages
-                // last: ?*Msg = null,
+                name: []const u8,
                 paused: bool = false,
+                channels: std.StringHashMap(*Channel),
+                store: Store,
+
                 metric: Metric = .{},
                 metric_prev: Metric = .{},
-
-                store: Store,
 
                 timer_ts: u64 = infinite,
                 timers: *TimerQueue(Topic),
@@ -460,7 +459,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                             .ack_policy = .explicit,
                             .deliver_policy = .all,
                             .retention_policy = .all,
-                            .page_size = 1024 * 1024,
+                            .page_size = 1024 * 1024, // TODO default, min, max
                         }),
                         .timers = &broker.topic_timers,
                         .deferred = std.PriorityQueue(DeferredPublish, void, DeferredPublish.less).init(allocator, {}),
@@ -528,14 +527,14 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                     channel.sequence = self.store.subscribe();
                     if (first_channel) {
-                        // First channel gets all messages from the topic
+                        // First channel gets all messages from the topic,
+                        // move metrics to the channel.
                         channel.metric.depth = self.metric.depth;
                         self.metric.reset();
-
+                        // Other channels are getting new (from current sequence).
                         self.store.options.retention_policy = .interest;
                         self.store.options.deliver_policy = .new;
                     }
-
                     self.broker.channelCreated(self.name, channel.name);
                     return channel;
                 }
@@ -566,12 +565,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         mem.writeInt(u32, header[4..8], @intFromEnum(protocol.FrameType.message), .big); // frame type
                         mem.writeInt(u64, header[8..16], self.broker.now, .big); // timestamp
                         mem.writeInt(u16, header[16..18], 1, .big); // attempts
-                        // 16 bytes message id
-                        mem.writeInt(u32, header[18..22], 0, .big); // first 4 bytes, unused
-                        mem.writeInt(u32, header[22..26], res.page, .big); // 4 bytes, page no
-                        mem.writeInt(u64, header[26..34], res.sequence, .big); // 8 bytes, sequence
+                        MsgId.encode(header[18..34], res.page, res.sequence); // msg id
                     }
-                    // log.debug("topic {s} store append {} {}", .{ self.name, res.sequence, data.len });
                     @memcpy(body, data);
                     self.metric.inc(data.len, self.channels.count() == 0);
                 }
@@ -1321,11 +1316,11 @@ const TestConsumer = struct {
     }
 
     fn finish(self: *Self, sequence: u64) !void {
-        try self.channel.?.finish(self.id(), MsgId.encode(sequence));
+        try self.channel.?.finish(self.id(), MsgId.fromSequence(sequence));
     }
 
     fn requeue(self: *Self, sequence: u64, delay: u32) !void {
-        try self.channel.?.requeue(self.id(), MsgId.encode(sequence), delay);
+        try self.channel.?.requeue(self.id(), MsgId.fromSequence(sequence), delay);
     }
 
     fn pull(self: *Self) !void {
