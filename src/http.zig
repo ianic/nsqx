@@ -107,7 +107,7 @@ pub const Conn = struct {
         const server = self.listener.server;
         const cmd = parse(head.target) catch return error.NotFound;
         switch (cmd) {
-            .stats => try jsonStat(self.gpa, writer, server),
+            .stats => |args| try jsonStat(self.gpa, args, writer, server),
             .info => try jsonInfo(writer, server, self.listener.options),
 
             .topic_create => |name| try server.createTopic(name),
@@ -230,6 +230,7 @@ const Stat = struct {
         paused: bool,
         channels: []Channel,
         e2e_processing_latency: struct { count: usize = 0 } = .{},
+        store: Store,
     };
     const Channel = struct {
         channel_name: []const u8,
@@ -242,6 +243,7 @@ const Stat = struct {
         client_count: usize,
         clients: []Client,
         paused: bool,
+        sequence: u64,
         e2e_processing_latency: struct { count: usize = 0 } = .{},
     };
     const Client = struct {
@@ -264,6 +266,22 @@ const Stat = struct {
         topic: []const u8,
         count: usize,
     };
+    const Store = struct {
+        last_page: u32,
+        last_sequence: u64,
+        message_count: usize,
+        message_bytes: usize,
+        capacity: usize,
+        pages: []Page,
+    };
+    const Page = struct {
+        no: u32,
+        first_sequence: u64,
+        message_count: usize,
+        message_bytes: usize,
+        references: u32,
+        capacity: usize,
+    };
 
     version: []const u8 = "0.1.0",
     health: []const u8 = "OK",
@@ -272,50 +290,55 @@ const Stat = struct {
     producers: []Client,
 };
 
-fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
+// gauge   - current value, can go up or down
+// counter - summary value since start/creation, only increases
+fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, server: *Server) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var topics = try allocator.alloc(Stat.Topic, server.topics.count());
-    var topics_iter = server.topics.iterator();
-    var topic_idx: usize = 0;
-    while (topics_iter.next()) |topic_elem| : (topic_idx += 1) {
-        const topic_name = topic_elem.key_ptr.*;
-        const topic = topic_elem.value_ptr.*;
+    const topics_capacity = if (args.topic.len == 0) server.topics.count() else 1;
+    var topics = try std.ArrayList(Stat.Topic).initCapacity(allocator, topics_capacity);
+    var topics_iter = server.topics.valueIterator();
+    while (topics_iter.next()) |topic_elem| {
+        const topic = topic_elem.*;
 
-        var channels = try allocator.alloc(Stat.Channel, topic.channels.count());
-        var channels_iter = topic.channels.iterator();
-        var channel_idx: usize = 0;
-        while (channels_iter.next()) |channel_elem| : (channel_idx += 1) {
-            const channel_name = channel_elem.key_ptr.*;
-            const channel = channel_elem.value_ptr.*;
+        if (args.topic.len > 0 and !mem.eql(u8, topic.name, args.topic))
+            continue;
+
+        const channels_capacity = if (args.channel.len == 0) topic.channels.count() else 1;
+        var channels = try std.ArrayList(Stat.Channel).initCapacity(allocator, channels_capacity);
+        var channels_iter = topic.channels.valueIterator();
+        while (channels_iter.next()) |channel_elem| {
+            const channel = channel_elem.*;
+
+            if (args.channel.len > 0 and !mem.eql(u8, channel.name, args.channel))
+                continue;
 
             const client_count = channel.consumers.items.len;
-            var clients = try allocator.alloc(Stat.Client, client_count);
+            const clients: []Stat.Client = if (args.includeClients()) brk: {
+                var clients = try allocator.alloc(Stat.Client, client_count);
+                for (channel.consumers.items, 0..) |consumer, i| {
+                    const remote_address = try std.fmt.allocPrint(allocator, "{}", .{consumer.addr});
+                    clients[i] = Stat.Client{
+                        .client_id = consumer.identify.client_id,
+                        .hostname = consumer.identify.hostname,
+                        .user_agent = consumer.identify.user_agent,
+                        .remote_address = remote_address,
+                        .ready_count = consumer.ready_count,
+                        .in_flight_count = consumer.in_flight,
+                        .message_count = consumer.metric.send,
+                        .finish_count = consumer.metric.finish,
+                        .requeue_count = consumer.metric.requeue,
+                        .connect_ts = consumer.metric.connected_at / std.time.ns_per_s,
+                        .msg_timeout = consumer.identify.msg_timeout,
+                    };
+                }
+                break :brk clients;
+            } else &.{};
 
-            for (channel.consumers.items, 0..) |consumer, i| {
-                const remote_address = try std.fmt.allocPrint(allocator, "{}", .{consumer.addr});
-                clients[i] = Stat.Client{
-                    .client_id = consumer.identify.client_id,
-                    .hostname = consumer.identify.hostname,
-                    .user_agent = consumer.identify.user_agent,
-                    .remote_address = remote_address,
-                    .ready_count = consumer.ready_count,
-                    .in_flight_count = consumer.in_flight,
-                    .message_count = consumer.metric.send,
-                    .finish_count = consumer.metric.finish,
-                    .requeue_count = consumer.metric.requeue,
-                    .connect_ts = consumer.metric.connected_at / std.time.ns_per_s,
-                    .msg_timeout = consumer.identify.msg_timeout,
-                };
-            }
-
-            // gauge   - current value, can go up or down
-            // counter - summary value since start/creation, only increases
-
-            channels[channel_idx] = Stat.Channel{
-                .channel_name = channel_name,
+            try channels.append(Stat.Channel{
+                .channel_name = channel.name,
 
                 // Current number of messages published to the topic but not
                 // processed by this channel.
@@ -344,22 +367,52 @@ fn jsonStat(gpa: std.mem.Allocator, writer: anytype, server: *Server) !void {
 
                 .clients = clients,
                 .paused = channel.paused,
-            };
+                .sequence = channel.sequence,
+            });
         }
 
-        topics[topic_idx] = Stat.Topic{
-            .topic_name = topic_name,
+        var pages = try std.ArrayList(Stat.Page).initCapacity(allocator, topic.store.pages.items.len);
+        var message_count: usize = 0;
+        var message_bytes: usize = 0;
+        var capacity: usize = 0;
+        for (topic.store.pages.items) |page| {
+            if (args.includePages()) {
+                try pages.append(.{
+                    .no = page.no,
+                    .first_sequence = page.first_sequence,
+                    .message_count = page.messagesCount(),
+                    .message_bytes = page.writePos(),
+                    .references = page.rc,
+                    .capacity = page.capacity(),
+                });
+            }
+            message_count += page.messagesCount();
+            message_bytes += page.writePos();
+            capacity += page.capacity();
+        }
+        const store = Stat.Store{
+            .last_sequence = topic.store.last_sequence,
+            .last_page = topic.store.last_page,
+            .message_count = message_count,
+            .message_bytes = message_bytes,
+            .capacity = capacity,
+            .pages = pages.items,
+        };
+
+        try topics.append(.{
+            .topic_name = topic.name,
             .depth = topic.metric.depth,
             .message_count = topic.metric.total,
             .message_bytes = topic.metric.total_bytes,
             .paused = topic.paused,
-            .channels = channels,
-        };
+            .channels = channels.items,
+            .store = store,
+        });
     }
 
     const stat = Stat{
         .start_time = server.started_at / std.time.ns_per_s,
-        .topics = topics,
+        .topics = topics.items,
         .producers = &.{},
     };
 
@@ -380,17 +433,47 @@ const Command = union(enum) {
     channel_pause: Channel,
     channel_unpause: Channel,
 
-    stats: void,
+    stats: Stats,
     info: void,
 
     const Channel = struct {
         topic_name: []const u8,
         name: []const u8,
     };
+
+    const Stats = struct {
+        topic: []const u8 = &.{},
+        channel: []const u8 = &.{},
+        format: []const u8 = &.{},
+        include_clients: []const u8 = &.{},
+        include_pages: []const u8 = &.{},
+
+        fn includeClients(self: Stats) bool {
+            if (mem.eql(u8, self.include_clients, "false") or
+                mem.eql(u8, self.include_clients, "0")) return false;
+            return true;
+        }
+
+        fn includePages(self: Stats) bool {
+            if (mem.eql(u8, self.include_pages, "true") or
+                mem.eql(u8, self.include_pages, "1")) return true;
+            return false;
+        }
+    };
 };
 
 fn parse(target: []const u8) !Command {
-    if (mem.startsWith(u8, target, "/stats")) return .{ .stats = {} };
+    if (mem.startsWith(u8, target, "/stats")) {
+        if (target.len <= 7) return .{ .stats = .{} };
+        const qs = target[7..];
+        return .{ .stats = .{
+            .topic = queryStringValue(qs, "topic"),
+            .channel = queryStringValue(qs, "channel"),
+            .format = queryStringValue(qs, "format"),
+            .include_clients = queryStringValue(qs, "include_clients"),
+            .include_pages = queryStringValue(qs, "include_pages"),
+        } };
+    }
     if (mem.startsWith(u8, target, "/info")) return .{ .info = {} };
 
     if (mem.startsWith(u8, target, "/topic")) {
@@ -455,12 +538,17 @@ fn findValue(query: []const u8, key: []const u8) ![]const u8 {
     return error.KeyNotFound;
 }
 
-const testing = std.testing;
+fn queryStringValue(query: []const u8, key: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (mem.indexOfScalarPos(u8, pair, 0, '=')) |sep| {
+            if (mem.eql(u8, key, pair[0..sep])) return pair[sep + 1 ..];
+        }
+    }
+    return &.{};
+}
 
-// parse also these params for stats requests
-// target: /stats?format=json&topic=topic-000&include_clients=false, content length: 0
-// target: /stats?format=json&topic=topic-000&channel=000, content length: 0
-// target: /stats?format=json&include_clients=false, content length: 0
+const testing = std.testing;
 
 test parse {
     try testing.expectEqualStrings("topic-001", (try parse("/topic/empty?topic=topic-001")).topic_empty);
@@ -493,6 +581,13 @@ test parse {
     cmd = try parse("/create_channel?topic=topic-012&channel=013");
     try testing.expectEqualStrings("topic-012", cmd.channel_create.topic_name);
     try testing.expectEqualStrings("013", cmd.channel_create.name);
+
+    cmd = try parse("/stats?format=json&topic=topic-014&channel=channel-014&include_clients=false");
+    try testing.expectEqualStrings("topic-014", cmd.stats.topic);
+    try testing.expectEqualStrings("channel-014", cmd.stats.channel);
+    try testing.expectEqualStrings("false", cmd.stats.include_clients);
+    try testing.expect(!cmd.stats.includeClients());
+    try testing.expectEqualStrings("json", cmd.stats.format);
 }
 
 test findValue {

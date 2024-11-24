@@ -27,11 +27,11 @@ pub const Page = struct {
         @memcpy(self.buf[wp..][0..bytes.len], bytes);
     }
 
-    fn writePos(self: Self) u32 {
+    pub fn writePos(self: Self) u32 {
         return if (self.offsets.items.len == 0) 0 else self.offsets.getLast();
     }
 
-    fn capacity(self: Self) u32 {
+    pub fn capacity(self: Self) u32 {
         return @intCast(self.buf.len);
     }
 
@@ -39,7 +39,7 @@ pub const Page = struct {
         return self.capacity() - self.writePos();
     }
 
-    fn messagesCount(self: Self) u32 {
+    pub fn messagesCount(self: Self) u32 {
         return @intCast(self.offsets.items.len);
     }
 
