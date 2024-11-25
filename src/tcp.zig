@@ -14,8 +14,8 @@ const SendOp = @import("io.zig").SendOp;
 const Error = @import("io.zig").Error;
 
 const lookup = @import("lookup.zig");
-pub const Server = @import("broker.zig").BrokerType(Conn, lookup.Connector);
-const Channel = Server.Channel;
+pub const Broker = @import("broker.zig").BrokerType(Conn, lookup.Connector);
+const Channel = Broker.Channel;
 const MsgId = @import("broker.zig").MsgId;
 const TimerQueue = @import("broker.zig").TimerQueue;
 
@@ -24,7 +24,7 @@ const log = std.log.scoped(.tcp);
 pub fn ListenerType(comptime ConnType: type) type {
     return struct {
         allocator: mem.Allocator,
-        server: *Server,
+        server: *Broker,
         options: Options,
         socket: socket_t,
         io: *Io,
@@ -43,7 +43,7 @@ pub fn ListenerType(comptime ConnType: type) type {
             self: *Self,
             allocator: mem.Allocator,
             io: *Io,
-            server: *Server,
+            server: *Broker,
             options: Options,
             socket: socket_t,
         ) !void {
@@ -292,9 +292,8 @@ pub const Conn = struct {
         }) |msg| {
             self.receivedMsg(msg) catch |err| switch (err) {
                 error.MessageSizeOverflow,
-                error.BrokerMemoryOverflow,
-                error.TopicMemoryOverflow,
-                error.TopicMessagesOverflow,
+                error.BrokerOutOfPages,
+                error.TopicOutOfPages,
                 => try self.respond(.pub_failed),
                 error.MessageNotInFlight => {
                     log.warn("{} message not in flight, operation {s} ", .{ self.socket, @tagName(msg) });

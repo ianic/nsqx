@@ -10,7 +10,7 @@ const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const SendOp = @import("io.zig").SendOp;
 const Error = @import("io.zig").Error;
-const Server = @import("tcp.zig").Server;
+const Broker = @import("tcp.zig").Broker;
 pub const Listener = @import("tcp.zig").ListenerType(Conn);
 
 const log = std.log.scoped(.http);
@@ -204,10 +204,10 @@ const Info = struct {
     max_heartbeat_interval: u32,
 };
 
-fn jsonInfo(writer: anytype, server: *Server, options: Options) !void {
+fn jsonInfo(writer: anytype, broker: *Broker, options: Options) !void {
     var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const hostname = try std.posix.gethostname(&hostname_buf);
-    const start_time = server.started_at / std.time.ns_per_s;
+    const start_time = broker.started_at / std.time.ns_per_s;
 
     const info = Info{
         .broadcast_address = "localhost",
@@ -272,6 +272,8 @@ const Stat = struct {
         message_count: usize,
         message_bytes: usize,
         capacity: usize,
+        page_size: usize,
+        pages_count: usize,
         pages: []Page,
     };
     const Page = struct {
@@ -287,19 +289,23 @@ const Stat = struct {
     health: []const u8 = "OK",
     start_time: u64,
     topics: []Topic,
+    store: struct {
+        pages: u32,
+        bytes: u64,
+    },
     producers: []Client,
 };
 
 // gauge   - current value, can go up or down
 // counter - summary value since start/creation, only increases
-fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, server: *Server) !void {
+fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker: *Broker) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const topics_capacity = if (args.topic.len == 0) server.topics.count() else 1;
+    const topics_capacity = if (args.topic.len == 0) broker.topics.count() else 1;
     var topics = try std.ArrayList(Stat.Topic).initCapacity(allocator, topics_capacity);
-    var topics_iter = server.topics.valueIterator();
+    var topics_iter = broker.topics.valueIterator();
     while (topics_iter.next()) |topic_elem| {
         const topic = topic_elem.*;
 
@@ -396,6 +402,8 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, server
             .message_count = message_count,
             .message_bytes = message_bytes,
             .capacity = capacity,
+            .page_size = topic.store.page_size,
+            .pages_count = topic.store.pages.items.len,
             .pages = pages.items,
         };
 
@@ -410,9 +418,14 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, server
         });
     }
 
+    const store_stat = @import("store.zig").stat;
     const stat = Stat{
-        .start_time = server.started_at / std.time.ns_per_s,
+        .start_time = broker.started_at / std.time.ns_per_s,
         .topics = topics.items,
+        .store = .{
+            .pages = store_stat.pages,
+            .bytes = store_stat.capacity,
+        },
         .producers = &.{},
     };
 

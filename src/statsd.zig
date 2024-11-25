@@ -9,14 +9,14 @@ const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
 const Options = @import("Options.zig");
-const Server = @import("tcp.zig").Server;
+const Broker = @import("tcp.zig").Broker;
 
 const log = std.log.scoped(.statsd);
 
 pub const Connector = struct {
     allocator: mem.Allocator,
     io: *Io,
-    server: *Server,
+    server: *Broker,
     options: Options.Statsd,
     address: std.net.Address,
     socket: socket_t = 0,
@@ -29,7 +29,7 @@ pub const Connector = struct {
 
     const Self = @This();
 
-    pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, server: *Server, options: Options) !void {
+    pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, server: *Broker, options: Options) !void {
         self.* = .{
             .allocator = allocator,
             .io = io,

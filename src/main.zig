@@ -41,7 +41,7 @@ pub fn main() !void {
     try lookup_connector.init(allocator, &io, options.lookup_tcp_addresses, options);
     defer lookup_connector.deinit();
 
-    var server = tcp.Server.init(allocator, &lookup_connector, io.now(), options.limits);
+    var server = tcp.Broker.init(allocator, &lookup_connector, io.now(), options.limits);
     defer server.deinit();
 
     var tcp_listener: tcp.Listener = undefined;
@@ -149,7 +149,7 @@ fn mallocInfo() void {
     //c.malloc_stats();
 }
 
-fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Server) !void {
+fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Broker) !void {
     const print = std.debug.print;
     print("listener connections:\n", .{});
     print("  active {}, accepted: {}, completed: {}\n", .{ listener.metric.accept - listener.metric.close, listener.metric.accept, listener.metric.close });

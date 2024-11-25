@@ -57,7 +57,7 @@ pub const Connector = struct {
                 .ack_policy = .none,
                 .deliver_policy = .all,
                 .retention_policy = .all,
-                .page_size = 64 * 1024,
+                .initial_page_size = 64 * 1024,
             }),
         };
         errdefer self.deinit();

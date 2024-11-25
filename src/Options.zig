@@ -27,7 +27,7 @@ const usage =
     \\  --max-heartbeat-interval duration
     \\        maximum client configurable duration of time between client heartbeats (default 1m0s)
     \\  --max-msg-size int
-    \\        maximum size of a single message in bytes (default 1048576)
+    \\        maximum size of a single message in bytes (default 1M)
     \\  --max-msg-timeout duration
     \\        maximum duration before a message will timeout (default 15m0s)
     \\  --max-rdy-count int
@@ -46,12 +46,15 @@ const usage =
     \\  --statsd-udp-packet-size int
     \\        the size in bytes of statsd UDP packets (default 508)
     \\
-    \\  --max-mem
-    \\        maximum total message size of all messages in all topics (default 50% of system memory)
-    \\  --topic-max-mem
-    \\        maximum total messages size per topic (default 1GB)
-    \\  --topic-max-msgs
-    \\        maximum number of messages per topic (default 0, unlimited)
+    \\  memory limits:
+    \\  --max-pages
+    \\        total number of memory pages per broker (default unlimited)
+    \\  --topic-max-pages
+    \\        total number of memory pages per topic (default unlimited)
+    \\  --initial-page-size
+    \\        initial topic page size (default 64k)
+    \\  --max-page-size
+    \\        max topic memory page size (default 1M)
     \\
     \\  io_uring:
     \\  --io-entries
@@ -96,12 +99,13 @@ statsd: Statsd = .{},
 
 const Options = @This();
 
-const unlimited = std.math.maxInt(usize);
+const unlimited = std.math.maxInt(u32);
 
 pub const Limits = struct {
-    max_mem: usize = unlimited,
-    topic_max_mem: usize = unlimited,
-    topic_max_msgs: usize = unlimited,
+    max_pages: u32 = unlimited,
+    topic_max_pages: u32 = unlimited,
+    initial_page_size: u32 = 64 * 1024,
+    max_page_size: u32 = 1024 * 1024,
 };
 
 pub const Io = struct {
@@ -149,7 +153,6 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
     var opt: Options = .{
         .hostname = hostname,
         .statsd = .{ .prefix = "nsq.%s" },
-        .limits = .{ .max_mem = totalSystemMemory() / 2 }, // 50%
     };
 
     outer: while (iter.next()) |arg| {
@@ -205,13 +208,15 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
         } else if (iter.durationMs("statsd-interval")) |d| {
             opt.statsd.interval = d;
 
-            // limits
-        } else if (iter.byteSize("max-mem")) |d| {
-            opt.limits.max_mem = d;
-        } else if (iter.byteSize("topic-max-mem")) |d| {
-            opt.limits.topic_max_mem = d;
-        } else if (iter.byteSize("topic-max-msgs")) |d| {
-            opt.limits.topic_max_msgs = d;
+            // storage limits
+        } else if (iter.byteSize(u32, "max-pages")) |d| {
+            opt.limits.max_pages = d;
+        } else if (iter.byteSize(u32, "topic-max-pages")) |d| {
+            opt.limits.topic_max_pages = d;
+        } else if (iter.byteSize(u32, "initial-page-size")) |d| {
+            opt.limits.initial_page_size = d;
+        } else if (iter.byteSize(u32, "max-page-size")) |d| {
+            opt.limits.max_page_size = d;
 
             // io_uring
         } else if (iter.int("io-entries", u16)) |i| {
@@ -245,17 +250,13 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
     if (lookup_tcp_addresses.items.len > 0) opt.lookup_tcp_addresses = try lookup_tcp_addresses.toOwnedSlice();
     opt.statsd.prefix = try allocator.dupe(u8, opt.statsd.prefix);
 
-    if (opt.limits.max_mem == 0) opt.limits.max_mem = unlimited;
-    if (opt.limits.topic_max_mem == 0) opt.limits.topic_max_mem = unlimited;
-    if (opt.limits.topic_max_msgs == 0) opt.limits.topic_max_msgs = unlimited;
-
     return opt;
 }
 
 const ArgIterator = struct {
     allocator: mem.Allocator,
     inner: std.process.ArgIterator,
-    arg: [:0]const u8 = undefined,
+    arg: [:0]const u8 = &.{},
 
     const Self = @This();
 
@@ -320,17 +321,23 @@ const ArgIterator = struct {
         return null;
     }
 
-    fn byteSize(self: *Self, flag: []const u8) ?usize {
+    fn byteSize(self: *Self, comptime T: type, flag: []const u8) ?T {
         if (eql(flag, self.arg)) {
             const val = self.value();
-            return parseByteSize(val) catch {
-                fatal("unable to parse byte size '{s}', valid format: 123K, 456G, 789T", .{val});
+            return parseByteSize(T, val) catch {
+                fatal("unable to parse byte size '{s}', valid format: 123K, 456M, 789G", .{val});
             };
         }
         return null;
     }
 
     fn value(self: *Self) []const u8 {
+        if (self.arg.len > 0) {
+            if (mem.indexOfScalar(u8, self.arg, '=')) |pos| {
+                if (self.arg.len > pos + 1)
+                    return self.arg[pos + 1 ..];
+            }
+        }
         return self.inner.next() orelse {
             fatal("expected parameter after {s}", .{self.arg});
         };
@@ -347,8 +354,11 @@ fn subArg(iter: *std.process.ArgIterator) ![]const u8 {
 
 fn eql(flag: []const u8, arg: []const u8) bool {
     if (arg.len < 2) return false;
-    if (flag.len > 1 and arg[1] == '-') return mem.eql(u8, flag, arg[2..]);
-    return mem.eql(u8, flag, arg[1..]);
+    const start: usize = if (flag.len > 1 and arg[1] == '-') 2 else 1;
+    if (mem.indexOfScalar(u8, arg, '=')) |end| {
+        return mem.eql(u8, flag, arg[start..end]);
+    }
+    return mem.eql(u8, flag, arg[start..]);
 }
 
 fn parseAddress(allocator: mem.Allocator, arg: []const u8, default_port: u16) !net.Address {
@@ -384,7 +394,7 @@ test parseAddressFailing {
 }
 
 // test example:
-// $ zig run -lc Options.zig -- --max-mem 10G --topic-max-mem 4G --topic-max-msgs 1T
+// $ zig run -lc Options.zig -- --max-pages 1G  --max-page-size 2M --topic-max-pages=8k
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -416,9 +426,10 @@ pub fn main() !void {
     std.debug.print("statsd_udp_packet_size: {}\n", .{opt.statsd.udp_packet_size});
 
     std.debug.print("\n", .{});
-    std.debug.print("max_mem: {}\n", .{opt.limits.max_mem});
-    std.debug.print("topic_max_mem: {}\n", .{opt.limits.topic_max_mem});
-    std.debug.print("topic_max_msgs: {}\n", .{opt.limits.topic_max_msgs});
+    std.debug.print("max_pages: {}\n", .{opt.limits.max_pages});
+    std.debug.print("topic_max_pages: {}\n", .{opt.limits.topic_max_pages});
+    std.debug.print("initial_page_size: {}\n", .{opt.limits.initial_page_size});
+    std.debug.print("max_page_size: {}\n", .{opt.limits.max_page_size});
 }
 
 fn parseDuration(arg: []const u8) !u64 {
@@ -462,35 +473,35 @@ test parseDuration {
     try testing.expectError(error.InvalidCharacter, parseDuration("3-m56ss"));
 }
 
-fn parseByteSize(arg: []const u8) !u64 {
+fn parseByteSize(comptime T: type, arg: []const u8) !T {
     if (arg.len < 1) return 0;
     const b_char = arg[arg.len - 1] == 'b' or arg[arg.len - 1] == 'B';
     if (b_char and arg.len < 2) return 0;
     var unit_pos: usize = arg.len - @as(usize, if (b_char) 2 else 1);
     if (unit_pos > arg.len) return 0;
-    const unit: u64 = switch (arg[unit_pos]) {
+    const unit: T = switch (arg[unit_pos]) {
         'b', 'B' => 1,
         'k', 'K' => 1024,
         'm', 'M' => 1024 * 1024,
         'g', 'G' => 1024 * 1024 * 1024,
-        't', 'T' => 1024 * 1024 * 1024 * 1024,
+        't', 'T' => if (@sizeOf(T) > 4) 1024 * 1024 * 1024 * 1024 else 0,
         else => brk: {
             unit_pos += 1;
             break :brk 1;
         },
     };
-    return try fmt.parseInt(u64, arg[0..unit_pos], 10) * unit;
+    return try fmt.parseInt(T, arg[0..unit_pos], 10) * unit;
 }
 
 test parseByteSize {
-    try testing.expectEqual(123 * 1024, try parseByteSize("123K"));
-    try testing.expectEqual(4567 * 1024 * 1024, try parseByteSize("4567M"));
-    try testing.expectEqual(89, try parseByteSize("89"));
-    try testing.expectEqual(0, parseByteSize("B"));
-    try testing.expectEqual(123, parseByteSize("123B"));
+    try testing.expectEqual(123 * 1024, try parseByteSize(usize, "123K"));
+    try testing.expectEqual(4567 * 1024 * 1024, try parseByteSize(usize, "4567M"));
+    try testing.expectEqual(89, try parseByteSize(usize, "89"));
+    try testing.expectEqual(0, parseByteSize(usize, "B"));
+    try testing.expectEqual(123, parseByteSize(usize, "123B"));
 
-    try testing.expectEqual(123 * 1024, try parseByteSize("123KB"));
-    try testing.expectEqual(4567 * 1024 * 1024, try parseByteSize("4567MB"));
+    try testing.expectEqual(123 * 1024, try parseByteSize(usize, "123KB"));
+    try testing.expectEqual(4567 * 1024 * 1024, try parseByteSize(usize, "4567MB"));
 }
 
 pub fn fatal(comptime format: []const u8, args: anytype) noreturn {

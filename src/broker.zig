@@ -9,7 +9,8 @@ const log = std.log.scoped(.broker);
 const Error = @import("io.zig").Error;
 const protocol = @import("protocol.zig");
 const Limits = @import("Options.zig").Limits;
-const Store = @import("store.zig").Store;
+const store = @import("store.zig");
+const Store = store.Store;
 
 fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
@@ -63,6 +64,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         // Init/deinit -----------------
 
         pub fn init(allocator: mem.Allocator, notifier: *Notifier, now: u64, limits: Limits) Broker {
+            store.stat.max_pages = limits.max_pages;
             return .{
                 .allocator = allocator,
                 .topics = std.StringHashMap(*Topic).init(allocator),
@@ -131,31 +133,18 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         }
 
         pub fn publish(self: *Broker, topic_name: []const u8, data: []const u8) !void {
-            try self.checkLimits(topic_name, data.len);
             const topic = try self.getOrCreateTopic(topic_name);
             try topic.publish(data);
         }
 
         pub fn multiPublish(self: *Broker, topic_name: []const u8, msgs: u32, data: []const u8) !void {
-            try self.checkLimits(topic_name, data.len);
             const topic = try self.getOrCreateTopic(topic_name);
             try topic.multiPublish(msgs, data);
         }
 
         pub fn deferredPublish(self: *Broker, topic_name: []const u8, data: []const u8, delay: u32) !void {
-            try self.checkLimits(topic_name, data.len);
             const topic = try self.getOrCreateTopic(topic_name);
             try topic.deferredPublish(data, delay);
-        }
-
-        fn checkLimits(self: *Broker, topic_name: []const u8, len: usize) !void {
-            if (self.metric.depth_bytes + len > self.limits.max_mem) {
-                log.err(
-                    "{s} publish failed, broker memory limit of {} bytes reached",
-                    .{ topic_name, self.limits.max_mem },
-                );
-                return error.BrokerMemoryOverflow;
-            }
         }
 
         // Http interface actions -----------------
@@ -459,7 +448,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                             .ack_policy = .explicit,
                             .deliver_policy = .all,
                             .retention_policy = .all,
-                            .page_size = 1024 * 1024, // TODO default, min, max
+                            .max_page_size = broker.limits.max_page_size,
+                            .initial_page_size = broker.limits.initial_page_size,
+                            .max_pages = broker.limits.topic_max_pages,
                         }),
                         .timers = &broker.topic_timers,
                         .deferred = std.PriorityQueue(DeferredPublish, void, DeferredPublish.less).init(allocator, {}),
@@ -539,23 +530,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     return channel;
                 }
 
-                fn checkLimits(self: Topic, msgs: u32, bytes: usize) !void {
-                    if (self.metric.depth_bytes + bytes > self.broker.limits.topic_max_mem) {
-                        log.err(
-                            "{s} publish failed, topic memory limit of {} bytes reached",
-                            .{ self.name, self.broker.limits.topic_max_mem },
-                        );
-                        return error.TopicMemoryOverflow;
-                    }
-                    if (self.metric.depth + msgs > self.broker.limits.topic_max_msgs) {
-                        log.err(
-                            "{s} publish failed, topic max number of messages limit of {} reached",
-                            .{ self.name, self.broker.limits.topic_max_msgs },
-                        );
-                        return error.TopicMessagesOverflow;
-                    }
-                }
-
                 fn storeAppend(self: *Topic, data: []const u8) !void {
                     const res = try self.store.alloc(@intCast(data.len + 34));
                     const header = res.data[0..34];
@@ -572,7 +546,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn publish(self: *Topic, data: []const u8) !void {
-                    try self.checkLimits(1, data.len);
                     try self.storeAppend(data);
                     self.notifyChannels(1);
                 }
@@ -618,7 +591,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                 fn multiPublish(self: *Topic, msgs: u32, data: []const u8) !void {
                     if (msgs == 0) return;
-                    try self.checkLimits(msgs, data.len);
                     var pos: usize = 0;
                     for (0..msgs) |_| {
                         const len = mem.readInt(u32, data[pos..][0..4], .big);
@@ -970,8 +942,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     // or deallocate buffer (in case op copied message;
                     // deferred).
                     pub fn done(self: SendChunk) void {
-                        if (self.store) |store|
-                            store.release(self.page, 0);
+                        if (self.store) |s|
+                            s.release(self.page, 0);
                         if (self.allocator) |allocator|
                             allocator.free(self.data);
                     }

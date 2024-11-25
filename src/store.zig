@@ -2,7 +2,33 @@ const std = @import("std");
 const mem = std.mem;
 const assert = std.debug.assert;
 const testing = std.testing;
+const maxInt = std.math.maxInt;
 const log = std.log.scoped(.store);
+
+pub var stat: struct {
+    pages: u32 = 0,
+    capacity: u64 = 0,
+    max_pages: u32 = 0,
+
+    const Self = @This();
+
+    fn assertAddPage(self: Self) !void {
+        if (self.max_pages > 0 and self.pages == self.max_pages) {
+            log.err("max number of pages per broker {} reached", .{self.pages});
+            return error.BrokerOutOfPages;
+        }
+    }
+
+    fn inc(self: *Self, bytes: usize) void {
+        self.pages += 1;
+        self.capacity += bytes;
+    }
+
+    fn dec(self: *Self, bytes: usize) void {
+        self.pages -= 1;
+        self.capacity -= bytes;
+    }
+} = .{};
 
 pub const Page = struct {
     const Self = @This();
@@ -150,7 +176,10 @@ pub const RetentionPolicy = union(enum) {
 };
 
 pub const Options = struct {
-    page_size: u32,
+    initial_page_size: u32,
+    max_page_size: u32 = 0,
+    max_pages: u32 = maxInt(u32),
+
     ack_policy: AckPolicy = .none,
     deliver_policy: DeliverPolicy = .{ .all = {} },
     retention_policy: RetentionPolicy = .{ .all = {} },
@@ -169,12 +198,13 @@ pub const Store = struct {
     } = .{},
     last_sequence: u64 = 0,
     last_page: u32 = 0,
+    page_size: u32,
 
     pub fn init(allocator: mem.Allocator, options: Options) Self {
-        assert(options.page_size > 0);
         return .{
             .allocator = allocator,
             .options = options,
+            .page_size = options.initial_page_size,
             .pages = std.ArrayList(Page).init(allocator),
         };
     }
@@ -193,30 +223,47 @@ pub const Store = struct {
         page: u32,
     };
 
-    pub fn alloc(self: *Self, bytes_count: u32) !AllocResult {
-        if (self.pages.items.len == 0 or self.pages.getLast().free() < bytes_count) {
-            // if (self.pages.items.len > 2) {
-            //     self.options.page_size *|= 2;
-            // }
-
-            // add new page
-            var offsets = std.ArrayList(u32).init(self.allocator);
-            try offsets.ensureTotalCapacity(if (self.lastPage()) |page| page.messagesCount() else 128);
-            errdefer offsets.deinit();
-            const buf = try self.allocator.alloc(u8, @max(self.options.page_size, bytes_count));
-            errdefer self.allocator.free(buf);
-            try self.pages.append(
-                Page{
-                    .rc = 0,
-                    .first_sequence = 1 +% self.last_sequence,
-                    .no = 1 +% self.last_page,
-                    .buf = buf,
-                    .offsets = offsets,
-                },
-            );
-
-            self.last_page +%= 1;
+    fn addPage(self: *Self, min_size: u32) !void {
+        assert(min_size > 0);
+        const pages = self.pages.items.len;
+        if (pages >= self.options.max_pages) {
+            log.err("max number of pages per topic {} reached", .{pages});
+            return error.TopicOutOfPages;
         }
+        try stat.assertAddPage();
+
+        // increase page_size if needed
+        if (self.pages.items.len > 2 and self.page_size < self.options.max_page_size) {
+            self.page_size = @min(
+                self.page_size * 2,
+                self.options.max_page_size,
+            );
+        }
+
+        // append new page
+        var offsets = std.ArrayList(u32).init(self.allocator);
+        try offsets.ensureTotalCapacity(if (self.lastPage()) |page| page.messagesCount() else 128);
+        errdefer offsets.deinit();
+        const buf = try self.allocator.alloc(u8, @max(self.page_size, min_size));
+        errdefer self.allocator.free(buf);
+        try self.pages.append(
+            Page{
+                .rc = 0,
+                .first_sequence = 1 +% self.last_sequence,
+                .no = 1 +% self.last_page,
+                .buf = buf,
+                .offsets = offsets,
+            },
+        );
+
+        self.last_page +%= 1;
+        stat.inc(buf.len);
+    }
+
+    pub fn alloc(self: *Self, bytes_count: u32) !AllocResult {
+        if (self.pages.items.len == 0 or self.pages.getLast().free() < bytes_count)
+            try self.addPage(bytes_count);
+
         const page = self.lastPage().?;
         const data = try page.alloc(bytes_count);
 
@@ -318,10 +365,11 @@ pub const Store = struct {
             self.consumers.head > 0) return;
 
         while (self.pages.items.len > 0 and self.pages.items[0].rc == 0) {
-            var fp = self.pages.orderedRemove(0);
-            // log.warn("page remove {}-{}", .{ fp.first(), fp.last() });
+            var fp = self.pages.items[0];
             self.allocator.free(fp.buf);
             fp.offsets.deinit();
+            stat.dec(fp.buf.len);
+            _ = self.pages.orderedRemove(0);
         }
     }
 
@@ -457,7 +505,7 @@ pub const Store = struct {
 
 test "topic usage" {
     var store = Store.init(testing.allocator, .{
-        .page_size = 8,
+        .initial_page_size = 8,
         .ack_policy = .explicit,
         .deliver_policy = .all,
         .retention_policy = .all,
@@ -531,7 +579,7 @@ test "topic usage" {
 }
 
 test "append/alloc" {
-    var store = Store.init(testing.allocator, .{ .page_size = 8 });
+    var store = Store.init(testing.allocator, .{ .initial_page_size = 8 });
     store.last_sequence = 100;
     defer store.deinit();
     try testing.expectEqual(0, store.pages.items.len);
@@ -575,7 +623,7 @@ test "append/alloc" {
 }
 
 test "delivery policy" {
-    var store = Store.init(testing.allocator, .{ .page_size = 8, .deliver_policy = .all });
+    var store = Store.init(testing.allocator, .{ .initial_page_size = 8, .deliver_policy = .all });
     store.last_sequence = 100;
     defer store.deinit();
 
@@ -687,7 +735,7 @@ test "delivery policy" {
 }
 
 test "retention policy" {
-    var store = Store.init(testing.allocator, .{ .page_size = 8, .deliver_policy = .all, .retention_policy = .all });
+    var store = Store.init(testing.allocator, .{ .initial_page_size = 8, .deliver_policy = .all, .retention_policy = .all });
     store.last_sequence = 100;
     defer store.deinit();
 
@@ -767,7 +815,7 @@ test "retention policy" {
 
 test "ack policy" {
     var store = Store.init(testing.allocator, .{
-        .page_size = 8,
+        .initial_page_size = 8,
         .ack_policy = .explicit,
         .deliver_policy = .all,
         .retention_policy = .all,
@@ -819,7 +867,7 @@ test "ack policy" {
 
 test "subscribe/unsubscribe" {
     var store = Store.init(testing.allocator, .{
-        .page_size = 8,
+        .initial_page_size = 8,
         .ack_policy = .explicit,
         .deliver_policy = .new,
         .retention_policy = .all,
