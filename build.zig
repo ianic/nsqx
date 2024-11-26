@@ -66,4 +66,33 @@ pub fn build(b: *std.Build) void {
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    // build bin/nsq/main.zig to zig-out/bin/nsq
+    {
+        const nsq_module = b.addModule("nsq", .{
+            .root_source_file = b.path("src/lib.zig"),
+        });
+        const zigcli_dep = b.dependency("zig-cli", .{ .target = target });
+        const zigcli_mod = zigcli_dep.module("zig-cli");
+
+        const source_file = "bin/nsq/main.zig";
+        const bin = b.addExecutable(.{
+            .name = "nsq",
+            .root_source_file = b.path(source_file),
+            .target = target,
+            .optimize = optimize,
+        });
+        bin.root_module.addImport("nsq", nsq_module);
+        bin.root_module.addImport("zig-cli", zigcli_mod);
+
+        b.installArtifact(bin);
+
+        const bin_run_cmd = b.addRunArtifact(bin);
+        bin_run_cmd.step.dependOn(b.getInstallStep());
+        if (b.args) |args| {
+            bin_run_cmd.addArgs(args);
+        }
+        const bin_run_step = b.step("nsq", "Run the nsq");
+        bin_run_step.dependOn(&bin_run_cmd.step);
+    }
 }

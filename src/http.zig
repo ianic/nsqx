@@ -249,6 +249,7 @@ const Stat = struct {
     const Client = struct {
         client_id: []const u8,
         hostname: []const u8,
+        socket: u32,
         user_agent: []const u8,
         version: []const u8 = "V2",
         remote_address: []const u8,
@@ -328,6 +329,7 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
                     const remote_address = try std.fmt.allocPrint(allocator, "{}", .{consumer.addr});
                     clients[i] = Stat.Client{
                         .client_id = consumer.identify.client_id,
+                        .socket = @intCast(consumer.socket),
                         .hostname = consumer.identify.hostname,
                         .user_agent = consumer.identify.user_agent,
                         .remote_address = remote_address,

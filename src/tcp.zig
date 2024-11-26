@@ -157,8 +157,7 @@ pub const Conn = struct {
 
         self.recv_op = Op.recv(socket, self, onRecv, onRecvFail);
         self.io.submit(&self.recv_op);
-
-        log.debug("{} connected", .{socket});
+        log.debug("{} connected {}", .{ socket, addr });
     }
 
     fn deinit(self: *Conn) void {
