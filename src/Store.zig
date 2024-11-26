@@ -8,25 +8,25 @@ const log = std.log.scoped(.store);
 const Store = @This();
 
 pages: u32 = 0,
-capacity: u64 = 0,
-max_pages: u32 = maxInt(u32),
+alloc_bytes: u64 = 0,
+max_mem: u64 = maxInt(u64),
 options: Options,
 
-fn assertAddPage(self: Store) !void {
-    if (self.pages == self.max_pages) {
-        log.err("max number of pages per broker {} reached", .{self.pages});
-        return error.BrokerOutOfPages;
+fn assertAddPage(self: Store, size: usize) !void {
+    if (self.alloc_bytes + size > self.max_mem) {
+        log.err("max memory per broker reached; {} bytes", .{self.max_mem});
+        return error.BrokerOutOfMemory;
     }
 }
 
 fn inc(self: *Store, bytes: usize) void {
     self.pages += 1;
-    self.capacity += bytes;
+    self.alloc_bytes += bytes;
 }
 
 fn dec(self: *Store, bytes: usize) void {
     self.pages -= 1;
-    self.capacity -= bytes;
+    self.alloc_bytes -= bytes;
 }
 
 pub fn initStream(self: *Store, allocator: mem.Allocator) Stream {
@@ -36,7 +36,7 @@ pub fn initStream(self: *Store, allocator: mem.Allocator) Stream {
 pub const Options = struct {
     initial_page_size: u32,
     max_page_size: u32 = 0,
-    max_pages: u32 = maxInt(u32),
+    max_mem: u64 = maxInt(u64),
 
     ack_policy: AckPolicy = .none,
     deliver_policy: DeliverPolicy = .{ .all = {} },
@@ -207,6 +207,7 @@ pub const Stream = struct {
     last_sequence: u64 = 0,
     last_page: u32 = 0,
     page_size: u32,
+    alloc_bytes: u64 = 0,
 
     pub fn init(allocator: mem.Allocator, store: *Store) Self {
         const options = store.options;
@@ -235,12 +236,6 @@ pub const Stream = struct {
 
     fn addPage(self: *Self, min_size: u32) !void {
         assert(min_size > 0);
-        const pages = self.pages.items.len;
-        if (pages >= self.options.max_pages) {
-            log.err("max number of pages per topic {} reached", .{pages});
-            return error.TopicOutOfPages;
-        }
-        try self.store.assertAddPage();
 
         // increase page_size if needed
         if (self.pages.items.len > 2 and self.page_size < self.options.max_page_size) {
@@ -250,11 +245,18 @@ pub const Stream = struct {
             );
         }
 
+        const size = @max(self.page_size, min_size);
+        try self.store.assertAddPage(size);
+        if (self.alloc_bytes + size > self.options.max_mem) {
+            log.err("max topic memory reached; {} bytes", .{self.options.max_mem});
+            return error.TopicOutOfMemory;
+        }
+
         // append new page
         var offsets = std.ArrayList(u32).init(self.allocator);
         try offsets.ensureTotalCapacity(if (self.lastPage()) |page| page.count() else 128);
         errdefer offsets.deinit();
-        const buf = try self.allocator.alloc(u8, @max(self.page_size, min_size));
+        const buf = try self.allocator.alloc(u8, size);
         errdefer self.allocator.free(buf);
         try self.pages.append(
             Page{
@@ -268,6 +270,7 @@ pub const Stream = struct {
 
         self.last_page +%= 1;
         self.store.inc(buf.len);
+        self.alloc_bytes += buf.len;
     }
 
     pub fn alloc(self: *Self, bytes_count: u32) !AllocResult {
@@ -375,10 +378,11 @@ pub const Stream = struct {
             self.consumers.head > 0) return;
 
         while (self.pages.items.len > 0 and self.pages.items[0].rc == 0) {
-            var fp = self.pages.items[0];
-            self.allocator.free(fp.buf);
-            fp.offsets.deinit();
-            self.store.dec(fp.buf.len);
+            var page = &self.pages.items[0];
+            self.allocator.free(page.buf);
+            page.offsets.deinit();
+            self.store.dec(page.buf.len);
+            self.alloc_bytes -= page.buf.len;
             _ = self.pages.orderedRemove(0);
         }
     }

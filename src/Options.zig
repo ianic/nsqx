@@ -3,6 +3,7 @@ const mem = std.mem;
 const fmt = std.fmt;
 const net = std.net;
 const time = std.time;
+const math = std.math;
 
 const usage =
     \\Usage of nsqd:
@@ -26,8 +27,6 @@ const usage =
     \\
     \\  --max-heartbeat-interval duration
     \\        maximum client configurable duration of time between client heartbeats (default 1m0s)
-    \\  --max-msg-size int
-    \\        maximum size of a single message in bytes (default 1M)
     \\  --max-msg-timeout duration
     \\        maximum duration before a message will timeout (default 15m0s)
     \\  --max-rdy-count int
@@ -46,14 +45,20 @@ const usage =
     \\  --statsd-udp-packet-size int
     \\        the size in bytes of statsd UDP packets (default 508)
     \\
-    \\  memory limits:
-    \\  --max-pages
-    \\        total number of memory pages per broker (default unlimited)
-    \\  --topic-max-pages
-    \\        total number of memory pages per topic (default unlimited)
-    \\  --initial-page-size
+    \\  limits:
+    \\  --max-msg-size int(kMG)
+    \\        maximum size of a single message in bytes (default 1M)
+    \\  --max-mem int(kMG)
+    \\        maximum amount of memory used for all messages in broker (default 50% system memory)
+    \\  --max-topic-mem int(kMG)
+    \\        maximum amount of memory per topic (defalut unlimited)
+    \\  In topic messages are stored in pages. Each page can hold multiple messages.
+    \\  Initial page size is size of the first page in the topic. If needed size of the
+    \\  subsequent pages will grow limited with max-page-size. Single message can still
+    \\  allocate page bigger that max-page-size if max-msg-size allows that.
+    \\  --initial-page-size int(kMG)
     \\        initial topic page size (default 64k)
-    \\  --max-page-size
+    \\  --max-page-size int(kMG)
     \\        max topic memory page size (default 1M)
     \\
     \\  io_uring:
@@ -99,11 +104,13 @@ statsd: Statsd = .{},
 
 const Options = @This();
 
-const unlimited = std.math.maxInt(u32);
+const unlimited = math.maxInt(u32);
+const unlimited_mem = math.maxInt(u64);
 
 pub const Limits = struct {
-    max_pages: u32 = unlimited,
-    topic_max_pages: u32 = unlimited,
+    max_mem: u64 = unlimited_mem,
+    max_topic_mem: u64 = unlimited_mem,
+
     initial_page_size: u32 = 64 * 1024,
     max_page_size: u32 = 1024 * 1024,
 };
@@ -153,6 +160,9 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
     var opt: Options = .{
         .hostname = hostname,
         .statsd = .{ .prefix = "nsq.%s" },
+        .limits = .{
+            .max_mem = totalSystemMemory() / 2,
+        },
     };
 
     outer: while (iter.next()) |arg| {
@@ -209,10 +219,10 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
             opt.statsd.interval = d;
 
             // storage limits
-        } else if (iter.byteSize(u32, "max-pages")) |d| {
-            opt.limits.max_pages = d;
-        } else if (iter.byteSize(u32, "topic-max-pages")) |d| {
-            opt.limits.topic_max_pages = d;
+        } else if (iter.byteSize(u64, "max-mem")) |d| {
+            opt.limits.max_mem = d;
+        } else if (iter.byteSize(u64, "max-topic-mem")) |d| {
+            opt.limits.max_topic_mem = d;
         } else if (iter.byteSize(u32, "initial-page-size")) |d| {
             opt.limits.initial_page_size = d;
         } else if (iter.byteSize(u32, "max-page-size")) |d| {
@@ -394,7 +404,7 @@ test parseAddressFailing {
 }
 
 // test example:
-// $ zig run -lc Options.zig -- --max-pages 1G  --max-page-size 2M --topic-max-pages=8k
+// $ zig run -lc Options.zig -- --max-mem 1G  --max-topic-mem 2M
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -426,8 +436,8 @@ pub fn main() !void {
     std.debug.print("statsd_udp_packet_size: {}\n", .{opt.statsd.udp_packet_size});
 
     std.debug.print("\n", .{});
-    std.debug.print("max_pages: {}\n", .{opt.limits.max_pages});
-    std.debug.print("topic_max_pages: {}\n", .{opt.limits.topic_max_pages});
+    std.debug.print("max_mem: {} {}G\n", .{ opt.limits.max_mem, opt.limits.max_mem / 1024 / 1024 / 1024 });
+    std.debug.print("max_topic_mem: {}\n", .{opt.limits.max_topic_mem});
     std.debug.print("initial_page_size: {}\n", .{opt.limits.initial_page_size});
     std.debug.print("max_page_size: {}\n", .{opt.limits.max_page_size});
 }

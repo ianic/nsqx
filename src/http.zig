@@ -272,7 +272,7 @@ const Stat = struct {
         last_sequence: u64,
         message_count: usize,
         message_bytes: usize,
-        capacity: usize,
+        alloc_bytes: usize,
         page_size: usize,
         pages_count: usize,
         pages: []Page,
@@ -282,8 +282,8 @@ const Stat = struct {
         first_sequence: u64,
         message_count: usize,
         message_bytes: usize,
+        alloc_bytes: usize,
         references: u32,
-        capacity: usize,
     };
 
     version: []const u8 = "0.1.0",
@@ -347,42 +347,33 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
 
             try channels.append(Stat.Channel{
                 .channel_name = channel.name,
-
                 // Current number of messages published to the topic but not
                 // processed by this channel.
                 .depth = channel.metric.depth, // gauge
-
                 // Current number of in-flight messages, sent to the client but
                 // not fin jet.
                 .in_flight_count = channel.in_flight.count(), // gauge
-
                 // Current number of messages in the deferred queue. Message can be
                 // deferred by the client (re-queue action), by timeout while
                 // in-flight, or by producer (defer publish).
                 .deferred_count = channel.deferred.count(), // gauge
-
                 // Total number of messages finished by the clinet(s).
                 .message_count = channel.metric.finish, // counter
-
                 // Total number of messages re-queued by the client(s).
                 .requeue_count = channel.metric.requeue, // counter
-
                 // Total number of messages timed-out while in-flight.
                 .timeout_count = channel.metric.timeout, // counter
-
                 // Current number of connected clients.
                 .client_count = client_count, // gauge
-
-                .clients = clients,
                 .paused = channel.paused,
                 .sequence = channel.sequence,
+                .clients = clients,
             });
         }
 
         var pages = try std.ArrayList(Stat.Page).initCapacity(allocator, topic.stream.pages.items.len);
         var message_count: usize = 0;
         var message_bytes: usize = 0;
-        var capacity: usize = 0;
         for (topic.stream.pages.items) |page| {
             if (args.includePages()) {
                 try pages.append(.{
@@ -390,20 +381,19 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
                     .first_sequence = page.first_sequence,
                     .message_count = page.count(),
                     .message_bytes = page.size(),
+                    .alloc_bytes = page.capacity(),
                     .references = page.rc,
-                    .capacity = page.capacity(),
                 });
             }
             message_count += page.count();
             message_bytes += page.size();
-            capacity += page.capacity();
         }
         const store = Stat.Store{
             .last_sequence = topic.stream.last_sequence,
             .last_page = topic.stream.last_page,
             .message_count = message_count,
             .message_bytes = message_bytes,
-            .capacity = capacity,
+            .alloc_bytes = topic.stream.alloc_bytes,
             .page_size = topic.stream.page_size,
             .pages_count = topic.stream.pages.items.len,
             .pages = pages.items,
@@ -425,7 +415,7 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
         .topics = topics.items,
         .store = .{
             .pages = broker.store.pages,
-            .bytes = broker.store.capacity,
+            .bytes = broker.store.alloc_bytes,
         },
         .producers = &.{},
     };

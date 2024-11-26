@@ -74,12 +74,11 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 .topic_timers = TimerQueue(Topic).init(allocator),
                 .limits = limits,
                 .store = .{
-                    .max_pages = limits.max_pages,
+                    .max_mem = limits.max_mem,
                     .options = .{
                         .ack_policy = .explicit,
                         .deliver_policy = .all,
                         .retention_policy = .all,
-                        .max_pages = limits.topic_max_pages,
                         .max_page_size = limits.max_page_size,
                         .initial_page_size = limits.initial_page_size,
                     },

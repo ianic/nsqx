@@ -291,8 +291,8 @@ pub const Conn = struct {
         }) |msg| {
             self.receivedMsg(msg) catch |err| switch (err) {
                 error.MessageSizeOverflow,
-                error.BrokerOutOfPages,
-                error.TopicOutOfPages,
+                error.BrokerOutOfMemory,
+                error.TopicOutOfMemory,
                 => try self.respond(.pub_failed),
                 error.MessageNotInFlight => {
                     log.warn("{} message not in flight, operation {s} ", .{ self.socket, @tagName(msg) });

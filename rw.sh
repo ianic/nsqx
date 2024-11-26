@@ -23,7 +23,7 @@ cd ~/Code/nsql
 rm -f ./tmp/nsql.dump ./tmp/sub_bench
 
 # ./zig-out/bin/nsql --statsd-address localhost --statsd-prefix "" > tmp/nsql 2>&1 &
-./zig-out/bin/nsql --data-path ./tmp --topic-max-pages=4k > tmp/nsql 2>&1 &
+./zig-out/bin/nsql --data-path ./tmp --max-mem=4G > tmp/nsql 2>&1 &
 # sudo valgrind --tool=callgrind ./zig-out/bin/nsql --data-path ./tmp > tmp/nsql 2>&1 &
 # ~/Code/go/nsq/apps/nsqd/nsqd --mem-queue-size=100000000 > tmp/nsql 2>&1 &
 nsqd_pid=$!
