@@ -180,8 +180,8 @@ fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Broker) !void {
             topic_name,
             topic.metric.depth,
             topic.metric.depth_bytes,
-            topic.store.last_sequence,
-            topic.store.pages.items.len,
+            topic.stream.last_sequence,
+            topic.stream.pages.items.len,
         });
 
         var ci = topic.channels.iterator();

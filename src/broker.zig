@@ -9,8 +9,7 @@ const log = std.log.scoped(.broker);
 const Error = @import("io.zig").Error;
 const protocol = @import("protocol.zig");
 const Limits = @import("Options.zig").Limits;
-const store = @import("store.zig");
-const Store = store.Store;
+const Store = @import("Store.zig");
 
 fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
@@ -60,11 +59,11 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         // Channels waiting for wake up at specific timestamp.
         channel_timers: TimerQueue(Channel),
         topic_timers: TimerQueue(Topic),
+        store: Store,
 
         // Init/deinit -----------------
 
         pub fn init(allocator: mem.Allocator, notifier: *Notifier, now: u64, limits: Limits) Broker {
-            store.stat.max_pages = limits.max_pages;
             return .{
                 .allocator = allocator,
                 .topics = std.StringHashMap(*Topic).init(allocator),
@@ -74,6 +73,17 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 .channel_timers = TimerQueue(Channel).init(allocator),
                 .topic_timers = TimerQueue(Topic).init(allocator),
                 .limits = limits,
+                .store = .{
+                    .max_pages = limits.max_pages,
+                    .options = .{
+                        .ack_policy = .explicit,
+                        .deliver_policy = .all,
+                        .retention_policy = .all,
+                        .max_pages = limits.topic_max_pages,
+                        .max_page_size = limits.max_page_size,
+                        .initial_page_size = limits.initial_page_size,
+                    },
+                },
             };
         }
 
@@ -290,7 +300,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                 var topic_file = try dir.createFile(topic.name, .{});
                 defer topic_file.close();
-                try topic.store.dump(topic_file);
+                try topic.stream.dump(topic_file);
 
                 { // Topic meta:
                     // | name_len (1) | name (name_len) | paused (1)  | channels count (4) |
@@ -359,10 +369,10 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 topic.paused = try meta.readByte() != 0;
                 var channels = try meta.readInt(u32, .little);
 
-                // Store
+                // Stream
                 var topic_file = try dir.openFile(topic.name, .{});
                 defer topic_file.close();
-                try topic.store.restore(topic_file);
+                try topic.stream.restore(topic_file);
 
                 // Channels
                 while (channels > 0) : (channels -= 1) {
@@ -393,7 +403,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 name: []const u8,
                 paused: bool = false,
                 channels: std.StringHashMap(*Channel),
-                store: Store,
+                stream: Store.Stream,
 
                 metric: Metric = .{},
                 metric_prev: Metric = .{},
@@ -444,14 +454,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         .name = name,
                         .channels = std.StringHashMap(*Channel).init(allocator),
                         .broker = broker,
-                        .store = Store.init(allocator, .{
-                            .ack_policy = .explicit,
-                            .deliver_policy = .all,
-                            .retention_policy = .all,
-                            .max_page_size = broker.limits.max_page_size,
-                            .initial_page_size = broker.limits.initial_page_size,
-                            .max_pages = broker.limits.topic_max_pages,
-                        }),
+                        .stream = broker.store.initStream(allocator),
                         .timers = &broker.topic_timers,
                         .deferred = std.PriorityQueue(DeferredPublish, void, DeferredPublish.less).init(allocator, {}),
                     };
@@ -464,7 +467,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     self.channels.deinit();
                     while (self.deferred.removeOrNull()) |dp| self.allocator.free(dp.data);
                     self.deferred.deinit();
-                    self.store.deinit();
+                    self.stream.deinit();
                 }
 
                 fn empty(self: *Topic) void {
@@ -487,10 +490,10 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                 fn deinitChannel(self: *Topic, channel: *Channel) void {
                     if (self.channels.count() == 0) {
-                        self.store.options.retention_policy = .{ .from_sequence = self.store.last_sequence };
-                        self.store.options.deliver_policy = .{ .from_sequence = self.store.last_sequence };
+                        self.stream.options.retention_policy = .{ .from_sequence = self.stream.last_sequence };
+                        self.stream.options.deliver_policy = .{ .from_sequence = self.stream.last_sequence };
                     }
-                    self.store.unsubscribe(channel.sequence);
+                    self.stream.unsubscribe(channel.sequence);
 
                     const key = channel.name;
                     channel.deinit();
@@ -516,22 +519,22 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     errdefer channel.deinit();
                     self.channels.putAssumeCapacityNoClobber(key, channel);
 
-                    channel.sequence = self.store.subscribe();
+                    channel.sequence = self.stream.subscribe();
                     if (first_channel) {
                         // First channel gets all messages from the topic,
                         // move metrics to the channel.
                         channel.metric.depth = self.metric.depth;
                         self.metric.reset();
                         // Other channels are getting new (from current sequence).
-                        self.store.options.retention_policy = .interest;
-                        self.store.options.deliver_policy = .new;
+                        self.stream.options.retention_policy = .interest;
+                        self.stream.options.deliver_policy = .new;
                     }
                     self.broker.channelCreated(self.name, channel.name);
                     return channel;
                 }
 
-                fn storeAppend(self: *Topic, data: []const u8) !void {
-                    const res = try self.store.alloc(@intCast(data.len + 34));
+                fn appendStream(self: *Topic, data: []const u8) !void {
+                    const res = try self.stream.alloc(@intCast(data.len + 34));
                     const header = res.data[0..34];
                     const body = res.data[34..];
                     {
@@ -546,7 +549,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn publish(self: *Topic, data: []const u8) !void {
-                    try self.storeAppend(data);
+                    try self.appendStream(data);
                     self.notifyChannels(1);
                 }
 
@@ -595,7 +598,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     for (0..msgs) |_| {
                         const len = mem.readInt(u32, data[pos..][0..4], .big);
                         pos += 4;
-                        try self.storeAppend(data[pos..][0..len]);
+                        try self.appendStream(data[pos..][0..len]);
                         pos += len;
                     }
                     self.notifyChannels(msgs);
@@ -698,7 +701,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 paused: bool = false,
                 ephemeral: bool = false,
 
-                // Last store sequence consumed by this channel
+                // Last stream sequence consumed by this channel
                 sequence: u64 = 0,
 
                 const Metric = struct {
@@ -761,27 +764,33 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 // Called from topic when new topic message is created.
                 fn topicAppended(self: *Channel, msgs: u32) void {
                     self.metric.depth += msgs;
-                    if (!self.topic.store.hasMore(self.sequence)) return;
+                    if (!self.needWakeup()) return;
                     self.wakeup() catch |err| {
                         if (!builtin.is_test)
                             log.err("fail to wakeup channel {s}: {}", .{ self.name, err });
                     };
                 }
 
+                fn needWakeup(self: *Channel) bool {
+                    return !self.topic.paused and
+                        !self.paused and
+                        self.topic.stream.hasMore(self.sequence);
+                }
+
                 // Notify consumers that there are messages to pull.
                 fn wakeup(self: *Channel) !void {
                     while (self.consumers_iterator.next()) |consumer| {
                         try consumer.wakeup();
-                        if (!self.topic.store.hasMore(self.sequence)) break;
+                        if (!self.needWakeup()) break;
                     }
                 }
 
                 fn restore(self: *Channel, sequence: u64) !void {
                     if (sequence == self.sequence) return;
-                    self.topic.store.unsubscribe(self.sequence);
+                    self.topic.stream.unsubscribe(self.sequence);
                     self.sequence = sequence;
-                    self.topic.store.subscribeAt(sequence);
-                    self.metric.depth += self.topic.store.last_sequence - sequence;
+                    self.topic.stream.subscribeAt(sequence);
+                    self.metric.depth += self.topic.stream.last_sequence - sequence;
                 }
 
                 fn restoreMsg(self: *Channel, sequence: u64, defer_until: u64, attempts: u16) !void {
@@ -791,7 +800,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         .attempts = attempts + 1,
                     };
                     try self.deferred.add(dm);
-                    self.topic.store.acquire(sequence);
+                    self.topic.stream.acquire(sequence);
                     if (dm.defer_until > 0) self.updateTimer(dm.defer_until);
                     self.metric.depth += 1;
                 }
@@ -820,7 +829,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 fn popDeferred(self: *Channel, consumer_id: u32, msg_timeout: u32) !?SendChunk {
                     if (self.deferred.peek()) |dm| if (dm.defer_until <= self.now.*) {
                         try self.in_flight.ensureUnusedCapacity(1);
-                        const payload = try self.allocator.dupe(u8, self.topic.store.message(dm.sequence));
+                        const payload = try self.allocator.dupe(u8, self.topic.stream.message(dm.sequence));
                         errdefer self.allocator.free(payload);
 
                         const ifm = InFlightMsg{
@@ -932,18 +941,18 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     data: []const u8,
                     count: u32 = 1,
 
-                    store: ?*Store = null,
+                    stream: ?*Store.Stream = null,
                     page: u32 = 0,
                     allocator: ?mem.Allocator = null,
 
                     // Consumer should call this when data is no more in use by
                     // underlying network interface; when io_uring send
-                    // operation is completed. This will release store reference
+                    // operation is completed. This will release stream reference
                     // or deallocate buffer (in case op copied message;
                     // deferred).
                     pub fn done(self: SendChunk) void {
-                        if (self.store) |s|
-                            s.release(self.page, 0);
+                        if (self.stream) |stream|
+                            stream.release(self.page, 0);
                         if (self.allocator) |allocator|
                             allocator.free(self.data);
                     }
@@ -957,10 +966,10 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     // if there is deferred message return one
                     if (try self.popDeferred(consumer_id, msg_timeout)) |sc| return sc;
 
-                    // else find next chunk in store
+                    // else find next chunk in stream
                     if (self.topic.paused) return null;
-                    if (self.topic.store.next(self.sequence, ready_count)) |res| {
-                        errdefer res.revert(&self.topic.store, self.sequence);
+                    if (self.topic.stream.next(self.sequence, ready_count)) |res| {
+                        errdefer res.revert(&self.topic.stream, self.sequence);
 
                         { // add all sequence to in_flight
                             try self.in_flight.ensureUnusedCapacity(res.count);
@@ -981,7 +990,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         return .{
                             .data = res.data,
                             .count = res.count,
-                            .store = &self.topic.store,
+                            .stream = &self.topic.stream,
                             .page = res.page,
                         };
                     }
@@ -993,7 +1002,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     const ifm = self.in_flight.get(id.sequence) orelse return error.MessageNotInFlight;
                     if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
 
-                    self.topic.store.release(id.page, id.sequence);
+                    self.topic.stream.release(id.page, id.sequence);
                     assert(self.in_flight.remove(id.sequence));
                     self.metric.finish += 1;
                     self.metric.depth -|= 1;
@@ -1068,20 +1077,20 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     { // release in_flight messages
                         var iter = self.in_flight.keyIterator();
                         while (iter.next()) |e| {
-                            self.topic.store.fin(e.*);
+                            self.topic.stream.fin(e.*);
                         }
                         self.in_flight.clearAndFree();
                     }
                     { // release deferred messages
                         var iter = self.deferred.iterator();
                         while (iter.next()) |dm| {
-                            self.topic.store.fin(dm.sequence);
+                            self.topic.stream.fin(dm.sequence);
                         }
                         self.deferred.shrinkAndFree(0);
                     }
-                    { // move store pointer
-                        self.topic.store.unsubscribe(self.sequence);
-                        self.sequence = self.topic.store.subscribe();
+                    { // move stream pointer
+                        self.topic.stream.unsubscribe(self.sequence);
+                        self.sequence = self.topic.stream.subscribe();
                         self.metric.depth = 0;
                     }
                 }
@@ -1438,14 +1447,14 @@ test "first channel gets all messages accumulated in topic" {
     try broker.publish(topic_name, "message body"); // 17
     try testing.expectEqual(1, channel.metric.depth);
     try testing.expectEqual(0, topic.metric.depth);
-    try testing.expectEqual(17, topic.store.last_sequence);
+    try testing.expectEqual(17, topic.stream.last_sequence);
 
     try broker.deleteChannel(topic_name, channel_name);
     try testing.expectEqual(0, topic.metric.depth);
     try broker.publish(topic_name, "message body"); // 18
     try testing.expectEqual(1, topic.metric.depth);
 
-    try testing.expectEqual(17, topic.store.options.deliver_policy.from_sequence);
+    try testing.expectEqual(17, topic.stream.options.deliver_policy.from_sequence);
 
     var consumer2 = TestConsumer.init(allocator);
     defer consumer2.deinit();
@@ -1544,12 +1553,12 @@ test "deferred messages" {
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(2, topic.deferred.count());
-        try testing.expectEqual(0, topic.store.last_sequence);
+        try testing.expectEqual(0, topic.stream.last_sequence);
     }
 
     { // move now, one is in flight after publish from topic.onTimer
         _ = broker.tick(nsFromMs(1));
-        try testing.expectEqual(1, topic.store.last_sequence);
+        try testing.expectEqual(1, topic.stream.last_sequence);
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(1, topic.deferred.count());
@@ -1566,7 +1575,7 @@ test "deferred messages" {
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         topic.onTimer(broker.now);
-        try testing.expectEqual(2, topic.store.last_sequence);
+        try testing.expectEqual(2, topic.stream.last_sequence);
         try testing.expectEqual(0, topic.deferred.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(2, channel.in_flight.count());
@@ -1790,13 +1799,13 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try broker.createChannel(topic_name, channel1_name);
     try broker.createChannel(topic_name, channel2_name);
     const topic = broker.getOrCreateTopic(topic_name) catch unreachable;
-    try testing.expectEqual(2, topic.store.consumers.head);
+    try testing.expectEqual(2, topic.stream.consumers.head);
 
     // Publish some messages
     try broker.publish(topic_name, "message 1");
     try broker.publish(topic_name, "message 2");
     try testing.expectEqual(0, topic.metric.depth);
-    try testing.expectEqual(2, topic.store.last_sequence);
+    try testing.expectEqual(2, topic.stream.last_sequence);
 
     // 1 consumer for channel 1 and 2 consumers for channel 2
     var channel1_consumer = TestConsumer.init(allocator);
@@ -1990,8 +1999,8 @@ test "dump/restore" {
         var channel2 = consumer2.channel.?;
 
         { // add 3 messages to the topic
-            topic.store.last_sequence = 100;
-            topic.store.last_page = 10;
+            topic.stream.last_sequence = 100;
+            topic.stream.last_page = 10;
             broker.now = now;
             try broker.publish(topic_name, "Iso "); // msg 1, sequence: 101
             broker.now += ns_per_s;
@@ -2020,7 +2029,7 @@ test "dump/restore" {
         try testing.expectEqual(2, channel1.metric.depth);
         try testing.expectEqual(2, channel2.metric.depth);
 
-        try testing.expectEqual(5, topic.store.pages.items[0].rc);
+        try testing.expectEqual(5, topic.stream.pages.items[0].rc);
         try broker.dump(dir);
     }
 
@@ -2030,16 +2039,16 @@ test "dump/restore" {
         try broker.restore(dir);
 
         const topic = try broker.getOrCreateTopic(topic_name);
-        try testing.expectEqual(103, topic.store.last_sequence);
-        try testing.expectEqual(11, topic.store.last_page);
-        const page = topic.store.pages.items[0];
+        try testing.expectEqual(103, topic.stream.last_sequence);
+        try testing.expectEqual(11, topic.stream.last_page);
+        const page = topic.stream.pages.items[0];
         try testing.expectEqual(3, page.offsets.items.len);
         try testing.expectEqual(11, page.no);
         try testing.expectEqual(5, page.rc);
 
-        try testing.expectEqualStrings(topic.store.message(101)[34..], "Iso ");
-        try testing.expectEqualStrings(topic.store.message(102)[34..], "medo u ducan ");
-        try testing.expectEqualStrings(topic.store.message(103)[34..], "nije reko dobar dan.");
+        try testing.expectEqualStrings(topic.stream.message(101)[34..], "Iso ");
+        try testing.expectEqualStrings(topic.stream.message(102)[34..], "medo u ducan ");
+        try testing.expectEqualStrings(topic.stream.message(103)[34..], "nije reko dobar dan.");
 
         try testing.expectEqual(2, topic.channels.count());
         var channel1 = try topic.getOrCreateChannel(&channel1_name);

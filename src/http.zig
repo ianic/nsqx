@@ -377,33 +377,33 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
             });
         }
 
-        var pages = try std.ArrayList(Stat.Page).initCapacity(allocator, topic.store.pages.items.len);
+        var pages = try std.ArrayList(Stat.Page).initCapacity(allocator, topic.stream.pages.items.len);
         var message_count: usize = 0;
         var message_bytes: usize = 0;
         var capacity: usize = 0;
-        for (topic.store.pages.items) |page| {
+        for (topic.stream.pages.items) |page| {
             if (args.includePages()) {
                 try pages.append(.{
                     .no = page.no,
                     .first_sequence = page.first_sequence,
-                    .message_count = page.messagesCount(),
-                    .message_bytes = page.writePos(),
+                    .message_count = page.count(),
+                    .message_bytes = page.size(),
                     .references = page.rc,
                     .capacity = page.capacity(),
                 });
             }
-            message_count += page.messagesCount();
-            message_bytes += page.writePos();
+            message_count += page.count();
+            message_bytes += page.size();
             capacity += page.capacity();
         }
         const store = Stat.Store{
-            .last_sequence = topic.store.last_sequence,
-            .last_page = topic.store.last_page,
+            .last_sequence = topic.stream.last_sequence,
+            .last_page = topic.stream.last_page,
             .message_count = message_count,
             .message_bytes = message_bytes,
             .capacity = capacity,
-            .page_size = topic.store.page_size,
-            .pages_count = topic.store.pages.items.len,
+            .page_size = topic.stream.page_size,
+            .pages_count = topic.stream.pages.items.len,
             .pages = pages.items,
         };
 
@@ -418,13 +418,12 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
         });
     }
 
-    const store_stat = @import("store.zig").stat;
     const stat = Stat{
         .start_time = broker.started_at / std.time.ns_per_s,
         .topics = topics.items,
         .store = .{
-            .pages = store_stat.pages,
-            .bytes = store_stat.capacity,
+            .pages = broker.store.pages,
+            .bytes = broker.store.capacity,
         },
         .producers = &.{},
     };

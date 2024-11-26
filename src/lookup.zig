@@ -11,7 +11,7 @@ const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
 const RecvBuf = @import("tcp.zig").RecvBuf;
 const Options = @import("Options.zig");
-const Store = @import("store.zig").Store;
+const Store = @import("Store.zig");
 
 const log = std.log.scoped(.lookup);
 
@@ -24,6 +24,7 @@ pub const Connector = struct {
     identify: []const u8,
     ticker_op: Op = .{},
     store: Store,
+    stream: Store.Stream,
     state: State,
     const State = enum {
         connected,
@@ -53,13 +54,18 @@ pub const Connector = struct {
             .connections = std.ArrayList(*Conn).init(allocator),
             .identify = identify,
             .state = .connected,
-            .store = Store.init(allocator, .{
-                .ack_policy = .none,
-                .deliver_policy = .all,
-                .retention_policy = .all,
-                .initial_page_size = 64 * 1024,
-            }),
+            .store = .{
+                .options = .{
+                    .initial_page_size = 64 * 1024,
+                    .max_page_size = 64 * 1024,
+                    .ack_policy = .none,
+                    .deliver_policy = .all,
+                    .retention_policy = .all,
+                },
+            },
+            .stream = undefined,
         };
+        self.stream = self.store.initStream(allocator);
         errdefer self.deinit();
         try self.connections.ensureUnusedCapacity(lookup_tcp_addresses.len);
         for (lookup_tcp_addresses) |addr| try self.addLookupd(addr);
@@ -89,7 +95,7 @@ pub const Connector = struct {
         }
         self.connections.deinit();
         self.allocator.free(self.identify);
-        self.store.deinit();
+        self.stream.deinit();
     }
 
     fn onTick(self: *Self) void {
@@ -115,15 +121,15 @@ pub const Connector = struct {
     }
 
     fn append(self: *Self, comptime fmt: []const u8, args: anytype) void {
-        self.storeAppend(fmt, args) catch |err| {
+        self.appendStream(fmt, args) catch |err| {
             // TODO: what now
             log.err("add registration failed {}", .{err});
         };
     }
 
-    fn storeAppend(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+    fn appendStream(self: *Self, comptime fmt: []const u8, args: anytype) !void {
         const bytes_count = std.fmt.count(fmt, args);
-        const res = try self.store.alloc(@intCast(bytes_count));
+        const res = try self.stream.alloc(@intCast(bytes_count));
         _ = try std.fmt.bufPrint(res.data, fmt, args);
         for (self.connections.items) |conn| conn.wakeup();
     }
@@ -240,7 +246,7 @@ const Conn = struct {
         self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
         self.io.submit(&self.recv_op);
         self.state = .connected;
-        self.sequence = self.connector.store.subscribe();
+        self.sequence = self.connector.stream.subscribe();
         log.debug("{} connected", .{self.address});
     }
 
@@ -265,7 +271,7 @@ const Conn = struct {
         if (self.send_op.active()) return;
         if (self.state != .connected) return;
 
-        if (self.connector.store.next(self.sequence, 2)) |res| {
+        if (self.connector.stream.next(self.sequence, 2)) |res| {
             log.debug("sending msgs {} - {} len: {}", .{ res.sequence.from, res.sequence.to, res.data.len });
             self.send(res.data);
             self.sequence = res.sequence.to;
@@ -335,7 +341,7 @@ const Conn = struct {
         switch (self.state) {
             .connecting, .connected => {
                 if (self.state == .connected)
-                    self.connector.store.unsubscribe(self.sequence);
+                    self.connector.stream.unsubscribe(self.sequence);
                 self.recv_buf.free();
                 self.state = .closing;
                 self.shutdown();
