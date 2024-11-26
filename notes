@@ -59,3 +59,30 @@ waiting for pprof...
 # batch size 32, 64
 [bench_reader] 2024/08/15 12:20:46 duration: 10.001501673s - 509.811mb/s - 2672875.621ops/s - 0.374us/op total messages count 26732770
 [bench_reader] 2024/08/15 12:21:36 duration: 10.001139127s - 543.656mb/s - 2850325.412ops/s - 0.351us/op total messages count 28506501
+
+
+
+Prije store
+ hydra  nsql  kako_je_bilo_prije [$] ➜ ./rw.sh
+[bench_writer] 2024/11/26 16:56:19 duration: 10s - 1114.264mb/s - 5841954.554ops/s - 0.171us/op messages: 58432000
+[bench_reader] 2024/11/26 16:56:19 duration: 10s - 1114.230mb/s - 5841772.974ops/s - 0.171us/op messages: 58432000
+[bench_writer] 2024/11/26 16:56:29 duration: 10s - 1067.986mb/s - 5599323.738ops/s - 0.179us/op messages: 56002200
+[bench_reader] 2024/11/26 16:56:29 duration: 10s - 1067.846mb/s - 5598590.667ops/s - 0.179us/op messages: 56001736
+[bench_writer] 2024/11/26 16:56:39 duration: 10s - 1041.179mb/s - 5458774.652ops/s - 0.183us/op messages: 54597200
+[bench_reader] 2024/11/26 16:56:39 duration: 10s - 1041.061mb/s - 5458158.168ops/s - 0.183us/op messages: 54597664
+[bench_writer] 2024/11/26 16:56:49 duration: 10s - 1008.711mb/s - 5288550.610ops/s - 0.189us/op messages: 52893200
+[bench_reader] 2024/11/26 16:56:49 duration: 10s - 1008.099mb/s - 5285340.611ops/s - 0.189us/op messages: 52898200
+^CTerminated
+./rw.sh: line 50: kill: (48056) - No such process
+Terminated
+
+Nakon store
+ hydra  nsql  main [$] ➜ ./rw.sh
+[bench_writer] 2024/11/26 16:57:12 duration: 10s - 1766.392mb/s - 9260980.712ops/s - 0.108us/op messages: 92620800
+[bench_reader] 2024/11/26 16:57:12 duration: 10s - 1757.948mb/s - 9216710.286ops/s - 0.108us/op messages: 92623600
+[bench_writer] 2024/11/26 16:57:22 duration: 10s - 1791.904mb/s - 9394739.852ops/s - 0.106us/op messages: 93956800
+[bench_reader] 2024/11/26 16:57:22 duration: 10s - 1791.917mb/s - 9394803.796ops/s - 0.106us/op messages: 94381584
+[bench_writer] 2024/11/26 16:57:32 duration: 10s - 1799.031mb/s - 9432103.922ops/s - 0.106us/op messages: 94332600
+[bench_reader] 2024/11/26 16:57:32 duration: 10s - 1799.933mb/s - 9436830.817ops/s - 0.106us/op messages: 94778191
+[bench_writer] 2024/11/26 16:57:42 duration: 10s - 1818.559mb/s - 9534484.520ops/s - 0.105us/op messages: 95356200
+[bench_reader] 2024/11/26 16:57:42 duration: 10s - 1816.652mb/s - 9524490.012ops/s - 0.105us/op messages: 95697817
