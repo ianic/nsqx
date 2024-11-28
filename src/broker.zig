@@ -103,16 +103,12 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
             return self.now + nsFromMs(delay_ms);
         }
 
-        fn channelCreated(self: *Broker, topic_name: []const u8, name: []const u8) void {
-            self.notifier.channelCreated(topic_name, name);
-            log.debug("topic '{s}' channel '{s}' created", .{ topic_name, name });
-        }
-
         // Publish/subscribe -----------------
 
         fn getOrCreateTopic(self: *Broker, name: []const u8) !*Topic {
             if (self.topics.get(name)) |t| return t;
 
+            try self.notifier.ensureCapacity(name, "");
             const topic = try self.allocator.create(Topic);
             errdefer self.allocator.destroy(topic);
             const key = try self.allocator.dupe(u8, name);
@@ -153,6 +149,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         }
 
         pub fn deleteTopic(self: *Broker, name: []const u8) !void {
+            try self.notifier.ensureCapacity(name, "");
             const kv = self.topics.fetchRemove(name) orelse return error.NotFound;
             const topic = kv.value;
             topic.delete();
@@ -168,6 +165,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
         pub fn deleteChannel(self: *Broker, topic_name: []const u8, name: []const u8) !void {
             const topic = self.topics.get(topic_name) orelse return error.NotFound;
+            try self.notifier.ensureCapacity(topic_name, name);
             try topic.deleteChannel(name);
             self.notifier.channelDeleted(topic_name, name);
             log.debug("deleted channel {s} on topic {s}", .{ name, topic_name });
@@ -477,6 +475,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 fn getOrCreateChannel(self: *Topic, name: []const u8) !*Channel {
                     if (self.channels.get(name)) |channel| return channel;
 
+                    try self.broker.notifier.ensureCapacity(self.name, name);
                     const first_channel = self.channels.count() == 0;
                     const channel = try self.allocator.create(Channel);
                     errdefer self.allocator.destroy(channel);
@@ -489,7 +488,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                     channel.sequence = self.stream.subscribe(if (first_channel) .all else .new);
                     channel.metric.depth = if (first_channel) self.stream.metric.msgs else 0;
-                    self.broker.channelCreated(self.name, channel.name);
+                    self.broker.notifier.channelCreated(self.name, channel.name);
+                    log.debug("topic '{s}' channel '{s}' created", .{ self.name, channel.name });
                     return channel;
                 }
 
@@ -1294,6 +1294,7 @@ pub const NoopNotifier = struct {
     fn channelDeleted(self: *Self, _: []const u8, _: []const u8) void {
         self.call_count += 1;
     }
+    fn ensureCapacity(_: *Self, _: []const u8, _: []const u8) !void {}
 };
 
 var noop_notifier = NoopNotifier{};

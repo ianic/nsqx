@@ -57,7 +57,7 @@ pub const Connector = struct {
                 allocator,
                 .{
                     .initial_page_size = 64 * 1024,
-                    .max_page_size = 64 * 1024,
+                    .max_page_size = 1024 * 1024,
                     .ack_policy = .none,
                     .retention_policy = .all,
                 },
@@ -116,6 +116,10 @@ pub const Connector = struct {
 
     pub fn channelDeleted(self: *Self, topic_name: []const u8, name: []const u8) void {
         self.append("UNREGISTER {s} {s}\n", .{ topic_name, name });
+    }
+
+    pub fn ensureCapacity(self: *Self, topic_name: []const u8, channel_name: []const u8) !void {
+        try self.stream.ensureUnusedCapacity(@intCast(10 + 1 + topic_name.len + 1 + channel_name.len + 1));
     }
 
     fn append(self: *Self, comptime fmt: []const u8, args: anytype) void {
