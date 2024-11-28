@@ -9,7 +9,7 @@ const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
 const Options = @import("Options.zig");
-const Broker = @import("tcp.zig").Broker;
+const Broker = @import("main.zig").Broker;
 
 const log = std.log.scoped(.statsd);
 

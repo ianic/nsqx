@@ -13,8 +13,7 @@ const Op = @import("io.zig").Op;
 const SendOp = @import("io.zig").SendOp;
 const Error = @import("io.zig").Error;
 
-const lookup = @import("lookup.zig");
-pub const Broker = @import("broker.zig").BrokerType(Conn, lookup.Connector);
+const Broker = @import("main.zig").Broker;
 const Channel = Broker.Channel;
 const MsgId = @import("broker.zig").MsgId;
 const TimerQueue = @import("broker.zig").TimerQueue;

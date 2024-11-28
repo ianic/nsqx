@@ -10,7 +10,7 @@ const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
 const SendOp = @import("io.zig").SendOp;
 const Error = @import("io.zig").Error;
-const Broker = @import("tcp.zig").Broker;
+const Broker = @import("main.zig").Broker;
 const store = @import("store.zig");
 pub const Listener = @import("tcp.zig").ListenerType(Conn);
 

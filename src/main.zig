@@ -12,6 +12,7 @@ const tcp = @import("tcp.zig");
 const http = @import("http.zig");
 const lookup = @import("lookup.zig");
 const statsd = @import("statsd.zig");
+pub const Broker = @import("broker.zig").BrokerType(tcp.Conn, lookup.Connector);
 
 pub const std_options = std.Options{
     .log_level = if (builtin.mode == .ReleaseFast) .warn else .debug,
@@ -41,7 +42,7 @@ pub fn main() !void {
     try lookup_connector.init(allocator, &io, options.lookup_tcp_addresses, options);
     defer lookup_connector.deinit();
 
-    var server = tcp.Broker.init(allocator, &lookup_connector, io.now(), options.limits);
+    var server = Broker.init(allocator, &lookup_connector, io.now(), options.limits);
     defer server.deinit();
 
     var tcp_listener: tcp.Listener = undefined;

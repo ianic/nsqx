@@ -1126,7 +1126,7 @@ test "channel fin req" {
         try testing.expectEqual(0, channel.deferred.count());
     }
     { // wakeup without ready consumers
-        try channel.wakeup();
+        channel.wakeup();
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
     }
@@ -1224,7 +1224,11 @@ const TestConsumer = struct {
         self.sequences.deinit();
     }
 
-    fn wakeup(self: *Self) !void {
+    fn wakeup(self: *Self) void {
+        self.wakeup_() catch {};
+    }
+
+    fn wakeup_(self: *Self) !void {
         {
             // Making this method fallible in check all allocations
             const buf = try self.allocator.alloc(u8, 8);
@@ -1261,7 +1265,7 @@ const TestConsumer = struct {
 
     fn pull(self: *Self) !void {
         self.ready_count = 1;
-        try self.wakeup();
+        try self.wakeup_();
     }
 
     fn pullFinish(self: *Self) !void {
@@ -1524,7 +1528,7 @@ test "deferred messages" {
 
     { // move now to deliver both
         broker.now = nsFromMs(3);
-        try channel.wakeup();
+        channel.wakeup();
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         topic.onTimer(broker.now);
