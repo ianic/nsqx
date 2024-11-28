@@ -2,7 +2,8 @@ const std = @import("std");
 const mem = std.mem;
 const assert = std.debug.assert;
 const testing = std.testing;
-const maxInt = std.math.maxInt;
+const math = std.math;
+const maxInt = math.maxInt;
 const log = std.log.scoped(.store);
 
 const Store = @This();
@@ -126,7 +127,7 @@ pub const Page = struct {
         };
     }
 
-    fn first(self: *Self) u64 {
+    fn first(self: Self) u64 {
         return self.first_sequence;
     }
 
@@ -134,7 +135,7 @@ pub const Page = struct {
         return self.first_sequence + self.offsets.items.len - 1;
     }
 
-    fn contains(self: *Self, sequence: u64) bool {
+    fn contains(self: Self, sequence: u64) bool {
         return self.first() <= sequence and self.last() >= sequence;
     }
 
@@ -162,7 +163,6 @@ pub const NextResult = struct {
             page.rc -= (self.count + 1);
         }
         if (sequence == 0) stream.consumers.head += 1;
-        if (self.sequence.to == stream.last_sequence) stream.consumers.tail -= 1;
     }
 };
 
@@ -202,7 +202,6 @@ pub const Stream = struct {
     consumers: struct {
         count: u32 = 0,
         head: u32 = 0,
-        tail: u32 = 0,
     } = .{},
     last_sequence: u64 = 0,
     last_page: u32 = 0,
@@ -222,6 +221,7 @@ pub const Stream = struct {
 
     pub fn deinit(self: *Self) void {
         for (self.pages.items) |*page| {
+            self.store.dec(page.buf.len);
             self.allocator.free(page.buf);
             page.offsets.deinit();
         }
@@ -281,7 +281,6 @@ pub const Stream = struct {
         const data = try page.alloc(bytes_count);
 
         self.last_sequence +%= 1;
-        self.consumers.tail = 0;
         assert(self.last_sequence == page.last());
         return .{ .data = data, .sequence = self.last_sequence, .page = page.no };
     }
@@ -307,17 +306,18 @@ pub const Stream = struct {
     }
 
     fn nextPage(self: *Self, sequence: *u64) ?[]const u8 {
-        const max_ready_count = std.math.maxInt(u32);
+        const max_ready_count = maxInt(u32);
         return self.next(sequence, max_ready_count);
     }
 
-    pub fn empty(self: Self) bool {
-        return self.pages.items.len == 0;
+    fn containsSequence(sequence: u64, page: Page) math.Order {
+        if (page.contains(sequence)) return .eq;
+        return if (page.first_sequence > sequence) .lt else .gt;
     }
 
     fn findPage(self: Self, sequence: u64) ?*Page {
-        for (self.pages.items) |*page| {
-            if (page.contains(sequence)) return page;
+        if (std.sort.binarySearch(Page, self.pages.items, sequence, containsSequence)) |i| {
+            return &self.pages.items[i];
         }
         return null;
     }
@@ -328,7 +328,6 @@ pub const Stream = struct {
             .new => {
                 if (self.lastPage()) |p| {
                     p.rc += 1;
-                    self.consumers.tail += 1;
                     return self.last_sequence;
                 } else {
                     self.consumers.head += 1;
@@ -358,7 +357,6 @@ pub const Stream = struct {
         self.consumers.count += 1;
         self.acquire(sequence);
         if (sequence == 0) self.consumers.head += 1;
-        if (sequence == self.last_sequence) self.consumers.tail += 1;
     }
 
     pub fn unsubscribe(self: *Self, sequence: u64) void {
@@ -367,16 +365,17 @@ pub const Stream = struct {
             self.consumers.head -= 1;
             return;
         }
-        if (sequence == self.last_sequence) {
-            self.consumers.tail -= 1;
-        }
-        self.fin(sequence);
+        self.release(0, sequence);
     }
 
     fn cleanupPages(self: *Self) void {
         if (self.options.retention_policy != .interest or
             self.consumers.head > 0) return;
+        self.removeFreePages();
+    }
 
+    // Remove pages which have zero references.
+    fn removeFreePages(self: *Self) void {
         while (self.pages.items.len > 0 and self.pages.items[0].rc == 0) {
             var page = &self.pages.items[0];
             self.allocator.free(page.buf);
@@ -385,6 +384,10 @@ pub const Stream = struct {
             self.alloc_bytes -= page.buf.len;
             _ = self.pages.orderedRemove(0);
         }
+    }
+
+    pub fn empty(self: *Self) void {
+        self.removeFreePages();
     }
 
     pub fn next(self: *Self, sequence: u64, ready_count: u32) ?NextResult {
@@ -415,10 +418,8 @@ pub const Stream = struct {
             return null;
         };
 
-        const res = page.next(sequence, ready_count, self.options.ack_policy);
-        if (cleanup) self.cleanupPages();
-        if (res.sequence.to == self.last_sequence) self.consumers.tail += 1;
-        return res;
+        defer if (cleanup) self.cleanupPages();
+        return page.next(sequence, ready_count, self.options.ack_policy);
     }
 
     pub fn hasMore(self: *Self, sequence: u64) bool {
@@ -430,12 +431,6 @@ pub const Stream = struct {
         return page.message(sequence);
     }
 
-    pub fn fin(self: *Self, sequence: u64) void {
-        const page = self.findPage(sequence).?;
-        page.rc -= 1;
-        if (page.rc == 0) self.cleanupPages();
-    }
-
     fn findPageByNo(self: *Self, no: u32) ?*Page {
         const first_no = self.pages.items[0].no;
         if (no >= first_no) {
@@ -444,6 +439,14 @@ pub const Stream = struct {
                 return &self.pages.items[idx];
         }
         return null;
+    }
+
+    pub fn releaseSequence(self: *Self, sequence: u64) void {
+        self.release(0, sequence);
+    }
+
+    pub fn releasePage(self: *Self, page: u32) void {
+        self.release(page, 0);
     }
 
     pub fn release(self: *Self, no: u32, sequence: u64) void {
@@ -543,6 +546,8 @@ test "topic usage" {
         try stream.append("4567");
     }
 
+    try testing.expectEqual(1, stream.findPage(101).?.no);
+
     // first subscriber gets all the messages
     var sub_1_seq = stream.subscribe();
     try testing.expectEqual(0, sub_1_seq);
@@ -590,8 +595,8 @@ test "topic usage" {
 
         // fin messages in flight release first page
         try testing.expectEqual(3, stream.pages.items.len);
-        for (res1.sequence.from..res1.sequence.to + 1) |seq| stream.fin(seq);
-        stream.fin(res1.sequence.from);
+        for (res1.sequence.from..res1.sequence.to + 1) |seq| stream.releaseSequence(seq);
+        stream.releaseSequence(res1.sequence.from);
         try testing.expectEqual(2, stream.pages.items.len);
     }
 }
@@ -891,11 +896,9 @@ test "subscribe/unsubscribe" {
         try testing.expectEqual(sequence, 0);
         try testing.expectEqual(1, stream.consumers.count);
         try testing.expectEqual(1, stream.consumers.head);
-        try testing.expectEqual(0, stream.consumers.tail);
         stream.unsubscribe(sequence);
         try testing.expectEqual(0, stream.consumers.count);
         try testing.expectEqual(0, stream.consumers.head);
-        try testing.expectEqual(0, stream.consumers.tail);
     }
     stream.options.deliver_policy = .new;
     {
@@ -903,11 +906,9 @@ test "subscribe/unsubscribe" {
         try testing.expectEqual(sequence, 0);
         try testing.expectEqual(1, stream.consumers.count);
         try testing.expectEqual(1, stream.consumers.head);
-        try testing.expectEqual(0, stream.consumers.tail);
         stream.unsubscribe(sequence);
         try testing.expectEqual(0, stream.consumers.count);
         try testing.expectEqual(0, stream.consumers.head);
-        try testing.expectEqual(0, stream.consumers.tail);
     }
     try stream.append("0");
     stream.options.deliver_policy = .all;
@@ -916,11 +917,9 @@ test "subscribe/unsubscribe" {
         try testing.expectEqual(sequence, 0);
         try testing.expectEqual(1, stream.consumers.count);
         try testing.expectEqual(1, stream.consumers.head);
-        try testing.expectEqual(0, stream.consumers.tail);
         stream.unsubscribe(sequence);
         try testing.expectEqual(0, stream.consumers.count);
         try testing.expectEqual(0, stream.consumers.head);
-        try testing.expectEqual(0, stream.consumers.tail);
     }
     stream.options.deliver_policy = .new;
     {
@@ -928,10 +927,8 @@ test "subscribe/unsubscribe" {
         try testing.expectEqual(sequence, 101);
         try testing.expectEqual(1, stream.consumers.count);
         try testing.expectEqual(0, stream.consumers.head);
-        try testing.expectEqual(1, stream.consumers.tail);
         stream.unsubscribe(sequence);
         try testing.expectEqual(0, stream.consumers.count);
         try testing.expectEqual(0, stream.consumers.head);
-        try testing.expectEqual(0, stream.consumers.tail);
     }
 }

@@ -470,10 +470,10 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn empty(self: *Topic) void {
-                    // TODO missing store implementation
-                    // If first is hard pointer release it.
-                    // if (self.channels.count() == 0) if (self.first) |n| n.release();
-                    _ = self;
+                    if (self.channels.count() == 0) {
+                        self.stream.empty();
+                        self.metric.depth = 0;
+                    }
                 }
 
                 fn delete(self: *Topic) void {
@@ -951,7 +951,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     // deferred).
                     pub fn done(self: SendChunk) void {
                         if (self.stream) |stream|
-                            stream.release(self.page, 0);
+                            stream.releasePage(self.page);
                         if (self.allocator) |allocator|
                             allocator.free(self.data);
                     }
@@ -1076,14 +1076,14 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     { // release in_flight messages
                         var iter = self.in_flight.keyIterator();
                         while (iter.next()) |e| {
-                            self.topic.stream.fin(e.*);
+                            self.topic.stream.releaseSequence(e.*);
                         }
                         self.in_flight.clearAndFree();
                     }
                     { // release deferred messages
                         var iter = self.deferred.iterator();
                         while (iter.next()) |dm| {
-                            self.topic.stream.fin(dm.sequence);
+                            self.topic.stream.releaseSequence(dm.sequence);
                         }
                         self.deferred.shrinkAndFree(0);
                     }
