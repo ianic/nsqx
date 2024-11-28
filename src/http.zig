@@ -11,6 +11,7 @@ const Op = @import("io.zig").Op;
 const SendOp = @import("io.zig").SendOp;
 const Error = @import("io.zig").Error;
 const Broker = @import("tcp.zig").Broker;
+const store = @import("store.zig");
 pub const Listener = @import("tcp.zig").ListenerType(Conn);
 
 const log = std.log.scoped(.http);
@@ -230,7 +231,7 @@ const Stat = struct {
         paused: bool,
         channels: []Channel,
         e2e_processing_latency: struct { count: usize = 0 } = .{},
-        store: Store,
+        stream: Stream,
     };
     const Channel = struct {
         channel_name: []const u8,
@@ -267,33 +268,35 @@ const Stat = struct {
         topic: []const u8,
         count: usize,
     };
-    const Store = struct {
+    const Stream = struct {
         last_page: u32,
         last_sequence: u64,
-        message_count: usize,
-        message_bytes: usize,
-        alloc_bytes: usize,
         page_size: usize,
         pages_count: usize,
+        metric: StreamMetric,
         pages: []Page,
+    };
+    const StreamMetric = struct {
+        msgs: usize,
+        bytes: usize,
+        capacity: usize,
+        total_msgs: usize,
+        total_bytes: usize,
     };
     const Page = struct {
         no: u32,
         first_sequence: u64,
-        message_count: usize,
-        message_bytes: usize,
-        alloc_bytes: usize,
-        references: u32,
+        msgs: usize,
+        bytes: usize,
+        capacity: usize,
+        ref_count: u32,
     };
 
     version: []const u8 = "0.1.0",
     health: []const u8 = "OK",
     start_time: u64,
     topics: []Topic,
-    store: struct {
-        pages: u32,
-        bytes: u64,
-    },
+    metric: StreamMetric,
     producers: []Client,
 };
 
@@ -379,43 +382,50 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
                 try pages.append(.{
                     .no = page.no,
                     .first_sequence = page.first_sequence,
-                    .message_count = page.count(),
-                    .message_bytes = page.size(),
-                    .alloc_bytes = page.capacity(),
-                    .references = page.rc,
+                    .msgs = page.count(),
+                    .bytes = page.size(),
+                    .capacity = page.capacity(),
+                    .ref_count = page.ref_count,
                 });
             }
             message_count += page.count();
             message_bytes += page.size();
         }
-        const store = Stat.Store{
+        const stream = Stat.Stream{
             .last_sequence = topic.stream.last_sequence,
             .last_page = topic.stream.last_page,
-            .message_count = message_count,
-            .message_bytes = message_bytes,
-            .alloc_bytes = topic.stream.alloc_bytes,
             .page_size = topic.stream.page_size,
+            .metric = .{
+                .msgs = topic.stream.metric.msgs,
+                .bytes = topic.stream.metric.bytes,
+                .capacity = topic.stream.metric.capacity,
+                .total_msgs = topic.stream.metric.total_msgs,
+                .total_bytes = topic.stream.metric.total_bytes,
+            },
             .pages_count = topic.stream.pages.items.len,
             .pages = pages.items,
         };
 
         try topics.append(.{
             .topic_name = topic.name,
-            .depth = topic.metric.depth,
-            .message_count = topic.metric.total,
-            .message_bytes = topic.metric.total_bytes,
+            .depth = if (topic.channels.count() == 0) topic.stream.metric.msgs else 0,
+            .message_count = topic.stream.metric.total_msgs,
+            .message_bytes = topic.stream.metric.total_bytes,
             .paused = topic.paused,
             .channels = channels.items,
-            .store = store,
+            .stream = stream,
         });
     }
 
     const stat = Stat{
         .start_time = broker.started_at / std.time.ns_per_s,
         .topics = topics.items,
-        .store = .{
-            .pages = broker.store.pages,
-            .bytes = broker.store.alloc_bytes,
+        .metric = .{
+            .msgs = broker.metric.msgs,
+            .bytes = broker.metric.bytes,
+            .capacity = broker.metric.capacity,
+            .total_msgs = broker.metric.total_msgs,
+            .total_bytes = broker.metric.total_bytes,
         },
         .producers = &.{},
     };

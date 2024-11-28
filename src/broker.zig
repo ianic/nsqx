@@ -6,10 +6,9 @@ const builtin = @import("builtin");
 const testing = std.testing;
 
 const log = std.log.scoped(.broker);
-const Error = @import("io.zig").Error;
 const protocol = @import("protocol.zig");
 const Limits = @import("Options.zig").Limits;
-const Store = @import("Store.zig");
+const store = @import("store.zig");
 
 fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
@@ -51,15 +50,15 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         limits: Limits,
 
         started_at: u64,
-        metric: Topic.Metric = .{},
-        metric_prev: Topic.Metric = .{},
+        metric: store.Metric = .{},
+        metric_prev: store.Metric = .{},
 
         // Current timestamp, set in tick().
         now: u64 = 0,
         // Channels waiting for wake up at specific timestamp.
         channel_timers: TimerQueue(Channel),
+        // Topics with deferred messages waiting for wake up.
         topic_timers: TimerQueue(Topic),
-        store: Store,
 
         // Init/deinit -----------------
 
@@ -73,16 +72,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 .channel_timers = TimerQueue(Channel).init(allocator),
                 .topic_timers = TimerQueue(Topic).init(allocator),
                 .limits = limits,
-                .store = .{
-                    .max_mem = limits.max_mem,
-                    .options = .{
-                        .ack_policy = .explicit,
-                        .deliver_policy = .all,
-                        .retention_policy = .all,
-                        .max_page_size = limits.max_page_size,
-                        .initial_page_size = limits.initial_page_size,
-                    },
-                },
+                .metric = .{ .max_mem = limits.max_mem },
             };
         }
 
@@ -238,13 +228,13 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
             while (ti.next()) |topic_ptr| {
                 const topic = topic_ptr.*;
                 { // Topic metrics
-                    const cur = topic.metric;
+                    const cur = topic.stream.metric;
                     const prev = topic.metric_prev;
                     const prefix = try std.fmt.allocPrint(self.allocator, "topic.{s}", .{topic.name});
                     defer self.allocator.free(prefix);
-                    try writer.gauge(prefix, "depth", cur.depth);
-                    try writer.gauge(prefix, "depth_bytes", cur.depth_bytes);
-                    try writer.counter(prefix, "message_count", cur.total, prev.total);
+                    try writer.gauge(prefix, "depth", cur.msgs);
+                    try writer.gauge(prefix, "depth_bytes", cur.bytes);
+                    try writer.counter(prefix, "message_count", cur.total_msgs, prev.total_msgs);
                     try writer.counter(prefix, "message_bytes", cur.total_bytes, prev.total_bytes);
                 }
                 var ci = topic.channels.valueIterator();
@@ -265,15 +255,15 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     try writer.counter(prefix, "requeue_count", cur.requeue, prev.requeue);
                     channel.metric_prev = cur;
                 }
-                topic.metric_prev = topic.metric;
+                topic.metric_prev = topic.stream.metric;
             }
             { // Broker metrics (sum of all topics)
                 const cur = self.metric;
                 const prev = self.metric_prev;
                 const prefix = "broker";
-                try writer.gauge(prefix, "depth", cur.depth);
-                try writer.gauge(prefix, "depth_bytes", cur.depth_bytes);
-                try writer.counter(prefix, "message_count", cur.total, prev.total);
+                try writer.gauge(prefix, "depth", cur.msgs);
+                try writer.gauge(prefix, "depth_bytes", cur.bytes);
+                try writer.counter(prefix, "message_count", cur.total_msgs, prev.total_msgs);
                 try writer.counter(prefix, "message_bytes", cur.total_bytes, prev.total_bytes);
                 self.metric_prev = self.metric;
             }
@@ -402,10 +392,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 name: []const u8,
                 paused: bool = false,
                 channels: std.StringHashMap(*Channel),
-                stream: Store.Stream,
-
-                metric: Metric = .{},
-                metric_prev: Metric = .{},
+                stream: store.Stream,
+                metric_prev: store.Metric = .{},
 
                 timer_ts: u64 = infinite,
                 timers: *TimerQueue(Topic),
@@ -422,30 +410,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     }
                 };
 
-                const Metric = struct {
-                    // Current number of messages in the topic
-                    depth: usize = 0,
-                    // Size in bytes of the current messages.
-                    depth_bytes: usize = 0,
-                    // Total number of messages.
-                    total: usize = 0,
-                    // Total size of all messages.
-                    total_bytes: usize = 0,
-
-                    fn inc(self: *Metric, bytes: usize, no_channels: bool) void {
-                        self.total +%= 1;
-                        self.total_bytes +%= bytes;
-                        if (no_channels) {
-                            self.depth +%= 1;
-                            self.depth_bytes +%= bytes;
-                        }
-                    }
-                    fn reset(self: *Metric) void {
-                        self.depth = 0;
-                        self.depth_bytes = 0;
-                    }
-                };
-
                 pub fn init(broker: *Broker, name: []const u8) Topic {
                     const allocator = broker.allocator;
                     return .{
@@ -453,9 +417,19 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         .name = name,
                         .channels = std.StringHashMap(*Channel).init(allocator),
                         .broker = broker,
-                        .stream = broker.store.initStream(allocator),
                         .timers = &broker.topic_timers,
                         .deferred = std.PriorityQueue(DeferredPublish, void, DeferredPublish.less).init(allocator, {}),
+                        .stream = store.Stream.init(
+                            allocator,
+                            .{
+                                .ack_policy = .explicit,
+                                .retention_policy = .interest,
+                                .max_page_size = broker.limits.max_page_size,
+                                .initial_page_size = broker.limits.initial_page_size,
+                                .max_mem = broker.limits.max_topic_mem,
+                            },
+                            &broker.metric,
+                        ),
                     };
                 }
 
@@ -472,7 +446,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 fn empty(self: *Topic) void {
                     if (self.channels.count() == 0) {
                         self.stream.empty();
-                        self.metric.depth = 0;
                     }
                 }
 
@@ -488,16 +461,12 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn deinitChannel(self: *Topic, channel: *Channel) void {
-                    if (self.channels.count() == 0) {
-                        self.stream.options.retention_policy = .{ .from_sequence = self.stream.last_sequence };
-                        self.stream.options.deliver_policy = .{ .from_sequence = self.stream.last_sequence };
-                    }
                     self.stream.unsubscribe(channel.sequence);
-
                     const key = channel.name;
                     channel.deinit();
                     self.allocator.free(key);
                     self.allocator.destroy(channel);
+                    self.empty();
                 }
 
                 fn subscribe(self: *Topic, consumer: *Consumer, name: []const u8) !void {
@@ -518,16 +487,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     errdefer channel.deinit();
                     self.channels.putAssumeCapacityNoClobber(key, channel);
 
-                    channel.sequence = self.stream.subscribe();
-                    if (first_channel) {
-                        // First channel gets all messages from the topic,
-                        // move metrics to the channel.
-                        channel.metric.depth = self.metric.depth;
-                        self.metric.reset();
-                        // Other channels are getting new (from current sequence).
-                        self.stream.options.retention_policy = .interest;
-                        self.stream.options.deliver_policy = .new;
-                    }
+                    channel.sequence = self.stream.subscribe(if (first_channel) .all else .new);
+                    channel.metric.depth = if (first_channel) self.stream.metric.msgs else 0;
                     self.broker.channelCreated(self.name, channel.name);
                     return channel;
                 }
@@ -544,7 +505,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         MsgId.encode(header[18..34], res.page, res.sequence); // msg id
                     }
                     @memcpy(body, data);
-                    self.metric.inc(data.len, self.channels.count() == 0);
                 }
 
                 fn publish(self: *Topic, data: []const u8) !void {
@@ -787,9 +747,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 fn restore(self: *Channel, sequence: u64) !void {
                     if (sequence == self.sequence) return;
                     self.topic.stream.unsubscribe(self.sequence);
-                    self.sequence = sequence;
-                    self.topic.stream.subscribeAt(sequence);
-                    self.metric.depth += self.topic.stream.last_sequence - sequence;
+                    self.sequence = self.topic.stream.subscribe(.{ .from_sequence = sequence });
+                    self.metric.depth = self.topic.stream.last_sequence - sequence;
                 }
 
                 fn restoreMsg(self: *Channel, sequence: u64, defer_until: u64, attempts: u16) !void {
@@ -940,7 +899,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     data: []const u8,
                     count: u32 = 1,
 
-                    stream: ?*Store.Stream = null,
+                    stream: ?*store.Stream = null,
                     page: u32 = 0,
                     allocator: ?mem.Allocator = null,
 
@@ -968,7 +927,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     // else find next chunk in stream
                     if (self.topic.paused) return null;
                     if (self.topic.stream.next(self.sequence, ready_count)) |res| {
-                        errdefer res.revert(&self.topic.stream, self.sequence);
+                        errdefer res.revert(&self.topic.stream);
 
                         { // add all sequence to in_flight
                             try self.in_flight.ensureUnusedCapacity(res.count);
@@ -1089,7 +1048,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     }
                     { // move stream pointer
                         self.topic.stream.unsubscribe(self.sequence);
-                        self.sequence = self.topic.stream.subscribe();
+                        self.sequence = self.topic.stream.subscribe(.new);
                         self.metric.depth = 0;
                     }
                 }
@@ -1424,7 +1383,7 @@ test "first channel gets all messages accumulated in topic" {
         try broker.publish(topic_name, "message body"); // 1-16
 
     const topic = try broker.getOrCreateTopic(topic_name);
-    try testing.expectEqual(no, topic.metric.depth);
+    try testing.expectEqual(no, topic.stream.metric.msgs);
 
     // subscribe creates channel
     // channel gets all messages
@@ -1433,7 +1392,6 @@ test "first channel gets all messages accumulated in topic" {
     try broker.subscribe(&consumer, topic_name, channel_name);
     var channel = consumer.channel.?;
     try testing.expectEqual(0, channel.sequence);
-    try testing.expectEqual(0, topic.metric.depth);
     try testing.expectEqual(no, channel.metric.depth);
 
     for (0..no) |i| {
@@ -1441,26 +1399,24 @@ test "first channel gets all messages accumulated in topic" {
         try consumer.pullFinish();
     }
     try testing.expectEqual(0, channel.metric.depth);
-    try testing.expectEqual(0, topic.metric.depth);
+    try testing.expectEqual(no, topic.stream.metric.msgs);
 
     try broker.publish(topic_name, "message body"); // 17
     try testing.expectEqual(1, channel.metric.depth);
-    try testing.expectEqual(0, topic.metric.depth);
+    try testing.expectEqual(17, topic.stream.metric.msgs);
     try testing.expectEqual(17, topic.stream.last_sequence);
 
     try broker.deleteChannel(topic_name, channel_name);
-    try testing.expectEqual(0, topic.metric.depth);
+    try testing.expectEqual(0, topic.stream.metric.msgs);
     try broker.publish(topic_name, "message body"); // 18
-    try testing.expectEqual(1, topic.metric.depth);
-
-    try testing.expectEqual(17, topic.stream.options.deliver_policy.from_sequence);
+    try testing.expectEqual(1, topic.stream.metric.msgs);
 
     var consumer2 = TestConsumer.init(allocator);
     defer consumer2.deinit();
     try broker.subscribe(&consumer2, topic_name, channel_name);
     channel = consumer2.channel.?;
     try testing.expectEqual(17, channel.sequence);
-    try testing.expectEqual(0, topic.metric.depth);
+    try testing.expectEqual(1, topic.stream.metric.msgs);
     try testing.expectEqual(1, channel.metric.depth);
 }
 
@@ -1594,7 +1550,7 @@ test "topic pause" {
     {
         try broker.publish(topic_name, "message 1");
         try broker.publish(topic_name, "message 2");
-        try testing.expectEqual(2, topic.metric.depth);
+        try testing.expectEqual(2, topic.stream.metric.msgs);
     }
 
     var consumer = TestConsumer.init(allocator);
@@ -1749,7 +1705,7 @@ test "depth" {
     try broker.publish(topic_name, "message 1");
     try broker.publish(topic_name, "message 2");
 
-    try testing.expectEqual(0, topic.metric.depth);
+    try testing.expectEqual(2, topic.stream.metric.msgs);
     try testing.expectEqual(2, channel1.metric.depth);
     try testing.expectEqual(2, channel2.metric.depth);
 
@@ -1758,23 +1714,19 @@ test "depth" {
     try consumer1.pullFinish();
     try testing.expectEqual(1, channel1.sequence);
 
-    try testing.expectEqual(0, topic.metric.depth);
     try testing.expectEqual(1, channel1.metric.depth);
     try testing.expectEqual(2, channel2.metric.depth);
 
     try consumer2.pullFinish();
-    try testing.expectEqual(0, topic.metric.depth);
     try testing.expectEqual(1, channel1.metric.depth);
     try testing.expectEqual(1, channel2.metric.depth);
 
     try consumer2.pullFinish();
-    try testing.expectEqual(0, topic.metric.depth);
     try testing.expectEqual(1, channel1.metric.depth);
     try testing.expectEqual(0, channel2.metric.depth);
 
     try broker.publish(topic_name, "message 3");
 
-    try testing.expectEqual(0, topic.metric.depth);
     try testing.expectEqual(2, channel1.metric.depth);
     try testing.expectEqual(1, channel2.metric.depth);
 }
@@ -1798,12 +1750,11 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try broker.createChannel(topic_name, channel1_name);
     try broker.createChannel(topic_name, channel2_name);
     const topic = broker.getOrCreateTopic(topic_name) catch unreachable;
-    try testing.expectEqual(2, topic.stream.consumers.head);
 
     // Publish some messages
     try broker.publish(topic_name, "message 1");
     try broker.publish(topic_name, "message 2");
-    try testing.expectEqual(0, topic.metric.depth);
+    try testing.expectEqual(2, topic.stream.metric.msgs);
     try testing.expectEqual(2, topic.stream.last_sequence);
 
     // 1 consumer for channel 1 and 2 consumers for channel 2
@@ -1827,7 +1778,7 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try channel1_consumer.pullFinish();
     try channel2_consumer1.pullFinish();
     try channel2_consumer2.pullFinish();
-    try testing.expectEqual(0, topic.metric.depth);
+    try testing.expectEqual(2, topic.stream.metric.msgs);
     try testing.expectEqual(2, channel1_consumer.sequences.items.len);
     try testing.expectEqual(1, channel2_consumer1.sequences.items.len);
     try testing.expectEqual(1, channel2_consumer2.sequences.items.len);
@@ -2028,7 +1979,7 @@ test "dump/restore" {
         try testing.expectEqual(2, channel1.metric.depth);
         try testing.expectEqual(2, channel2.metric.depth);
 
-        try testing.expectEqual(5, topic.stream.pages.items[0].rc);
+        try testing.expectEqual(5, topic.stream.pages.items[0].ref_count);
         try broker.dump(dir);
     }
 
@@ -2043,7 +1994,7 @@ test "dump/restore" {
         const page = topic.stream.pages.items[0];
         try testing.expectEqual(3, page.offsets.items.len);
         try testing.expectEqual(11, page.no);
-        try testing.expectEqual(5, page.rc);
+        try testing.expectEqual(5, page.ref_count);
 
         try testing.expectEqualStrings(topic.stream.message(101)[34..], "Iso ");
         try testing.expectEqualStrings(topic.stream.message(102)[34..], "medo u ducan ");

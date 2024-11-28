@@ -111,7 +111,7 @@ pub fn main() !void {
         if (sig != 0) {
             signal.store(0, .release);
             switch (sig) {
-                posix.SIG.USR1 => try showStat(&tcp_listener, &io, &server),
+                // posix.SIG.USR1 => try showStat(&tcp_listener, &io, &server),
                 posix.SIG.USR2 => {
                     mallocInfo();
                     mallocTrim();
@@ -149,67 +149,67 @@ fn mallocInfo() void {
     //c.malloc_stats();
 }
 
-fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Broker) !void {
-    const print = std.debug.print;
-    print("listener connections:\n", .{});
-    print("  active {}, accepted: {}, completed: {}\n", .{ listener.metric.accept - listener.metric.close, listener.metric.accept, listener.metric.close });
+// fn showStat(listener: *tcp.Listener, io: *Io, server: *tcp.Broker) !void {
+//     const print = std.debug.print;
+//     print("listener connections:\n", .{});
+//     print("  active {}, accepted: {}, completed: {}\n", .{ listener.metric.accept - listener.metric.close, listener.metric.accept, listener.metric.close });
 
-    print("io operations: loops: {}, cqes: {}, cqes/loop {}\n", .{
-        io.metric.loops,
-        io.metric.cqes,
-        if (io.metric.loops > 0) io.metric.cqes / io.metric.loops else 0,
-    });
-    print("  all    {}\n", .{io.metric.all});
-    print("  recv   {}\n", .{io.metric.recv});
-    print("  sendv  {}\n", .{io.metric.sendv});
-    print("  timer  {}\n", .{io.metric.timer});
-    print("  close  {}\n", .{io.metric.close});
-    print("  accept {}\n", .{io.metric.accept});
+//     print("io operations: loops: {}, cqes: {}, cqes/loop {}\n", .{
+//         io.metric.loops,
+//         io.metric.cqes,
+//         if (io.metric.loops > 0) io.metric.cqes / io.metric.loops else 0,
+//     });
+//     print("  all    {}\n", .{io.metric.all});
+//     print("  recv   {}\n", .{io.metric.recv});
+//     print("  sendv  {}\n", .{io.metric.sendv});
+//     print("  timer  {}\n", .{io.metric.timer});
+//     print("  close  {}\n", .{io.metric.close});
+//     print("  accept {}\n", .{io.metric.accept});
 
-    print(
-        "  receive buffers group:\n    success: {}, no-buffs: {} {d:5.2}%\n",
-        .{ io.metric.recv_buf_grp.success, io.metric.recv_buf_grp.no_bufs, io.metric.recv_buf_grp.noBufs() },
-    );
+//     print(
+//         "  receive buffers group:\n    success: {}, no-buffs: {} {d:5.2}%\n",
+//         .{ io.metric.recv_buf_grp.success, io.metric.recv_buf_grp.no_bufs, io.metric.recv_buf_grp.noBufs() },
+//     );
 
-    print("server topics: {}\n", .{server.topics.count()});
-    var ti = server.topics.iterator();
-    while (ti.next()) |te| {
-        const topic_name = te.key_ptr.*;
-        const topic = te.value_ptr.*;
-        print("  {s} depth: {d} bytes: {d} sequence: {} pages: {}\n", .{
-            topic_name,
-            topic.metric.depth,
-            topic.metric.depth_bytes,
-            topic.stream.last_sequence,
-            topic.stream.pages.items.len,
-        });
+//     print("server topics: {}\n", .{server.topics.count()});
+//     var ti = server.topics.iterator();
+//     while (ti.next()) |te| {
+//         const topic_name = te.key_ptr.*;
+//         const topic = te.value_ptr.*;
+//         print("  {s} depth: {d} bytes: {d} sequence: {} pages: {}\n", .{
+//             topic_name,
+//             topic.metric.depth,
+//             topic.metric.depth_bytes,
+//             topic.stream.last_sequence,
+//             topic.stream.pages.items.len,
+//         });
 
-        var ci = topic.channels.iterator();
-        while (ci.next()) |ce| {
-            const channel_name = ce.key_ptr.*;
-            const channel = ce.value_ptr.*;
-            print("  --{s} consumers: {},  in flight messages: {}, deferred: {}\n", .{
-                channel_name,
-                channel.consumers.items.len,
-                channel.in_flight.count(),
-                channel.deferred.count(),
-            });
-            print("    pull: {}, finish: {}, timeout: {}, requeue: {}\n", .{
-                channel.metric.pull,
-                channel.metric.finish,
-                channel.metric.timeout,
-                channel.metric.requeue,
-            });
-        }
-    }
+//         var ci = topic.channels.iterator();
+//         while (ci.next()) |ce| {
+//             const channel_name = ce.key_ptr.*;
+//             const channel = ce.value_ptr.*;
+//             print("  --{s} consumers: {},  in flight messages: {}, deferred: {}\n", .{
+//                 channel_name,
+//                 channel.consumers.items.len,
+//                 channel.in_flight.count(),
+//                 channel.deferred.count(),
+//             });
+//             print("    pull: {}, finish: {}, timeout: {}, requeue: {}\n", .{
+//                 channel.metric.pull,
+//                 channel.metric.finish,
+//                 channel.metric.timeout,
+//                 channel.metric.requeue,
+//             });
+//         }
+//     }
 
-    print("listener connections: {}\n", .{listener.conns.count()});
-    var iter = listener.conns.keyIterator();
-    while (iter.next()) |e| {
-        const conn = e.*;
-        conn.printStatus();
-    }
-}
+//     print("listener connections: {}\n", .{listener.conns.count()});
+//     var iter = listener.conns.keyIterator();
+//     while (iter.next()) |e| {
+//         const conn = e.*;
+//         conn.printStatus();
+//     }
+// }
 
 var signal = Atomic(c_int).init(0);
 

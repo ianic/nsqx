@@ -11,7 +11,7 @@ const Op = @import("io.zig").Op;
 const Error = @import("io.zig").Error;
 const RecvBuf = @import("tcp.zig").RecvBuf;
 const Options = @import("Options.zig");
-const Store = @import("Store.zig");
+const Stream = @import("store.zig").Stream;
 
 const log = std.log.scoped(.lookup);
 
@@ -23,8 +23,7 @@ pub const Connector = struct {
     connections: std.ArrayList(*Conn),
     identify: []const u8,
     ticker_op: Op = .{},
-    store: Store,
-    stream: Store.Stream,
+    stream: Stream,
     state: State,
     const State = enum {
         connected,
@@ -54,18 +53,17 @@ pub const Connector = struct {
             .connections = std.ArrayList(*Conn).init(allocator),
             .identify = identify,
             .state = .connected,
-            .store = .{
-                .options = .{
+            .stream = Stream.init(
+                allocator,
+                .{
                     .initial_page_size = 64 * 1024,
                     .max_page_size = 64 * 1024,
                     .ack_policy = .none,
-                    .deliver_policy = .all,
                     .retention_policy = .all,
                 },
-            },
-            .stream = undefined,
+                null,
+            ),
         };
-        self.stream = self.store.initStream(allocator);
         errdefer self.deinit();
         try self.connections.ensureUnusedCapacity(lookup_tcp_addresses.len);
         for (lookup_tcp_addresses) |addr| try self.addLookupd(addr);
@@ -246,7 +244,7 @@ const Conn = struct {
         self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
         self.io.submit(&self.recv_op);
         self.state = .connected;
-        self.sequence = self.connector.stream.subscribe();
+        self.sequence = self.connector.stream.subscribe(.all);
         log.debug("{} connected", .{self.address});
     }
 
