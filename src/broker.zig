@@ -179,7 +179,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
         pub fn unpauseTopic(self: *Broker, name: []const u8) !void {
             const topic = self.topics.get(name) orelse return error.NotFound;
-            try topic.unpause();
+            topic.unpause();
             log.debug("un-paused topic {s}", .{name});
         }
 
@@ -568,7 +568,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     var iter = self.channels.valueIterator();
                     while (iter.next()) |ptr| {
                         const channel = ptr.*;
-                        channel.topicAppended(msgs);
+                        channel.onTopicAppend(msgs);
                     }
                 }
 
@@ -585,11 +585,11 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     self.paused = true;
                 }
 
-                fn unpause(self: *Topic) !void {
+                fn unpause(self: *Topic) void {
                     self.paused = false;
                     // wake-up all channels
                     var iter = self.channels.valueIterator();
-                    while (iter.next()) |ptr| try ptr.*.wakeup();
+                    while (iter.next()) |ptr| ptr.*.wakeup();
                 }
 
                 fn pauseChannel(self: *Topic, name: []const u8) !void {
@@ -599,7 +599,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                 fn unpauseChannel(self: *Topic, name: []const u8) !void {
                     const channel = self.channels.get(name) orelse return error.NotFound;
-                    try channel.unpause();
+                    channel.unpause();
                 }
 
                 fn emptyChannel(self: *Topic, name: []const u8) !void {
@@ -721,13 +721,10 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 // -----------------
 
                 // Called from topic when new topic message is created.
-                fn topicAppended(self: *Channel, msgs: u32) void {
+                fn onTopicAppend(self: *Channel, msgs: u32) void {
                     self.metric.depth += msgs;
                     if (!self.needWakeup()) return;
-                    self.wakeup() catch |err| {
-                        if (!builtin.is_test)
-                            log.err("fail to wakeup channel {s}: {}", .{ self.name, err });
-                    };
+                    self.wakeup();
                 }
 
                 fn needWakeup(self: *Channel) bool {
@@ -737,9 +734,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 // Notify consumers that there are messages to pull.
-                fn wakeup(self: *Channel) !void {
+                fn wakeup(self: *Channel) void {
                     while (self.consumers_iterator.next()) |consumer| {
-                        try consumer.wakeup();
+                        consumer.wakeup();
                         if (!self.needWakeup()) break;
                     }
                 }
@@ -819,15 +816,15 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 fn onTimer(self: *Channel, now: u64) void {
                     self.timer_ts = @min(
                         self.inFlightTimeout(now) catch infinite,
-                        self.deferredTimeout(now) catch infinite,
+                        self.deferredTimeout(now),
                     );
                 }
 
                 // Returns next timeout of deferred messages
-                fn deferredTimeout(self: *Channel, now: u64) !u64 {
+                fn deferredTimeout(self: *Channel, now: u64) u64 {
                     var ts: u64 = infinite;
                     if (self.deferred.count() > 0) {
-                        try self.wakeup();
+                        self.wakeup();
                         if (self.deferred.peek()) |dm| {
                             if (dm.defer_until > now and dm.defer_until < ts) ts = dm.defer_until;
                         }
@@ -926,7 +923,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                     // else find next chunk in stream
                     if (self.topic.paused) return null;
-                    if (self.topic.stream.next(self.sequence, ready_count)) |res| {
+                    if (self.topic.stream.pull(self.sequence, ready_count)) |res| {
                         errdefer res.revert(&self.topic.stream);
 
                         { // add all sequence to in_flight
@@ -1026,9 +1023,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     self.paused = true;
                 }
 
-                fn unpause(self: *Channel) !void {
+                fn unpause(self: *Channel) void {
                     self.paused = false;
-                    try self.wakeup();
+                    self.wakeup();
                 }
 
                 fn empty(self: *Channel) !void {

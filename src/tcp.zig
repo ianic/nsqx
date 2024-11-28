@@ -188,7 +188,7 @@ pub const Conn = struct {
     }
 
     /// Pull messages from channel and send.
-    pub fn wakeup(self: *Conn) !void {
+    pub fn wakeup(self: *Conn) void {
         if (self.send_op.active() or self.state != .connected) return;
 
         { // prepare pending responses
@@ -259,7 +259,7 @@ pub const Conn = struct {
 
     fn onSend(self: *Conn) Error!void {
         self.sendDone();
-        try self.wakeup();
+        self.wakeup();
     }
 
     fn sendDone(self: *Conn) void {
@@ -301,7 +301,7 @@ pub const Conn = struct {
         }
 
         try self.recv_buf.set(parser.unparsed());
-        try self.wakeup();
+        self.wakeup();
     }
 
     fn checkLimits(self: *Conn, topic_name: []const u8, len: usize) !void {
