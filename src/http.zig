@@ -5,6 +5,7 @@ const posix = std.posix;
 const socket_t = std.posix.socket_t;
 const fd_t = std.posix.fd_t;
 
+const validateName = @import("protocol.zig").validateName;
 const Options = @import("Options.zig");
 const Io = @import("io.zig").Io;
 const Op = @import("io.zig").Op;
@@ -477,8 +478,8 @@ fn parse(target: []const u8) !Command {
         if (target.len <= 7) return .{ .stats = .{} };
         const qs = target[7..];
         return .{ .stats = .{
-            .topic = queryStringValue(qs, "topic"),
-            .channel = queryStringValue(qs, "channel"),
+            .topic = try nameOrEmpty(queryStringValue(qs, "topic")),
+            .channel = try nameOrEmpty(queryStringValue(qs, "channel")),
             .format = queryStringValue(qs, "format"),
             .include_clients = queryStringValue(qs, "include_clients"),
             .include_pages = queryStringValue(qs, "include_pages"),
@@ -488,41 +489,41 @@ fn parse(target: []const u8) !Command {
 
     if (mem.startsWith(u8, target, "/topic")) {
         if (mem.startsWith(u8, target[6..], "/create?topic="))
-            return .{ .topic_create = target[20..] };
+            return .{ .topic_create = try validateName(target[20..]) };
         if (mem.startsWith(u8, target[6..], "/delete?topic="))
-            return .{ .topic_delete = target[20..] };
+            return .{ .topic_delete = try validateName(target[20..]) };
         if (mem.startsWith(u8, target[6..], "/empty?topic="))
-            return .{ .topic_empty = target[19..] };
+            return .{ .topic_empty = try validateName(target[19..]) };
         if (mem.startsWith(u8, target[6..], "/pause?topic="))
-            return .{ .topic_pause = target[19..] };
+            return .{ .topic_pause = try validateName(target[19..]) };
         if (mem.startsWith(u8, target[6..], "/unpause?topic="))
-            return .{ .topic_unpause = target[21..] };
+            return .{ .topic_unpause = try validateName(target[21..]) };
     }
     if (mem.startsWith(u8, target, "/channel")) {
         if (mem.startsWith(u8, target[8..], "/create?"))
             return .{ .channel_create = .{
-                .topic_name = try findValue(target[16..], "topic"),
-                .name = try findValue(target[16..], "channel"),
+                .topic_name = try findName(target[16..], "topic"),
+                .name = try findName(target[16..], "channel"),
             } };
         if (mem.startsWith(u8, target[8..], "/delete?"))
             return .{ .channel_delete = .{
-                .topic_name = try findValue(target[16..], "topic"),
-                .name = try findValue(target[16..], "channel"),
+                .topic_name = try findName(target[16..], "topic"),
+                .name = try findName(target[16..], "channel"),
             } };
         if (mem.startsWith(u8, target[8..], "/empty?"))
             return .{ .channel_empty = .{
-                .topic_name = try findValue(target[15..], "topic"),
-                .name = try findValue(target[15..], "channel"),
+                .topic_name = try findName(target[15..], "topic"),
+                .name = try findName(target[15..], "channel"),
             } };
         if (mem.startsWith(u8, target[8..], "/pause?"))
             return .{ .channel_pause = .{
-                .topic_name = try findValue(target[15..], "topic"),
-                .name = try findValue(target[15..], "channel"),
+                .topic_name = try findName(target[15..], "topic"),
+                .name = try findName(target[15..], "channel"),
             } };
         if (mem.startsWith(u8, target[8..], "/unpause?"))
             return .{ .channel_unpause = .{
-                .topic_name = try findValue(target[17..], "topic"),
-                .name = try findValue(target[17..], "channel"),
+                .topic_name = try findName(target[17..], "topic"),
+                .name = try findName(target[17..], "channel"),
             } };
     }
     if (mem.startsWith(u8, target, "/create")) {
@@ -530,12 +531,21 @@ fn parse(target: []const u8) !Command {
             return .{ .topic_create = target[20..] };
         if (mem.startsWith(u8, target[7..], "_channel?"))
             return .{ .channel_create = .{
-                .topic_name = try findValue(target[16..], "topic"),
-                .name = try findValue(target[16..], "channel"),
+                .topic_name = try findName(target[16..], "topic"),
+                .name = try findName(target[16..], "channel"),
             } };
     }
 
     return error.UnknownCommand;
+}
+
+fn nameOrEmpty(name: []const u8) ![]const u8 {
+    if (name.len == 0) return name;
+    return try validateName(name);
+}
+
+fn findName(query: []const u8, key: []const u8) ![]const u8 {
+    return try validateName(try findValue(query, key));
 }
 
 fn findValue(query: []const u8, key: []const u8) ![]const u8 {
@@ -598,6 +608,10 @@ test parse {
     try testing.expectEqualStrings("false", cmd.stats.include_clients);
     try testing.expect(!cmd.stats.includeClients());
     try testing.expectEqualStrings("json", cmd.stats.format);
+
+    try testing.expectError(error.InvalidNameCharacter, parse("/topic/empty?topic=topic-000%"));
+    try testing.expectError(error.InvalidName, parse("/topic/empty?topic="));
+    try testing.expectError(error.InvalidName, parse("/topic/empty?topic=01234567890012345678900123456789001234567890012345678900123456789001234567890"));
 }
 
 test findValue {

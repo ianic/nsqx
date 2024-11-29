@@ -138,7 +138,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         // Http interface actions -----------------
 
         pub fn createTopic(self: *Broker, name: []const u8) !void {
-            _ = try self.getOrCreateTopic(try protocol.validateName(name));
+            _ = try self.getOrCreateTopic(name);
         }
 
         pub fn deleteTopic(self: *Broker, name: []const u8) !void {
@@ -152,8 +152,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         }
 
         pub fn createChannel(self: *Broker, topic_name: []const u8, name: []const u8) !void {
-            const topic = try self.getOrCreateTopic(try protocol.validateName(topic_name));
-            _ = try topic.getOrCreateChannel(try protocol.validateName(name));
+            const topic = try self.getOrCreateTopic(topic_name);
+            _ = try topic.getOrCreateChannel(name);
         }
 
         pub fn deleteChannel(self: *Broker, topic_name: []const u8, name: []const u8) !void {
