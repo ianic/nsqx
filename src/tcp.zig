@@ -347,7 +347,7 @@ pub const Conn = struct {
                 self.in_flight -|= 1;
                 try channel.finish(self.id(), msg_id);
                 self.metric.finish += 1;
-                log.debug("{} finish {}", .{ self.socket, MsgId.parse(msg_id).sequence });
+                log.debug("{} finish {}", .{ self.socket, MsgId.parse(msg_id) });
             },
             .requeue => |arg| {
                 var channel = self.channel orelse return error.NotSubscribed;
@@ -358,12 +358,12 @@ pub const Conn = struct {
                     arg.delay;
                 try channel.requeue(self.id(), arg.msg_id, delay);
                 self.metric.requeue += 1;
-                log.debug("{} requeue {}", .{ self.socket, MsgId.parse(arg.msg_id).sequence });
+                log.debug("{} requeue {}", .{ self.socket, MsgId.parse(arg.msg_id) });
             },
             .touch => |msg_id| {
                 var channel = self.channel orelse return error.NotSubscribed;
                 try channel.touch(self.id(), msg_id, self.msgTimeout());
-                log.debug("{} touch {}", .{ self.socket, MsgId.parse(msg_id).sequence });
+                log.debug("{} touch {}", .{ self.socket, MsgId.parse(msg_id) });
             },
             .close => {
                 self.ready_count = 0;

@@ -269,7 +269,6 @@ const Stat = struct {
         count: usize,
     };
     const Stream = struct {
-        last_page: u32,
         last_sequence: u64,
         page_size: usize,
         pages_count: usize,
@@ -284,7 +283,6 @@ const Stat = struct {
         total_bytes: usize,
     };
     const Page = struct {
-        no: u32,
         first_sequence: u64,
         msgs: usize,
         bytes: usize,
@@ -380,20 +378,18 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
         for (topic.stream.pages.items) |page| {
             if (args.includePages()) {
                 try pages.append(.{
-                    .no = page.no,
                     .first_sequence = page.first_sequence,
-                    .msgs = page.count(),
-                    .bytes = page.size(),
+                    .msgs = page.messagesCount(),
+                    .bytes = page.bytesSize(),
                     .capacity = page.capacity(),
                     .ref_count = page.ref_count,
                 });
             }
-            message_count += page.count();
-            message_bytes += page.size();
+            message_count += page.messagesCount();
+            message_bytes += page.bytesSize();
         }
         const stream = Stat.Stream{
             .last_sequence = topic.stream.last_sequence,
-            .last_page = topic.stream.last_page,
             .page_size = topic.stream.page_size,
             .metric = .{
                 .msgs = topic.stream.metric.msgs,

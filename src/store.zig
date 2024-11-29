@@ -15,11 +15,10 @@ pub const Options = struct {
     retention_policy: RetentionPolicy = .all,
 };
 
-pub const Page = struct {
+const Page = struct {
     const Self = @This();
 
     buf: []u8, // allocated page buffer
-    no: u32, // #no of the page in the stream
     first_sequence: u64, // sequence of message at offset 0
     ref_count: u32 = 0, // reference counter
     offsets: std.ArrayList(u32), // offset of each message in the buf
@@ -38,27 +37,30 @@ pub const Page = struct {
         @memcpy(self.buf[wp..][0..bytes.len], bytes);
     }
 
-    pub fn writePos(self: Self) u32 {
+    fn writePos(self: Self) u32 {
         return if (self.offsets.items.len == 0) 0 else self.offsets.getLast();
-    }
-
-    pub fn capacity(self: Self) u32 {
-        return @intCast(self.buf.len);
     }
 
     fn free(self: Self) u32 {
         return self.capacity() - self.writePos();
     }
 
-    pub fn count(self: Self) u32 {
+    // Allocated bytes
+    pub fn capacity(self: Self) u32 {
+        return @intCast(self.buf.len);
+    }
+
+    // Number of messages in page
+    pub fn messagesCount(self: Self) u32 {
         return @intCast(self.offsets.items.len);
     }
 
-    pub fn size(self: Self) u32 {
+    // Used bytes
+    pub fn bytesSize(self: Self) u32 {
         return self.writePos();
     }
 
-    pub fn release(self: *Self, refs: u32) void {
+    fn release(self: *Self, refs: u32) void {
         self.ref_count -= refs;
     }
 
@@ -66,7 +68,7 @@ pub const Page = struct {
     // for the first message. That first reference should be released when
     // buffer is no more required by kernel. Other references should be released
     // when that message is no more needed.
-    fn next(self: *Self, sequence: u64, ready_count: u32, ack_policy: AckPolicy) PullResult {
+    fn pull(self: *Self, sequence: u64, ready_count: u32, ack_policy: AckPolicy) PullResult {
         assert(ready_count > 0);
         assert(sequence < self.last());
         const msgs_count = self.offsets.items.len;
@@ -80,7 +82,6 @@ pub const Page = struct {
                 .data = data,
                 .count = cnt,
                 .sequence = .{ .from = self.first(), .to = self.first() + end_idx },
-                .page = self.no,
             };
         }
         assert(sequence >= self.first());
@@ -94,7 +95,6 @@ pub const Page = struct {
             .data = data,
             .count = cnt,
             .sequence = .{ .from = sequence + 1, .to = sequence + cnt },
-            .page = self.no,
         };
     }
 
@@ -126,11 +126,10 @@ pub const PullResult = struct {
         from: u64,
         to: u64,
     },
-    page: u32,
 
     pub fn revert(self: PullResult, stream: *Stream) void {
         if (stream.options.ack_policy == .explicit) {
-            const page = stream.findPageByNo(self.page).?;
+            const page = stream.findPage(self.sequence.from).?;
             page.ref_count -= (self.count + 1);
         }
     }
@@ -221,7 +220,6 @@ pub const Stream = struct {
     pages: std.ArrayList(Page),
     subscribers: u32 = 0,
     last_sequence: u64 = 0,
-    last_page: u32 = 0,
     page_size: u32,
     metric: Metric = .{},
 
@@ -237,7 +235,7 @@ pub const Stream = struct {
 
     pub fn deinit(self: *Self) void {
         for (self.pages.items) |*page| {
-            self.metric.free(page.count(), page.size(), page.capacity());
+            self.metric.free(page.messagesCount(), page.bytesSize(), page.capacity());
             self.allocator.free(page.buf);
             page.offsets.deinit();
         }
@@ -247,7 +245,6 @@ pub const Stream = struct {
     const AllocResult = struct {
         data: []u8,
         sequence: u64,
-        page: u32,
     };
 
     fn addPage(self: *Self, min_size: u32) !void {
@@ -266,7 +263,7 @@ pub const Stream = struct {
 
         // append new page
         var offsets = std.ArrayList(u32).init(self.allocator);
-        try offsets.ensureTotalCapacity(if (self.lastPage()) |page| page.count() else 128);
+        try offsets.ensureTotalCapacity(if (self.lastPage()) |page| page.messagesCount() else 128);
         errdefer offsets.deinit();
         const buf = try self.allocator.alloc(u8, size);
         errdefer self.allocator.free(buf);
@@ -274,13 +271,10 @@ pub const Stream = struct {
             Page{
                 .ref_count = if (self.pages.items.len == 0) self.subscribers else 0,
                 .first_sequence = 1 +% self.last_sequence,
-                .no = 1 +% self.last_page,
                 .buf = buf,
                 .offsets = offsets,
             },
         );
-
-        self.last_page +%= 1;
         self.metric.alloc(buf.len);
     }
 
@@ -301,7 +295,7 @@ pub const Stream = struct {
         self.last_sequence +%= 1;
         self.metric.append(1, bytes_count);
         assert(self.last_sequence == page.last());
-        return .{ .data = data, .sequence = self.last_sequence, .page = page.no };
+        return .{ .data = data, .sequence = self.last_sequence };
     }
 
     pub fn append(self: *Self, bytes: []const u8) !void {
@@ -393,7 +387,7 @@ pub const Stream = struct {
     fn removeFreePages(self: *Self) void {
         while (self.pages.items.len > 0 and self.pages.items[0].ref_count == 0) {
             var page = &self.pages.items[0];
-            self.metric.free(page.count(), page.size(), page.capacity());
+            self.metric.free(page.messagesCount(), page.bytesSize(), page.capacity());
             self.allocator.free(page.buf);
             page.offsets.deinit();
             _ = self.pages.orderedRemove(0);
@@ -431,7 +425,7 @@ pub const Stream = struct {
         };
 
         defer if (cleanup) self.cleanupPages();
-        return page.next(sequence, ready_count, self.options.ack_policy);
+        return page.pull(sequence, ready_count, self.options.ack_policy);
     }
 
     pub fn hasMore(self: *Self, sequence: u64) bool {
@@ -453,20 +447,9 @@ pub const Stream = struct {
         return null;
     }
 
-    pub fn releaseSequence(self: *Self, sequence: u64) void {
-        self.release(0, sequence);
-    }
-
-    pub fn releasePage(self: *Self, page: u32) void {
-        self.release(page, 0);
-    }
-
-    pub fn release(self: *Self, no: u32, sequence: u64) void {
-        const page = brk: {
-            if (no > 0) if (self.findPageByNo(no)) |page| break :brk page;
-            if (self.findPage(sequence)) |page| break :brk page;
-
-            log.err("release: page not found page: {} sequence: {}", .{ no, sequence });
+    pub fn release(self: *Self, sequence: u64) void {
+        const page = self.findPage(sequence) orelse {
+            log.err("release: page not found for sequence: {}", .{sequence});
             return;
         };
         page.ref_count -= 1;
@@ -479,18 +462,16 @@ pub const Stream = struct {
     }
 
     pub fn dump(self: Self, file: std.fs.File) !void {
-        var header: [16]u8 = undefined;
+        var header: [12]u8 = undefined;
         mem.writeInt(u64, header[0..8], self.last_sequence, .little);
-        mem.writeInt(u32, header[8..12], self.last_page, .little);
-        mem.writeInt(u32, header[12..16], @intCast(self.pages.items.len), .little);
-        try file.writeAll(header[0..16]);
+        mem.writeInt(u32, header[8..12], @intCast(self.pages.items.len), .little);
+        try file.writeAll(header[0..12]);
 
         for (self.pages.items) |page| {
             const wp = page.writePos();
             mem.writeInt(u64, header[0..8], page.first_sequence, .little);
-            mem.writeInt(u32, header[8..12], page.no, .little);
-            mem.writeInt(u32, header[12..16], wp, .little);
-            try file.writeAll(header[0..16]);
+            mem.writeInt(u32, header[8..12], wp, .little);
+            try file.writeAll(header[0..12]);
             try file.writeAll(page.buf[0..wp]);
         }
     }
@@ -498,23 +479,20 @@ pub const Stream = struct {
     pub fn restore(self: *Self, file: std.fs.File) !void {
         const rdr = file.reader();
 
-        var header: [16]u8 = undefined;
-        try rdr.readNoEof(header[0..16]);
+        var header: [12]u8 = undefined;
+        try rdr.readNoEof(header[0..12]);
         self.last_sequence = mem.readInt(u64, header[0..8], .little);
-        self.last_page = mem.readInt(u32, header[8..12], .little);
-        const pages_count = mem.readInt(u32, header[12..16], .little);
+        const pages_count = mem.readInt(u32, header[8..12], .little);
 
         assert(self.pages.items.len == 0);
         for (0..pages_count) |_| {
-            try rdr.readNoEof(header[0..16]);
+            try rdr.readNoEof(header[0..12]);
             const first_sequence = mem.readInt(u64, header[0..8], .little);
-            const no = mem.readInt(u32, header[8..12], .little);
-            const buf_len = mem.readInt(u32, header[12..16], .little);
+            const buf_len = mem.readInt(u32, header[8..12], .little);
 
             var page = Page{
                 .ref_count = 0,
                 .first_sequence = first_sequence,
-                .no = no,
                 .buf = try self.allocator.alloc(u8, buf_len),
                 .offsets = std.ArrayList(u32).init(self.allocator),
             };
@@ -529,7 +507,7 @@ pub const Stream = struct {
             }
             try self.pages.append(page);
             self.metric.alloc(buf_len);
-            self.metric.append(page.count(), page.size());
+            self.metric.append(page.messagesCount(), page.bytesSize());
         }
     }
 };
@@ -560,8 +538,6 @@ test "topic usage" {
     try testing.expectEqual(6, broker_metric.msgs);
     try testing.expectEqual(18, stream.metric.bytes);
     try testing.expectEqual(24, stream.metric.capacity);
-
-    try testing.expectEqual(1, stream.findPage(101).?.no);
 
     // first subscriber gets all the messages
     var sub_1_seq = stream.subscribe(.all);
@@ -605,8 +581,8 @@ test "topic usage" {
 
         // fin messages in flight release first page
         try testing.expectEqual(3, stream.pages.items.len);
-        for (res1.sequence.from..res1.sequence.to + 1) |seq| stream.releaseSequence(seq);
-        stream.releaseSequence(res1.sequence.from);
+        for (res1.sequence.from..res1.sequence.to + 1) |seq| stream.release(seq);
+        stream.release(res1.sequence.from);
         try testing.expectEqual(2, stream.pages.items.len);
 
         try testing.expectEqual(3, stream.metric.msgs);
@@ -635,13 +611,11 @@ test "append/alloc" {
     try testing.expectEqual(102, stream.pages.items[0].last());
     //try store.append("6");
     var res = try stream.alloc(2);
-    try testing.expectEqual(1, res.page);
     try testing.expectEqual(103, stream.last_sequence);
     try testing.expectEqual(103, stream.pages.items[0].last());
 
     // page 2
     res = try stream.alloc(2);
-    try testing.expectEqual(2, res.page);
     try testing.expectEqual(2, stream.pages.items.len);
     try testing.expectEqual(2, res.data.len);
     try testing.expectEqual(104, res.sequence);
@@ -651,7 +625,6 @@ test "append/alloc" {
 
     // page 3 of size 9
     res = try stream.alloc(9);
-    try testing.expectEqual(3, res.page);
     try testing.expectEqual(3, stream.pages.items.len);
     try testing.expectEqual(9, res.data.len);
     try testing.expectEqual(105, res.sequence);
@@ -983,5 +956,4 @@ test "subscribe/unsubscribe interest" {
     stream.unsubscribe(101);
     try testing.expectEqual(1, stream.pages.items.len);
     try testing.expectEqual(1, stream.pages.items[0].ref_count);
-    try testing.expectEqual(2, stream.pages.items[0].no);
 }

@@ -15,25 +15,18 @@ fn nsFromMs(ms: u32) u64 {
 }
 
 pub const MsgId = struct {
-    page: u32,
-    sequence: u64,
-
-    pub fn parse(msg_id: [16]u8) MsgId {
-        return .{
-            .page = mem.readInt(u32, msg_id[4..8], .big),
-            .sequence = mem.readInt(u64, msg_id[8..], .big),
-        };
+    pub fn parse(msg_id: [16]u8) u64 {
+        return mem.readInt(u64, msg_id[8..], .big);
     }
 
-    fn fromSequence(sequence: u64) [16]u8 {
-        var msg_id: [16]u8 = undefined;
-        encode(&msg_id, 0, sequence);
-        return msg_id;
+    fn from(sequence: u64) [16]u8 {
+        var buf: [16]u8 = undefined;
+        encode(&buf, sequence);
+        return buf;
     }
 
-    fn encode(buf: *[16]u8, page: u32, sequence: u64) void {
-        mem.writeInt(u32, buf[0..4], 0, .big); // first 4 bytes, unused
-        mem.writeInt(u32, buf[4..8], page, .big); // 4 bytes, page no
+    fn encode(buf: *[16]u8, sequence: u64) void {
+        mem.writeInt(u64, buf[0..8], 0, .big); // 8 bytes, unused
         mem.writeInt(u64, buf[8..16], sequence, .big); // 8 bytes, sequence
     }
 };
@@ -509,7 +502,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         mem.writeInt(u32, header[4..8], @intFromEnum(protocol.FrameType.message), .big); // frame type
                         mem.writeInt(u64, header[8..16], self.broker.now, .big); // timestamp
                         mem.writeInt(u16, header[16..18], 1, .big); // attempts
-                        MsgId.encode(header[18..34], res.page, res.sequence); // msg id
+                        MsgId.encode(header[18..34], res.sequence); // msg id
                     }
                     @memcpy(body, data);
                 }
@@ -904,7 +897,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     count: u32 = 1,
 
                     stream: ?*store.Stream = null,
-                    page: u32 = 0,
+                    sequence: u64 = 0,
                     allocator: ?mem.Allocator = null,
 
                     // Consumer should call this when data is no more in use by
@@ -914,7 +907,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     // deferred).
                     pub fn done(self: SendChunk) void {
                         if (self.stream) |stream|
-                            stream.releasePage(self.page);
+                            stream.release(self.sequence);
                         if (self.allocator) |allocator|
                             allocator.free(self.data);
                     }
@@ -953,37 +946,37 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                             .data = res.data,
                             .count = res.count,
                             .stream = &self.topic.stream,
-                            .page = res.page,
+                            .sequence = res.sequence.from,
                         };
                     }
                     return null;
                 }
 
-                fn findInFlight(self: *Channel, consumer_id: u32, msg_id: [16]u8) !struct { MsgId, InFlightMsg } {
-                    const id = MsgId.parse(msg_id);
-                    const ifm = self.in_flight.get(id.sequence) orelse return error.MessageNotInFlight;
+                fn findInFlight(self: *Channel, consumer_id: u32, msg_id: [16]u8) !struct { u64, InFlightMsg } {
+                    const sequence = MsgId.parse(msg_id);
+                    const ifm = self.in_flight.get(sequence) orelse return error.MessageNotInFlight;
                     if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
-                    return .{ id, ifm };
+                    return .{ sequence, ifm };
                 }
 
                 pub fn finish(self: *Channel, consumer_id: u32, msg_id: [16]u8) !void {
-                    const id, _ = try self.findInFlight(consumer_id, msg_id);
-                    self.topic.stream.release(id.page, id.sequence);
-                    assert(self.in_flight.remove(id.sequence));
+                    const sequence, _ = try self.findInFlight(consumer_id, msg_id);
+                    self.topic.stream.release(sequence);
+                    assert(self.in_flight.remove(sequence));
                     self.metric.finish += 1;
                     self.metric.depth -|= 1;
                 }
 
                 /// Extend message timeout for interval (milliseconds).
                 pub fn touch(self: *Channel, consumer_id: u32, msg_id: [16]u8, interval: u32) !void {
-                    const id, _ = try self.findInFlight(consumer_id, msg_id);
-                    const ifm = self.in_flight.getPtr(id.sequence).?;
+                    const sequence, _ = try self.findInFlight(consumer_id, msg_id);
+                    const ifm = self.in_flight.getPtr(sequence).?;
                     ifm.timeout_at += nsFromMs(interval);
                 }
 
                 pub fn requeue(self: *Channel, consumer_id: u32, msg_id: [16]u8, delay: u32) !void {
-                    const id, const ifm = try self.findInFlight(consumer_id, msg_id);
-                    try self.deferInFlight(id.sequence, ifm, delay);
+                    const sequence, const ifm = try self.findInFlight(consumer_id, msg_id);
+                    try self.deferInFlight(sequence, ifm, delay);
                     self.metric.requeue += 1;
                 }
 
@@ -1038,14 +1031,14 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     { // release in_flight messages
                         var iter = self.in_flight.keyIterator();
                         while (iter.next()) |e| {
-                            self.topic.stream.releaseSequence(e.*);
+                            self.topic.stream.release(e.*);
                         }
                         self.in_flight.clearAndFree();
                     }
                     { // release deferred messages
                         var iter = self.deferred.iterator();
                         while (iter.next()) |dm| {
-                            self.topic.stream.releaseSequence(dm.sequence);
+                            self.topic.stream.release(dm.sequence);
                         }
                         self.deferred.shrinkAndFree(0);
                     }
@@ -1262,11 +1255,11 @@ const TestConsumer = struct {
     }
 
     fn finish(self: *Self, sequence: u64) !void {
-        try self.channel.?.finish(self.id(), MsgId.fromSequence(sequence));
+        try self.channel.?.finish(self.id(), MsgId.from(sequence));
     }
 
     fn requeue(self: *Self, sequence: u64, delay: u32) !void {
-        try self.channel.?.requeue(self.id(), MsgId.fromSequence(sequence), delay);
+        try self.channel.?.requeue(self.id(), MsgId.from(sequence), delay);
     }
 
     fn pull(self: *Self) !void {
@@ -1958,7 +1951,6 @@ test "dump/restore" {
 
         { // add 3 messages to the topic
             topic.stream.last_sequence = 100;
-            topic.stream.last_page = 10;
             broker.now = now;
             try broker.publish(topic_name, "Iso "); // msg 1, sequence: 101
             broker.now += ns_per_s;
@@ -1998,10 +1990,8 @@ test "dump/restore" {
 
         const topic = try broker.getOrCreateTopic(topic_name);
         try testing.expectEqual(103, topic.stream.last_sequence);
-        try testing.expectEqual(11, topic.stream.last_page);
         const page = topic.stream.pages.items[0];
         try testing.expectEqual(3, page.offsets.items.len);
-        try testing.expectEqual(11, page.no);
         try testing.expectEqual(5, page.ref_count);
 
         try testing.expectEqualStrings(topic.stream.message(101)[34..], "Iso ");
