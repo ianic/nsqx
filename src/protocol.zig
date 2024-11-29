@@ -64,25 +64,6 @@ const MessageTag = enum {
     auth,
 };
 
-pub const FrameType = enum(u32) {
-    response = 0,
-    err = 1,
-    message = 2,
-};
-
-// Message frame:
-// |  (int32) ||  (int32) || (binary)
-// |  4-byte  ||  4-byte  || N-byte
-// ------------------------------------...
-//     size     frame type     data
-//
-pub fn frame(comptime data: []const u8, comptime typ: FrameType) [data.len + 8]u8 {
-    var hdr: [8]u8 = undefined;
-    mem.writeInt(u32, hdr[0..4], @intCast(4 + data.len), .big);
-    mem.writeInt(u32, hdr[4..8], @intFromEnum(typ), .big);
-    return hdr ++ data[0..].*;
-}
-
 pub const Parser = struct {
     buf: []const u8,
     pos: usize = 0,
@@ -534,4 +515,54 @@ test "validate name" {
 test isEphemeral {
     try testing.expect(!isEphemeral("#ephemeral"));
     try testing.expect(isEphemeral("foo#ephemeral"));
+}
+
+pub const FrameType = enum(u32) {
+    response = 0,
+    err = 1,
+    message = 2,
+};
+
+// Message frame:
+// |  (int32) ||  (int32) || (binary)
+// |  4-byte  ||  4-byte  || N-byte
+// ------------------------------------...
+//     size     frame type     data
+//
+pub fn frame(comptime data: []const u8, comptime typ: FrameType) [data.len + 8]u8 {
+    var hdr: [8]u8 = undefined;
+    mem.writeInt(u32, hdr[0..4], @intCast(4 + data.len), .big);
+    mem.writeInt(u32, hdr[4..8], @intFromEnum(typ), .big);
+    return hdr ++ data[0..].*;
+}
+
+pub const Response = enum {
+    ok,
+    close,
+    heartbeat,
+    pub_failed,
+
+    pub fn body(self: Response) []const u8 {
+        return switch (self) {
+            .ok => &ok_frame,
+            .close => &close_frame,
+            .heartbeat => &heartbeat_frame,
+            .pub_failed => &pub_failed_frame,
+        };
+    }
+};
+
+const ok_frame = frame("OK", .response);
+const close_frame = frame("CLOSE_WAIT", .response);
+const heartbeat_frame = frame("_heartbeat_", .response);
+const pub_failed_frame = frame("E_PUB_FAILED", .err);
+
+test "response body is comptime" {
+    const r1: Response = .heartbeat;
+    const r2: Response = .heartbeat;
+    try testing.expect(r1.body().ptr == r2.body().ptr);
+    try testing.expectEqualStrings(
+        &[_]u8{ 0, 0, 0, 15, 0, 0, 0, 0, 95, 104, 101, 97, 114, 116, 98, 101, 97, 116, 95 },
+        r1.body(),
+    );
 }

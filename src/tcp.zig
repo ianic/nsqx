@@ -109,7 +109,7 @@ pub const Conn = struct {
     send_op: SendOp = .{},
     send_chunk: ?Channel.SendChunk = null,
     shutdown_op: Op = .{},
-    pending_responses: std.ArrayList(Response),
+    pending_responses: std.ArrayList(protocol.Response),
     ready_count: u32 = 0,
     in_flight: u32 = 0,
     timer_ts: u64,
@@ -149,7 +149,7 @@ pub const Conn = struct {
             .recv_buf = RecvBuf.init(listener.allocator),
             .metric = .{ .connected_at = listener.io.now() },
             .timer_ts = listener.io.tsFromDelay(initial_heartbeat),
-            .pending_responses = std.ArrayList(Response).init(allocator),
+            .pending_responses = std.ArrayList(protocol.Response).init(allocator),
         };
         try self.send_op.init(allocator, socket, self, onSend, onSendFail);
         errdefer self.send_op.deinit(allocator);
@@ -380,7 +380,7 @@ pub const Conn = struct {
         }
     }
 
-    fn respond(self: *Conn, rsp: Response) !void {
+    fn respond(self: *Conn, rsp: protocol.Response) !void {
         if (self.send_op.active())
             return try self.pending_responses.insert(0, rsp);
 
@@ -471,36 +471,3 @@ pub const RecvBuf = struct {
         self.buf = new_buf;
     }
 };
-
-const Response = enum {
-    ok,
-    close,
-    heartbeat,
-    pub_failed,
-
-    pub fn body(self: Response) []const u8 {
-        return switch (self) {
-            .ok => &ok_frame,
-            .close => &close_frame,
-            .heartbeat => &heartbeat_frame,
-            .pub_failed => &pub_failed_frame,
-        };
-    }
-};
-
-const ok_frame = protocol.frame("OK", .response);
-const close_frame = protocol.frame("CLOSE_WAIT", .response);
-const heartbeat_frame = protocol.frame("_heartbeat_", .response);
-const pub_failed_frame = protocol.frame("E_PUB_FAILED", .err);
-
-const testing = std.testing;
-
-test "response body is comptime" {
-    const r1: Response = .heartbeat;
-    const r2: Response = .heartbeat;
-    try testing.expect(r1.body().ptr == r2.body().ptr);
-    try testing.expectEqualStrings(
-        &[_]u8{ 0, 0, 0, 15, 0, 0, 0, 0, 95, 104, 101, 97, 114, 116, 98, 101, 97, 116, 95 },
-        r1.body(),
-    );
-}
