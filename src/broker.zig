@@ -200,19 +200,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
             log.debug("empty channel {s} on topic {s}", .{ name, topic_name });
         }
 
-        // Lookup registrations -----------------
-
-        /// Iterate over topic and channel names.
-        pub fn iterateNames(self: *Broker, writer: anytype) !void {
-            var ti = self.topics.valueIterator();
-            while (ti.next()) |topic| {
-                try writer.topic(topic.*.name);
-                var ci = topic.*.channels.valueIterator();
-                while (ci.next()) |channel| {
-                    try writer.channel(topic.*.name, channel.*.name);
-                }
-            }
-        }
+        // Metrics, dump, restore -----------------
 
         pub fn writeMetrics(self: *Broker, writer: anytype) !void {
             var ti = self.topics.valueIterator();
@@ -1660,21 +1648,6 @@ test noop_notifier {
     _ = try broker.subscribe(&consumer3, "topic2", "channel2");
     try testing.expectEqual(5, notifier.call_count);
 
-    {
-        var writer = @import("lookup.zig").RegistrationsWriter.init(testing.allocator);
-        try broker.iterateNames(&writer);
-        const buf = try writer.toOwned();
-        defer testing.allocator.free(buf);
-
-        try testing.expectEqualStrings(
-            \\REGISTER topic2
-            \\REGISTER topic2 channel2
-            \\REGISTER topic1
-            \\REGISTER topic1 channel2
-            \\REGISTER topic1 channel1
-            \\
-        , buf);
-    }
     // test deletes
     try testing.expectEqual(5, notifier.call_count);
     try broker.deleteTopic("topic1");

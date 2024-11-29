@@ -137,32 +137,6 @@ pub const Connector = struct {
     }
 };
 
-pub const RegistrationsWriter = struct {
-    list: std.ArrayList(u8),
-
-    const Self = @This();
-    pub fn init(allocator: mem.Allocator) Self {
-        return .{
-            .list = std.ArrayList(u8).init(allocator),
-        };
-    }
-
-    pub fn topic(self: *Self, name: []const u8) !void {
-        const writer = self.list.writer().any();
-        try writer.print("REGISTER {s}\n", .{name});
-    }
-    pub fn channel(self: *Self, topic_name: []const u8, name: []const u8) !void {
-        const writer = self.list.writer().any();
-        try writer.print("REGISTER {s} {s}\n", .{ topic_name, name });
-    }
-
-    pub fn toOwned(self: *Self) ![]const u8 {
-        const buf = try self.list.toOwnedSlice();
-        self.list.deinit();
-        return buf;
-    }
-};
-
 const Conn = struct {
     connector: *Connector,
     recv_buf: RecvBuf,
