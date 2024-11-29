@@ -769,7 +769,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 // Find deferred message, make copy of that message, set
                 // increased attempts to message payload, put it in-flight and
                 // return payload.
-                fn popDeferred(self: *Channel, consumer_id: u32, msg_timeout: u32) !?SendChunk {
+                fn popDeferred(self: *Channel, consumer_id: u32, msg_timeout: u32) !?PullChunk {
                     if (self.deferred.peek()) |dm| if (dm.defer_until <= self.now.*) {
                         try self.in_flight.ensureUnusedCapacity(1);
                         const payload = try self.allocator.dupe(u8, self.topic.stream.message(dm.sequence));
@@ -880,7 +880,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 // Consumer interface actions -----------------
 
                 // Chunk of data to send to the consumer
-                pub const SendChunk = struct {
+                pub const PullChunk = struct {
                     data: []const u8,
                     count: u32 = 1,
 
@@ -891,9 +891,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     // Consumer should call this when data is no more in use by
                     // underlying network interface; when io_uring send
                     // operation is completed. This will release stream reference
-                    // or deallocate buffer (in case op copied message;
+                    // or deallocate buffer (in case of copied message;
                     // deferred).
-                    pub fn done(self: SendChunk) void {
+                    pub fn done(self: PullChunk) void {
                         if (self.stream) |stream|
                             stream.release(self.sequence);
                         if (self.allocator) |allocator|
@@ -901,7 +901,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     }
                 };
 
-                pub fn pull(self: *Channel, consumer_id: u32, msg_timeout: u32, ready_count: u32) !?SendChunk {
+                pub fn pull(self: *Channel, consumer_id: u32, msg_timeout: u32, ready_count: u32) !?PullChunk {
                     assert(ready_count > 0);
                     assert(consumer_id > 0);
                     if (self.paused) return null;

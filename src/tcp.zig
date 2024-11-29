@@ -107,7 +107,7 @@ pub const Conn = struct {
 
     recv_op: Op = .{},
     send_op: SendOp = .{},
-    send_chunk: ?Channel.SendChunk = null,
+    send_chunk: ?Channel.PullChunk = null,
     shutdown_op: Op = .{},
     pending_responses: std.ArrayList(protocol.Response),
     ready_count: u32 = 0,
