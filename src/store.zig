@@ -463,7 +463,7 @@ pub const Stream = struct {
 
     pub fn release(self: *Self, no: u32, sequence: u64) void {
         const page = brk: {
-            if (self.findPageByNo(no)) |page| break :brk page;
+            if (no > 0) if (self.findPageByNo(no)) |page| break :brk page;
             if (self.findPage(sequence)) |page| break :brk page;
 
             log.err("release: page not found page: {} sequence: {}", .{ no, sequence });

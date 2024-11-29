@@ -7,7 +7,7 @@ const testing = std.testing;
 
 const log = std.log.scoped(.broker);
 const protocol = @import("protocol.zig");
-const Limits = @import("Options.zig").Limits;
+const Options = @import("Options.zig").Broker;
 const store = @import("store.zig");
 
 fn nsFromMs(ms: u32) u64 {
@@ -47,7 +47,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         allocator: mem.Allocator,
         topics: std.StringHashMap(*Topic),
         notifier: *Notifier,
-        limits: Limits,
+        options: Options,
 
         started_at: u64,
         metric: store.Metric = .{},
@@ -62,7 +62,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
         // Init/deinit -----------------
 
-        pub fn init(allocator: mem.Allocator, notifier: *Notifier, now: u64, limits: Limits) Broker {
+        pub fn init(allocator: mem.Allocator, notifier: *Notifier, now: u64, options: Options) Broker {
             return .{
                 .allocator = allocator,
                 .topics = std.StringHashMap(*Topic).init(allocator),
@@ -71,8 +71,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 .now = now,
                 .channel_timers = TimerQueue(Channel).init(allocator),
                 .topic_timers = TimerQueue(Topic).init(allocator),
-                .limits = limits,
-                .metric = .{ .max_mem = limits.max_mem },
+                .options = options,
+                .metric = .{ .max_mem = options.max_mem },
             };
         }
 
@@ -422,9 +422,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                             .{
                                 .ack_policy = .explicit,
                                 .retention_policy = .interest,
-                                .max_page_size = broker.limits.max_page_size,
-                                .initial_page_size = broker.limits.initial_page_size,
-                                .max_mem = broker.limits.max_topic_mem,
+                                .max_page_size = broker.options.max_page_size,
+                                .initial_page_size = broker.options.initial_page_size,
+                                .max_mem = broker.options.max_topic_mem,
                             },
                             &broker.metric,
                         ),
@@ -494,6 +494,13 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn appendStream(self: *Topic, data: []const u8) !void {
+                    if (data.len > self.broker.options.max_msg_size) {
+                        log.err(
+                            "{s} publish failed, message length of {} bytes over limit of {} bytes ",
+                            .{ self.name, data.len, self.broker.options.max_msg_size },
+                        );
+                        return error.MessageSizeOverflow;
+                    }
                     const res = try self.stream.alloc(@intCast(data.len + 34));
                     const header = res.data[0..34];
                     const body = res.data[34..];
@@ -628,8 +635,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                 const DeferredMsg = struct {
                     sequence: u64,
-                    defer_until: u64 = 0,
-                    attempts: u16 = 1,
+                    defer_until: u64,
+                    attempts: u16,
 
                     const Self = @This();
 
@@ -952,11 +959,15 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     return null;
                 }
 
-                pub fn finish(self: *Channel, consumer_id: u32, msg_id: [16]u8) !void {
+                fn findInFlight(self: *Channel, consumer_id: u32, msg_id: [16]u8) !struct { MsgId, InFlightMsg } {
                     const id = MsgId.parse(msg_id);
                     const ifm = self.in_flight.get(id.sequence) orelse return error.MessageNotInFlight;
                     if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
+                    return .{ id, ifm };
+                }
 
+                pub fn finish(self: *Channel, consumer_id: u32, msg_id: [16]u8) !void {
+                    const id, _ = try self.findInFlight(consumer_id, msg_id);
                     self.topic.stream.release(id.page, id.sequence);
                     assert(self.in_flight.remove(id.sequence));
                     self.metric.finish += 1;
@@ -965,18 +976,13 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                 /// Extend message timeout for interval (milliseconds).
                 pub fn touch(self: *Channel, consumer_id: u32, msg_id: [16]u8, interval: u32) !void {
-                    const id = MsgId.parse(msg_id);
-                    const ifm = self.in_flight.getPtr(id.sequence) orelse return error.MessageNotInFlight;
-                    if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
-
+                    const id, _ = try self.findInFlight(consumer_id, msg_id);
+                    const ifm = self.in_flight.getPtr(id.sequence).?;
                     ifm.timeout_at += nsFromMs(interval);
                 }
 
                 pub fn requeue(self: *Channel, consumer_id: u32, msg_id: [16]u8, delay: u32) !void {
-                    const id = MsgId.parse(msg_id);
-                    const ifm = self.in_flight.get(id.sequence) orelse return error.MessageNotInFlight;
-                    if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
-
+                    const id, const ifm = try self.findInFlight(consumer_id, msg_id);
                     try self.deferInFlight(id.sequence, ifm, delay);
                     self.metric.requeue += 1;
                 }

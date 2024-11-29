@@ -4,6 +4,7 @@ const fmt = std.fmt;
 const net = std.net;
 const time = std.time;
 const math = std.math;
+const maxInt = math.maxInt;
 
 const usage =
     \\Usage of nsqd:
@@ -72,6 +73,7 @@ const usage =
     \\        byte size of each io_uring provided buffer (default 64k)
     \\
 ;
+const Options = @This();
 
 data_path: []const u8 = ".",
 
@@ -86,7 +88,6 @@ broadcast_tcp_port: u16 = 0,
 broadcast_http_port: u16 = 0,
 
 max_rdy_count: u16 = 2500,
-max_msg_size: u32 = 1048576,
 
 // Duration values in milliseconds
 max_heartbeat_interval: u32 = 60000, // 1m
@@ -94,22 +95,14 @@ max_msg_timeout: u32 = 60000 * 15, // 15m
 max_req_timeout: u32 = 60000 * 60, // 1h
 msg_timeout: u32 = 60000, // 1m
 
-limits: Limits = .{},
-
-/// io_uring configuration
+broker: Broker = .{},
 io: Io = .{},
-
-/// statsd
 statsd: Statsd = .{},
 
-const Options = @This();
-
-const unlimited = math.maxInt(u32);
-const unlimited_mem = math.maxInt(u64);
-
-pub const Limits = struct {
-    max_mem: u64 = unlimited_mem,
-    max_topic_mem: u64 = unlimited_mem,
+pub const Broker = struct {
+    max_msg_size: u32 = 1024 * 1024,
+    max_mem: u64 = maxInt(u64),
+    max_topic_mem: u64 = maxInt(u64),
 
     initial_page_size: u32 = 64 * 1024,
     max_page_size: u32 = 1024 * 1024,
@@ -160,7 +153,7 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
     var opt: Options = .{
         .hostname = hostname,
         .statsd = .{ .prefix = "nsq.%s" },
-        .limits = .{
+        .broker = .{
             .max_mem = totalSystemMemory() / 2,
         },
     };
@@ -170,7 +163,7 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
 
-            //
+            // dump data path
         } else if (iter.string("data-path")) |str| {
             opt.data_path = str;
 
@@ -179,11 +172,9 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
             opt.tcp_address = addr;
         } else if (iter.address("http-address", opt.http_address.getPort())) |addr| {
             opt.http_address = addr;
-
             // lookup addresses
         } else if (iter.address("lookupd-tcp-address", 4160)) |addr| {
             try lookup_tcp_addresses.append(addr);
-
             // broadcast arguments
         } else if (iter.string("broadcast-address")) |str| {
             opt.broadcast_address = try allocator.dupe(u8, str);
@@ -192,13 +183,9 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
         } else if (iter.int("broadcast-http-port", u16)) |port| {
             opt.broadcast_http_port = port;
 
-            // int limits
+            // client options
         } else if (iter.int("max-rdy-count", u16)) |count| {
             opt.max_rdy_count = count;
-        } else if (iter.int("max-msg-count", u32)) |size| {
-            opt.max_msg_size = size;
-
-            // duration's
         } else if (iter.durationMs("max-heartbeat-interval")) |d| {
             opt.max_heartbeat_interval = d;
         } else if (iter.durationMs("max-msg-timeout")) |d| {
@@ -208,7 +195,7 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
         } else if (iter.durationMs("msg-timeout")) |d| {
             opt.msg_timeout = d;
 
-            // statsd arguments
+            // statsd options
         } else if (iter.address("statsd-address", 8125)) |addr| {
             opt.statsd.address = addr;
         } else if (iter.string("statsd-prefix")) |str| {
@@ -218,15 +205,17 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
         } else if (iter.durationMs("statsd-interval")) |d| {
             opt.statsd.interval = d;
 
-            // storage limits
+            // broker options
+        } else if (iter.byteSize(u32, "max-msg-size")) |size| {
+            opt.broker.max_msg_size = size;
         } else if (iter.byteSize(u64, "max-mem")) |d| {
-            opt.limits.max_mem = d;
+            opt.broker.max_mem = d;
         } else if (iter.byteSize(u64, "max-topic-mem")) |d| {
-            opt.limits.max_topic_mem = d;
+            opt.broker.max_topic_mem = d;
         } else if (iter.byteSize(u32, "initial-page-size")) |d| {
-            opt.limits.initial_page_size = d;
+            opt.broker.initial_page_size = d;
         } else if (iter.byteSize(u32, "max-page-size")) |d| {
-            opt.limits.max_page_size = d;
+            opt.broker.max_page_size = d;
 
             // io_uring
         } else if (iter.int("io-entries", u16)) |i| {
@@ -323,7 +312,7 @@ const ArgIterator = struct {
     fn durationMs(self: *Self, flag: []const u8) ?u32 {
         if (self.duration(flag)) |d| {
             const ms = d / time.ns_per_ms;
-            if (ms > std.math.maxInt(u32)) {
+            if (ms > maxInt(u32)) {
                 fatal("duration in '{s}' overflow", .{self.arg});
             }
             return @intCast(ms);
@@ -413,6 +402,7 @@ pub fn main() !void {
     var opt = try Options.initFromArgs(allocator);
     defer opt.deinit(allocator);
 
+    // connect options
     std.debug.print("tcp_address: {}\n", .{opt.tcp_address});
     std.debug.print("http_address: {}\n", .{opt.http_address});
     std.debug.print("lookup_tcp_addresses: {any}\n", .{opt.lookup_tcp_addresses});
@@ -421,25 +411,29 @@ pub fn main() !void {
     std.debug.print("broadcast_http_port: {}\n", .{opt.broadcast_http_port});
     std.debug.print("\n", .{});
 
+    // client options
     std.debug.print("max_rdy_count: {}\n", .{opt.max_rdy_count});
-    std.debug.print("max_msg_size: {}\n", .{opt.max_msg_size});
     std.debug.print("max_heartbeat_interval: {}\n", .{opt.max_heartbeat_interval});
+    std.debug.print("msg_timeout: {}\n", .{opt.msg_timeout});
     std.debug.print("max_msg_timeout: {}\n", .{opt.max_msg_timeout});
     std.debug.print("max_req_timeout: {}\n", .{opt.max_req_timeout});
-    std.debug.print("msg_timeout: {}\n", .{opt.msg_timeout});
-
     std.debug.print("\n", .{});
+
+    // broker options
+    std.debug.print("max_msg_size: {}\n", .{opt.max_msg_size});
+    std.debug.print("max_mem: {} {}G\n", .{ opt.broker.max_mem, opt.broker.max_mem / 1024 / 1024 / 1024 });
+    std.debug.print("max_topic_mem: {}\n", .{opt.broker.max_topic_mem});
+    std.debug.print("initial_page_size: {}\n", .{opt.broker.initial_page_size});
+    std.debug.print("max_page_size: {}\n", .{opt.broker.max_page_size});
+    std.debug.print("\n", .{});
+
+    // statsd options
     if (opt.statsd.address) |addr|
         std.debug.print("statsd_address: {}\n", .{addr});
     std.debug.print("statsd_interval: {}\n", .{opt.statsd.interval});
     std.debug.print("statsd_prefix: {s}\n", .{opt.statsd.prefix});
     std.debug.print("statsd_udp_packet_size: {}\n", .{opt.statsd.udp_packet_size});
-
-    std.debug.print("\n", .{});
-    std.debug.print("max_mem: {} {}G\n", .{ opt.limits.max_mem, opt.limits.max_mem / 1024 / 1024 / 1024 });
-    std.debug.print("max_topic_mem: {}\n", .{opt.limits.max_topic_mem});
-    std.debug.print("initial_page_size: {}\n", .{opt.limits.initial_page_size});
-    std.debug.print("max_page_size: {}\n", .{opt.limits.max_page_size});
+    // std.debug.print("\n", .{});
 }
 
 fn parseDuration(arg: []const u8) !u64 {

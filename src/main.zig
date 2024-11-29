@@ -42,7 +42,7 @@ pub fn main() !void {
     try lookup_connector.init(allocator, &io, options.lookup_tcp_addresses, options);
     defer lookup_connector.deinit();
 
-    var server = Broker.init(allocator, &lookup_connector, io.now(), options.limits);
+    var server = Broker.init(allocator, &lookup_connector, io.now(), options.broker);
     defer server.deinit();
 
     var tcp_listener: tcp.Listener = undefined;
