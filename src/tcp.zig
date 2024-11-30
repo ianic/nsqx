@@ -23,7 +23,7 @@ const log = std.log.scoped(.tcp);
 pub fn ListenerType(comptime ConnType: type) type {
     return struct {
         allocator: mem.Allocator,
-        server: *Broker,
+        broker: *Broker,
         options: Options,
         socket: socket_t,
         io: *Io,
@@ -42,13 +42,13 @@ pub fn ListenerType(comptime ConnType: type) type {
             self: *Self,
             allocator: mem.Allocator,
             io: *Io,
-            server: *Broker,
+            broker: *Broker,
             options: Options,
             socket: socket_t,
         ) !void {
             self.* = .{
                 .allocator = allocator,
-                .server = server,
+                .broker = broker,
                 .options = options,
                 .io = io,
                 .socket = socket,
@@ -224,7 +224,7 @@ pub const Conn = struct {
 
     // IO callbacks -----------------
 
-    pub fn onTimer(self: *Conn, _: u64) void {
+    pub fn onTimer(self: *Conn, _: u64) !void {
         if (self.state == .closing) return;
         if (self.outstanding_heartbeats > 4) {
             log.debug("{} no heartbeat, closing", .{self.socket});
@@ -304,7 +304,7 @@ pub const Conn = struct {
     }
 
     fn receivedMsg(self: *Conn, msg: protocol.Message) !void {
-        const server = self.listener.server;
+        const broker = self.listener.broker;
         const options = self.listener.options;
         self.outstanding_heartbeats = 0;
 
@@ -318,23 +318,23 @@ pub const Conn = struct {
                 log.debug("{} identify {}", .{ self.socket, identify });
             },
             .subscribe => |arg| {
-                try server.subscribe(self, arg.topic, arg.channel);
+                try broker.subscribe(self, arg.topic, arg.channel);
                 try self.respond(.ok);
                 log.debug("{} subscribe: {s} {s}", .{ self.socket, arg.topic, arg.channel });
             },
             .publish => |arg| {
-                try server.publish(arg.topic, arg.data);
+                try broker.publish(arg.topic, arg.data);
                 try self.respond(.ok);
                 log.debug("{} publish: {s}", .{ self.socket, arg.topic });
             },
             .multi_publish => |arg| {
                 if (arg.msgs == 0) return;
-                try server.multiPublish(arg.topic, arg.msgs, arg.data);
+                try broker.multiPublish(arg.topic, arg.msgs, arg.data);
                 try self.respond(.ok);
                 log.debug("{} multi publish: {s} messages: {}", .{ self.socket, arg.topic, arg.msgs });
             },
             .deferred_publish => |arg| {
-                try server.deferredPublish(arg.topic, arg.data, arg.delay);
+                try broker.deferredPublish(arg.topic, arg.data, arg.delay);
                 try self.respond(.ok);
                 log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });
             },

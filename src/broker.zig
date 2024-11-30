@@ -514,21 +514,19 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     }
                 }
 
-                fn onTimer(self: *Topic, now: u64) void {
-                    self.timer_ts = infinite;
+                fn onTimer(self: *Topic, now: u64) !void {
+                    var ts = infinite;
                     while (self.deferred.peek()) |dp| {
                         if (dp.defer_until <= now) {
-                            self.publish(dp.data) catch |err| {
-                                log.err("fail to publish deferred message {}", .{err});
-                                return;
-                            };
+                            try self.publish(dp.data);
                             self.allocator.free(dp.data);
                             _ = self.deferred.remove();
                             continue;
                         }
-                        self.timer_ts = dp.defer_until;
-                        return;
+                        ts = dp.defer_until;
+                        break;
                     }
+                    self.timer_ts = ts;
                 }
 
                 fn publishDeferred(self: *Topic) !void {
@@ -801,9 +799,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 // Callback when timer timeout if fired
-                fn onTimer(self: *Channel, now: u64) void {
+                fn onTimer(self: *Channel, now: u64) !void {
                     self.timer_ts = @min(
-                        self.inFlightTimeout(now) catch infinite,
+                        try self.inFlightTimeout(now),
                         self.deferredTimeout(now),
                     );
                 }
@@ -1833,8 +1831,11 @@ pub fn TimerQueue(comptime T: type) type {
         pub fn tick(self: *Self, ts: u64) u64 {
             while (self.pq.peek()) |elem| {
                 if (elem.timer_ts > ts) return elem.timer_ts;
+                elem.onTimer(ts) catch |err| {
+                    log.err("timer tick failed {}", .{err});
+                    break;
+                };
                 _ = self.pq.remove();
-                elem.onTimer(ts);
                 if (elem.timer_ts > ts and elem.timer_ts < infinite)
                     self.add(elem) catch {};
             }

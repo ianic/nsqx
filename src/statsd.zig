@@ -16,7 +16,7 @@ const log = std.log.scoped(.statsd);
 pub const Connector = struct {
     allocator: mem.Allocator,
     io: *Io,
-    server: *Broker,
+    broker: *Broker,
     options: Options.Statsd,
     address: std.net.Address,
     socket: socket_t = 0,
@@ -29,11 +29,11 @@ pub const Connector = struct {
 
     const Self = @This();
 
-    pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, server: *Broker, options: Options) !void {
+    pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, broker: *Broker, options: Options) !void {
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .server = server,
+            .broker = broker,
             .options = options.statsd,
             .address = options.statsd.address.?,
             .prefix = try fmtPrefix(allocator, options.statsd.prefix, options.broadcastAddress(), options.broadcast_tcp_port),
@@ -89,8 +89,8 @@ pub const Connector = struct {
     fn generate(self: *Self) Error!void {
         var writer = MetricWriter.init(self.allocator, self.prefix);
         errdefer writer.deinit();
-        self.server.writeMetrics(&writer) catch |err| {
-            log.err("server write metrics error {}", .{err});
+        self.broker.writeMetrics(&writer) catch |err| {
+            log.err("broker write metrics error {}", .{err});
             return;
         };
         self.io.writeMetrics(&writer) catch |err| {

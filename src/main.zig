@@ -42,37 +42,37 @@ pub fn main() !void {
     try lookup_connector.init(allocator, &io, options.lookup_tcp_addresses, options);
     defer lookup_connector.deinit();
 
-    var server = Broker.init(allocator, &lookup_connector, io.now(), options.broker);
-    defer server.deinit();
+    var broker = Broker.init(allocator, &lookup_connector, io.now(), options.broker);
+    defer broker.deinit();
 
     var tcp_listener: tcp.Listener = undefined;
-    try tcp_listener.init(allocator, &io, &server, options, try socket(options.tcp_address));
+    try tcp_listener.init(allocator, &io, &broker, options, try socket(options.tcp_address));
     defer tcp_listener.deinit();
 
     var http_listener: http.Listener = undefined;
-    try http_listener.init(allocator, &io, &server, options, try socket(options.http_address));
+    try http_listener.init(allocator, &io, &broker, options, try socket(options.http_address));
     defer http_listener.deinit();
 
     const statsd_connector: ?*statsd.Connector = if (options.statsd.address) |_| brk: {
         var sc: statsd.Connector = undefined;
-        try sc.init(allocator, &io, &server, options);
+        try sc.init(allocator, &io, &broker, options);
         break :brk &sc;
     } else null;
     defer if (statsd_connector) |sc| sc.deinit();
 
-    try server.restore(data_dir);
+    try broker.restore(data_dir);
 
     // Run loop
     catchSignals();
     while (true) {
         const ts = brk: {
             const now = io.timestamp;
-            const server_ts = server.tick(now);
+            const broker_ts = broker.tick(now);
             const tcp_ts = tcp_listener.timers.tick(now);
 
             const min_ts = now + std.time.ns_per_ms; // 1 ms
             const max_ts = now + 10 * std.time.ns_per_s; // 10 s
-            break :brk @max(min_ts, @min(server_ts, tcp_ts, max_ts));
+            break :brk @max(min_ts, @min(broker_ts, tcp_ts, max_ts));
         };
 
         io.tickTs(ts) catch |err| {
@@ -124,7 +124,7 @@ pub fn main() !void {
         }
     }
 
-    try server.dump(data_dir);
+    try broker.dump(data_dir);
 }
 
 pub fn socket(addr: net.Address) !posix.socket_t {

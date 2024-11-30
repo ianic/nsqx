@@ -106,23 +106,23 @@ pub const Conn = struct {
             .{ self.socket, head.method, head.target, content_length },
         );
 
-        const server = self.listener.server;
+        const broker = self.listener.broker;
         const cmd = parse(head.target) catch return error.NotFound;
         switch (cmd) {
-            .stats => |args| try jsonStat(self.gpa, args, writer, server),
-            .info => try jsonInfo(writer, server, self.listener.options),
+            .stats => |args| try jsonStat(self.gpa, args, writer, broker),
+            .info => try jsonInfo(writer, broker, self.listener.options),
 
-            .topic_create => |name| try server.createTopic(name),
-            .topic_delete => |name| try server.deleteTopic(name),
-            .topic_empty => |name| try server.emptyTopic(name),
-            .topic_pause => |name| try server.pauseTopic(name),
-            .topic_unpause => |name| try server.unpauseTopic(name),
+            .topic_create => |name| try broker.createTopic(name),
+            .topic_delete => |name| try broker.deleteTopic(name),
+            .topic_empty => |name| try broker.emptyTopic(name),
+            .topic_pause => |name| try broker.pauseTopic(name),
+            .topic_unpause => |name| try broker.unpauseTopic(name),
 
-            .channel_create => |arg| try server.createChannel(arg.topic_name, arg.name),
-            .channel_delete => |arg| try server.deleteChannel(arg.topic_name, arg.name),
-            .channel_empty => |arg| try server.emptyChannel(arg.topic_name, arg.name),
-            .channel_pause => |arg| try server.pauseChannel(arg.topic_name, arg.name),
-            .channel_unpause => |arg| try server.unpauseChannel(arg.topic_name, arg.name),
+            .channel_create => |arg| try broker.createChannel(arg.topic_name, arg.name),
+            .channel_delete => |arg| try broker.deleteChannel(arg.topic_name, arg.name),
+            .channel_empty => |arg| try broker.emptyChannel(arg.topic_name, arg.name),
+            .channel_pause => |arg| try broker.pauseChannel(arg.topic_name, arg.name),
+            .channel_unpause => |arg| try broker.unpauseChannel(arg.topic_name, arg.name),
         }
     }
 
