@@ -1516,7 +1516,7 @@ test "deferred messages" {
         channel.wakeup();
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
-        topic.onTimer(broker.now);
+        try topic.onTimer(broker.now);
         try testing.expectEqual(2, topic.stream.last_sequence);
         try testing.expectEqual(0, topic.deferred.count());
         try testing.expectEqual(0, channel.deferred.count());
@@ -1854,7 +1854,7 @@ test "timer queue" {
     const C = struct {
         timer_ts: u64 = 0,
         count: usize = 0,
-        pub fn onTimer(self: *Self, ts: u64) void {
+        pub fn onTimer(self: *Self, ts: u64) !void {
             assert(ts <= self.timer_ts);
             self.count += 1;
         }
