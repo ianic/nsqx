@@ -12,6 +12,7 @@ const tcp = @import("tcp.zig");
 const http = @import("http.zig");
 const lookup = @import("lookup.zig");
 const statsd = @import("statsd.zig");
+const timer = @import("timer.zig");
 pub const Broker = @import("broker.zig").BrokerType(tcp.Conn, lookup.Connector);
 
 pub const std_options = std.Options{
@@ -67,12 +68,11 @@ pub fn main() !void {
     while (true) {
         const ts = brk: {
             const now = io.timestamp;
-            const broker_ts = broker.tick(now);
-            const tcp_ts = tcp_listener.timers.tick(now);
+            const ts = broker.tick(now) catch broker.timer_queue.next();
 
             const min_ts = now + std.time.ns_per_ms; // 1 ms
             const max_ts = now + 10 * std.time.ns_per_s; // 10 s
-            break :brk @max(min_ts, @min(broker_ts, tcp_ts, max_ts));
+            break :brk @max(min_ts, @min(ts, max_ts));
         };
 
         io.tickTs(ts) catch |err| {

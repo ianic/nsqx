@@ -248,7 +248,6 @@ const Conn = struct {
         if (self.state != .connected) return;
 
         if (self.connector.stream.pull(self.sequence, 1024)) |res| {
-            log.debug("sending msgs {} - {} len: {}", .{ res.sequence.from, res.sequence.to, res.data.len });
             self.send(res.data);
             self.sequence = res.sequence.to;
         }

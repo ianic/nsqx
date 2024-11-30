@@ -16,7 +16,7 @@ const Error = @import("io.zig").Error;
 const Broker = @import("main.zig").Broker;
 const Channel = Broker.Channel;
 const MsgId = @import("broker.zig").MsgId;
-const TimerQueue = @import("broker.zig").TimerQueue;
+const timer = @import("timer.zig");
 
 const log = std.log.scoped(.tcp);
 
@@ -34,7 +34,6 @@ pub fn ListenerType(comptime ConnType: type) type {
             accept: usize = 0, // accepted connections
             close: usize = 0, // closed (completed) connections
         } = .{},
-        timers: TimerQueue(ConnType),
 
         const Self = @This();
 
@@ -53,7 +52,6 @@ pub fn ListenerType(comptime ConnType: type) type {
                 .io = io,
                 .socket = socket,
                 .conns = std.AutoHashMap(*ConnType, void).init(allocator),
-                .timers = TimerQueue(ConnType).init(allocator),
             };
             errdefer self.deinit();
             self.op = Op.accept(socket, self, onAccept, onAcceptFail);
@@ -68,7 +66,6 @@ pub fn ListenerType(comptime ConnType: type) type {
                 self.allocator.destroy(conn);
             }
             self.conns.deinit();
-            self.timers.deinit();
         }
 
         fn onAccept(self: *Self, socket: socket_t, addr: std.net.Address) Error!void {
@@ -78,7 +75,6 @@ pub fn ListenerType(comptime ConnType: type) type {
             try conn.init(self, socket, addr);
             errdefer conn.deinit();
             self.conns.putAssumeCapacityNoClobber(conn, {});
-            if (conn.timer_ts > 0) try self.timers.add(conn);
             self.metric.accept +%= 1;
         }
 
@@ -89,7 +85,6 @@ pub fn ListenerType(comptime ConnType: type) type {
 
         pub fn remove(self: *Self, conn: *ConnType) void {
             assert(self.conns.remove(conn));
-            self.timers.remove(conn);
             self.allocator.destroy(conn);
             self.metric.close +%= 1;
         }
@@ -107,6 +102,7 @@ pub const Conn = struct {
 
     recv_op: Op = .{},
     send_op: SendOp = .{},
+    timer_op: timer.Op = undefined,
     send_chunk: ?Channel.PullChunk = null,
     shutdown_op: Op = .{},
     pending_responses: std.ArrayList(protocol.Response),
@@ -154,6 +150,9 @@ pub const Conn = struct {
         try self.send_op.init(allocator, socket, self, onSend, onSendFail);
         errdefer self.send_op.deinit(allocator);
 
+        self.timer_op.init(&listener.broker.timer_queue, self, Conn.onTimer);
+        try self.timer_op.update(initial_heartbeat);
+
         self.recv_op = Op.recv(socket, self, onRecv, onRecvFail);
         self.io.submit(&self.recv_op);
         log.debug("{} connected {}", .{ socket, addr });
@@ -164,6 +163,7 @@ pub const Conn = struct {
         self.identify.deinit(self.allocator);
         self.send_op.deinit(self.allocator);
         self.pending_responses.deinit();
+        self.timer_op.deinit();
     }
 
     // Channel api -----------------
@@ -224,18 +224,19 @@ pub const Conn = struct {
 
     // IO callbacks -----------------
 
-    pub fn onTimer(self: *Conn, _: u64) !void {
-        if (self.state == .closing) return;
+    pub fn onTimer(self: *Conn, _: u64) !u64 {
+        if (self.state == .closing) return timer.infinite;
         if (self.outstanding_heartbeats > 4) {
             log.debug("{} no heartbeat, closing", .{self.socket});
-            return self.shutdown();
+            self.shutdown();
+            return timer.infinite;
         }
         if (self.outstanding_heartbeats > 0) {
             log.debug("{} heartbeat", .{self.socket});
             self.respond(.heartbeat) catch self.shutdown();
         }
         self.outstanding_heartbeats += 1;
-        self.timer_ts = self.io.tsFromDelay(self.heartbeat_interval);
+        return self.io.tsFromDelay(self.heartbeat_interval);
     }
 
     fn onRecv(self: *Conn, bytes: []const u8) Error!void {

@@ -9,6 +9,7 @@ const log = std.log.scoped(.broker);
 const protocol = @import("protocol.zig");
 const Options = @import("Options.zig").Broker;
 const store = @import("store.zig");
+const timer = @import("timer.zig");
 
 fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
@@ -48,24 +49,25 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
         // Current timestamp, set in tick().
         now: u64 = 0,
-        // Channels waiting for wake up at specific timestamp.
-        channel_timers: TimerQueue(Channel),
-        // Topics with deferred messages waiting for wake up.
-        topic_timers: TimerQueue(Topic),
+        timer_queue: timer.Queue,
 
         // Init/deinit -----------------
 
-        pub fn init(allocator: mem.Allocator, notifier: *Notifier, now: u64, options: Options) Broker {
+        pub fn init(
+            allocator: mem.Allocator,
+            notifier: *Notifier,
+            now: u64,
+            options: Options,
+        ) Broker {
             return .{
                 .allocator = allocator,
                 .topics = std.StringHashMap(*Topic).init(allocator),
                 .notifier = notifier,
                 .started_at = now,
                 .now = now,
-                .channel_timers = TimerQueue(Channel).init(allocator),
-                .topic_timers = TimerQueue(Topic).init(allocator),
                 .options = options,
                 .metric = .{ .max_mem = options.max_mem },
+                .timer_queue = timer.Queue.init(allocator),
             };
         }
 
@@ -73,8 +75,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
             var iter = self.topics.iterator();
             while (iter.next()) |e| self.deinitTopic(e.value_ptr.*);
             self.topics.deinit();
-            self.channel_timers.deinit();
-            self.topic_timers.deinit();
+            self.timer_queue.deinit();
         }
 
         fn deinitTopic(self: *Broker, topic: *Topic) void {
@@ -84,12 +85,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
             self.allocator.destroy(topic);
         }
 
-        pub fn tick(self: *Broker, ts: u64) u64 {
+        pub fn tick(self: *Broker, ts: u64) !u64 {
             self.now = ts;
-            return @min(
-                self.channel_timers.tick(ts),
-                self.topic_timers.tick(ts),
-            );
+            return try self.timer_queue.tick(ts);
         }
 
         fn tsFromDelay(self: *Broker, delay_ms: u32) u64 {
@@ -109,6 +107,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
             try self.topics.ensureUnusedCapacity(1);
 
             topic.* = Topic.init(self, key);
+            topic.timer_op.init(&self.timer_queue, topic, Topic.onTimer);
+
             self.topics.putAssumeCapacityNoClobber(key, topic);
             self.notifier.topicCreated(key);
             log.debug("created topic {s}", .{name});
@@ -374,9 +374,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 stream: store.Stream,
                 metric_prev: store.Metric = .{},
 
-                timer_ts: u64 = infinite,
-                timers: *TimerQueue(Topic),
                 deferred: std.PriorityQueue(DeferredPublish, void, DeferredPublish.less),
+                timer_op: timer.Op = undefined,
 
                 const DeferredPublish = struct {
                     data: []const u8,
@@ -396,7 +395,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         .name = name,
                         .channels = std.StringHashMap(*Channel).init(allocator),
                         .broker = broker,
-                        .timers = &broker.topic_timers,
                         .deferred = std.PriorityQueue(DeferredPublish, void, DeferredPublish.less).init(allocator, {}),
                         .stream = store.Stream.init(
                             allocator,
@@ -420,6 +418,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     while (self.deferred.removeOrNull()) |dp| self.allocator.free(dp.data);
                     self.deferred.deinit();
                     self.stream.deinit();
+                    self.timer_op.deinit();
                 }
 
                 fn empty(self: *Topic) void {
@@ -467,6 +466,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     errdefer channel.deinit();
                     self.channels.putAssumeCapacityNoClobber(key, channel);
 
+                    channel.timer_op.init(&self.broker.timer_queue, channel, Channel.onTimer);
                     channel.sequence = self.stream.subscribe(if (first_channel) .all else .new);
                     channel.metric.depth = if (first_channel) self.stream.metric.msgs else 0;
                     self.broker.notifier.channelCreated(self.name, channel.name);
@@ -501,21 +501,20 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn deferredPublish(self: *Topic, data: []const u8, delay: u32) !void {
+                    if (data.len > self.broker.options.max_msg_size)
+                        return error.MessageSizeOverflow;
                     const data_dupe = try self.allocator.dupe(u8, data);
                     errdefer self.allocator.free(data_dupe);
                     const defer_until = self.broker.tsFromDelay(delay);
+                    if (defer_until < self.timer_op.ts)
+                        try self.timer_op.update(defer_until);
                     try self.deferred.add(.{
                         .data = data_dupe,
                         .defer_until = defer_until,
                     });
-                    if (defer_until < self.timer_ts) {
-                        self.timer_ts = defer_until;
-                        self.timers.update(self) catch {};
-                    }
                 }
 
-                fn onTimer(self: *Topic, now: u64) !void {
-                    var ts = infinite;
+                fn onTimer(self: *Topic, now: u64) !u64 {
                     while (self.deferred.peek()) |dp| {
                         if (dp.defer_until <= now) {
                             try self.publish(dp.data);
@@ -523,10 +522,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                             _ = self.deferred.remove();
                             continue;
                         }
-                        ts = dp.defer_until;
-                        break;
+                        return dp.defer_until;
                     }
-                    self.timer_ts = ts;
+                    return timer.infinite;
                 }
 
                 fn publishDeferred(self: *Topic) !void {
@@ -632,14 +630,13 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 consumers: std.ArrayList(*Consumer),
                 // Round robin consumers iterator.
                 consumers_iterator: ConsumersIterator,
-                // Timestamp when next onTimer will be called
-                timer_ts: u64,
-                timers: *TimerQueue(Channel),
+
                 now: *u64,
                 // Sent but not jet acknowledged (fin) messages.
                 in_flight: std.AutoHashMap(u64, InFlightMsg),
                 // Re-queued by consumer, timed-out or defer published messages.
                 deferred: std.PriorityQueue(DeferredMsg, void, DeferredMsg.less),
+                timer_op: timer.Op = undefined,
 
                 metric: Metric = .{},
                 metric_prev: Metric = .{},
@@ -676,9 +673,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         .consumers_iterator = .{ .channel = self },
                         .in_flight = std.AutoHashMap(u64, InFlightMsg).init(allocator),
                         .deferred = std.PriorityQueue(DeferredMsg, void, DeferredMsg.less).init(allocator, {}),
-                        .timers = &topic.broker.channel_timers,
                         .now = &topic.broker.now,
-                        .timer_ts = infinite,
                         .ephemeral = protocol.isEphemeral(name),
                     };
                 }
@@ -692,10 +687,10 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn deinit(self: *Channel) void {
-                    self.timers.remove(self);
                     self.in_flight.deinit();
                     self.deferred.deinit();
                     self.consumers.deinit();
+                    self.timer_op.deinit();
                 }
 
                 fn subscribe(self: *Channel, consumer: *Consumer) !void {
@@ -740,9 +735,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         .defer_until = if (defer_until > self.now.*) defer_until else 0,
                         .attempts = attempts + 1,
                     };
+                    try self.updateTimer(dm.defer_until);
                     try self.deferred.add(dm);
                     self.topic.stream.acquire(sequence);
-                    if (dm.defer_until > 0) self.updateTimer(dm.defer_until);
                     self.metric.depth += 1;
                 }
 
@@ -759,7 +754,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         .defer_until = if (delay == 0) 0 else self.tsFromDelay(delay),
                         .attempts = ifm.attempts + 1,
                     };
-                    if (dm.defer_until > 0) self.updateTimer(dm.defer_until);
+                    try self.updateTimer(dm.defer_until);
                     self.deferred.add(dm) catch unreachable; // capacity is ensured
                     assert(self.in_flight.remove(sequence));
                 }
@@ -779,7 +774,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                             .attempts = dm.attempts,
                         };
                         ifm.setAttempts(payload);
-                        self.updateTimer(ifm.timeout_at);
+                        try self.updateTimer(ifm.timeout_at);
                         self.in_flight.putAssumeCapacityNoClobber(dm.sequence, ifm);
                         _ = self.deferred.remove();
 
@@ -792,15 +787,14 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     return null;
                 }
 
-                fn updateTimer(self: *Channel, next_ts: u64) void {
-                    if (self.timer_ts <= next_ts) return;
-                    self.timer_ts = next_ts;
-                    self.timers.update(self) catch {};
+                fn updateTimer(self: *Channel, next_ts: u64) !void {
+                    if (next_ts == 0 or self.timer_op.ts <= next_ts) return;
+                    try self.timer_op.update(next_ts);
                 }
 
                 // Callback when timer timeout if fired
-                fn onTimer(self: *Channel, now: u64) !void {
-                    self.timer_ts = @min(
+                fn onTimer(self: *Channel, now: u64) !u64 {
+                    return @min(
                         try self.inFlightTimeout(now),
                         self.deferredTimeout(now),
                     );
@@ -808,7 +802,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                 // Returns next timeout of deferred messages
                 fn deferredTimeout(self: *Channel, now: u64) u64 {
-                    var ts: u64 = infinite;
+                    var ts: u64 = timer.infinite;
                     if (self.deferred.count() > 0) {
                         self.wakeup();
                         if (self.deferred.peek()) |dm| {
@@ -822,7 +816,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 // deferred queue.
                 // Returns next timeout for in flight messages.
                 fn inFlightTimeout(self: *Channel, now: u64) !u64 {
-                    var next_timeout: u64 = infinite;
+                    var next_timeout: u64 = timer.infinite;
 
                     // iterate over all in_flight messages
                     // find expired and next timeout
@@ -915,6 +909,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         { // add all sequence to in_flight
                             try self.in_flight.ensureUnusedCapacity(res.count);
                             const timeout_at = self.tsFromDelay(msg_timeout);
+                            try self.updateTimer(timeout_at);
                             for (res.sequence.from..res.sequence.to + 1) |sequence| {
                                 const ifm = InFlightMsg{
                                     .timeout_at = timeout_at,
@@ -923,7 +918,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                                 };
                                 self.in_flight.putAssumeCapacityNoClobber(sequence, ifm);
                             }
-                            self.updateTimer(timeout_at);
                         }
 
                         self.metric.pull += res.count;
@@ -1091,8 +1085,7 @@ test "channel fin req" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
+    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1293,8 +1286,7 @@ test "multiple channels" {
     const channel_name2 = "channel2";
     const no = 1024;
 
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
+    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
     var c1 = TestConsumer.init(allocator);
@@ -1362,8 +1354,7 @@ test "first channel gets all messages accumulated in topic" {
     const channel_name = "channel1";
     const no = 16;
 
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
+    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
     // publish messages to the topic which don't have channels created
     for (0..no) |_|
@@ -1412,8 +1403,7 @@ test "timeout messages" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
+    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1477,8 +1467,7 @@ test "deferred messages" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
+    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1499,7 +1488,7 @@ test "deferred messages" {
     }
 
     { // move now, one is in flight after publish from topic.onTimer
-        _ = broker.tick(nsFromMs(1));
+        _ = try broker.tick(nsFromMs(1));
         try testing.expectEqual(1, topic.stream.last_sequence);
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
@@ -1516,7 +1505,7 @@ test "deferred messages" {
         channel.wakeup();
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
-        try topic.onTimer(broker.now);
+        _ = try topic.onTimer(broker.now);
         try testing.expectEqual(2, topic.stream.last_sequence);
         try testing.expectEqual(0, topic.deferred.count());
         try testing.expectEqual(0, channel.deferred.count());
@@ -1529,8 +1518,7 @@ test "topic pause" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
+    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
     const topic = try broker.getOrCreateTopic(topic_name);
 
@@ -1580,8 +1568,7 @@ test "channel empty" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
+    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1607,8 +1594,7 @@ test "ephemeral channel" {
     const topic_name = "topic";
     const channel_name = "channel#ephemeral";
 
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
+    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
     var consumer = TestConsumer.init(allocator);
@@ -1658,8 +1644,7 @@ test "depth" {
     const allocator = testing.allocator;
     const topic_name = "topic";
 
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
+    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
     var consumer1 = TestConsumer.init(allocator);
@@ -1712,8 +1697,8 @@ test "check allocations" {
 
 fn publishFinish(allocator: mem.Allocator) !void {
     const topic_name = "topic";
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
+
+    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
     // Create 2 channels
@@ -1780,120 +1765,6 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try channel2.empty();
     try testing.expectEqual(0, channel2.in_flight.count());
     try broker.deleteTopic(topic_name);
-}
-
-pub const infinite: u64 = std.math.maxInt(u64);
-
-// T need to have onTimer method and timer_ts field!
-pub fn TimerQueue(comptime T: type) type {
-    return struct {
-        pq: PQ,
-
-        const PQ = std.PriorityQueue(*T, void, less);
-        const Self = @This();
-
-        fn less(_: void, a: *T, b: *T) math.Order {
-            return math.order(a.timer_ts, b.timer_ts);
-        }
-
-        pub fn init(allocator: mem.Allocator) Self {
-            return .{
-                .pq = PQ.init(allocator, {}),
-            };
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.pq.deinit();
-        }
-
-        pub fn add(self: *Self, elem: *T) !void {
-            try self.pq.add(elem);
-        }
-
-        pub fn remove(self: *Self, elem: *T) void {
-            const index = blk: {
-                var idx: usize = 0;
-                while (idx < self.pq.items.len) : (idx += 1) {
-                    const item = self.pq.items[idx];
-                    if (item == elem) break :blk idx;
-                }
-                return;
-            };
-            _ = self.pq.removeIndex(index);
-        }
-
-        pub fn update(self: *Self, elem: *T) !void {
-            self.remove(elem);
-            if (elem.timer_ts == infinite) return;
-            try self.add(elem);
-        }
-
-        pub fn tick(self: *Self, ts: u64) u64 {
-            while (self.pq.peek()) |elem| {
-                if (elem.timer_ts > ts) return elem.timer_ts;
-                elem.onTimer(ts) catch |err| {
-                    log.err("timer tick failed {}", .{err});
-                    break;
-                };
-                _ = self.pq.remove();
-                if (elem.timer_ts > ts and elem.timer_ts < infinite)
-                    self.add(elem) catch {};
-            }
-            return infinite;
-        }
-
-        pub fn next(self: *Self) u64 {
-            if (self.pq.peek()) |elem| return elem.timer_ts;
-            return infinite;
-        }
-    };
-}
-
-test "timer queue" {
-    const allocator = testing.allocator;
-    const C = struct {
-        timer_ts: u64 = 0,
-        count: usize = 0,
-        pub fn onTimer(self: *Self, ts: u64) !void {
-            assert(ts <= self.timer_ts);
-            self.count += 1;
-        }
-        const Self = @This();
-    };
-
-    var pq = TimerQueue(C).init(allocator);
-    defer pq.deinit();
-
-    var c1 = C{ .timer_ts = 5 };
-    try pq.add(&c1);
-    try testing.expectEqual(5, pq.next());
-
-    var c2 = C{ .timer_ts = 3 };
-    try pq.add(&c2);
-    try testing.expectEqual(3, pq.next());
-
-    try testing.expectEqual(3, pq.tick(2));
-    _ = pq.tick(3);
-    try testing.expectEqual(1, c2.count);
-    try testing.expectEqual(0, c1.count);
-    try testing.expectEqual(5, pq.next());
-
-    c2.timer_ts = 4;
-    try pq.add(&c2);
-    try testing.expectEqual(4, pq.next());
-
-    c2.timer_ts = 10;
-    try pq.update(&c2);
-    try testing.expectEqual(5, pq.next());
-
-    c1.timer_ts = 20;
-    try pq.update(&c1);
-    try testing.expectEqual(10, pq.next());
-
-    pq.remove(&c2);
-    try testing.expectEqual(20, pq.tick(11));
-    pq.remove(&c1);
-    try testing.expectEqual(infinite, pq.tick(0));
 }
 
 test "dump/restore" {
