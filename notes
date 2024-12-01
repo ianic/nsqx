@@ -86,3 +86,17 @@ Nakon store
 [bench_reader] 2024/11/26 16:57:32 duration: 10s - 1799.933mb/s - 9436830.817ops/s - 0.106us/op messages: 94778191
 [bench_writer] 2024/11/26 16:57:42 duration: 10s - 1818.559mb/s - 9534484.520ops/s - 0.105us/op messages: 95356200
 [bench_reader] 2024/11/26 16:57:42 duration: 10s - 1816.652mb/s - 9524490.012ops/s - 0.105us/op messages: 95697817
+
+
+general purpose allocator:
+[bench_writer] 2024/12/01 14:31:59 duration: 10s - 1139.807mb/s - 5975872.941ops/s - 0.167us/op messages: 59770600
+[bench_reader] 2024/12/01 14:31:59 duration: 10s - 1138.870mb/s - 5970957.719ops/s - 0.167us/op messages: 59776819
+[bench_writer] 2024/12/01 14:32:09 duration: 10s - 1152.990mb/s - 6044990.581ops/s - 0.165us/op messages: 60457400
+[bench_reader] 2024/12/01 14:32:09 duration: 10s - 1148.695mb/s - 6022467.429ops/s - 0.166us/op messages: 60518648
+[bench_writer] 2024/12/01 14:32:19 duration: 10s - 1135.609mb/s - 5953859.303ops/s - 0.168us/op messages: 59544600
+[bench_reader] 2024/12/01 14:32:19 duration: 10s - 1136.104mb/s - 5956457.662ops/s - 0.168us/op messages: 59838872
+c_allocator:
+[bench_writer] 2024/12/01 14:32:40 duration: 10s - 1755.222mb/s - 9202420.826ops/s - 0.109us/op messages: 92042200
+[bench_reader] 2024/12/01 14:32:40 duration: 10s - 1748.114mb/s - 9165150.386ops/s - 0.109us/op messages: 92035400
+[bench_writer] 2024/12/01 14:32:50 duration: 10s - 1716.783mb/s - 9000889.721ops/s - 0.111us/op messages: 90019600
+[bench_reader] 2024/12/01 14:32:50 duration: 10s - 1721.559mb/s - 9025929.302ops/s - 0.111us/op messages: 90357178

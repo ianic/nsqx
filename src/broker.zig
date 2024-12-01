@@ -76,17 +76,10 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         }
 
         pub fn deinit(self: *Broker) void {
-            var iter = self.topics.iterator();
-            while (iter.next()) |e| self.deinitTopic(e.value_ptr.*);
+            var iter = self.topics.valueIterator();
+            while (iter.next()) |e| e.*.deinit();
             self.topics.deinit();
             self.timer_queue.deinit();
-        }
-
-        fn deinitTopic(self: *Broker, topic: *Topic) void {
-            const key = topic.name;
-            topic.deinit();
-            self.allocator.free(key);
-            self.allocator.destroy(topic);
         }
 
         pub fn tick(self: *Broker, ts: u64) !u64 {
@@ -100,11 +93,12 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
             if (self.topics.get(name)) |t| return t;
 
             try self.notifier.ensureCapacity(name, "");
+            try self.topics.ensureUnusedCapacity(1);
+
             const topic = try self.allocator.create(Topic);
             errdefer self.allocator.destroy(topic);
             const key = try self.allocator.dupe(u8, name);
             errdefer self.allocator.free(key);
-            try self.topics.ensureUnusedCapacity(1);
 
             topic.* = Topic.init(self, key);
             topic.timer_op.init(&self.timer_queue, topic, Topic.onTimer);
@@ -146,7 +140,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
             const kv = self.topics.fetchRemove(name) orelse return error.NotFound;
             const topic = kv.value;
             topic.delete();
-            self.deinitTopic(topic);
             self.notifier.topicDeleted(name);
             log.debug("deleted topic {s}", .{name});
         }
@@ -417,14 +410,15 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn deinit(self: *Topic) void {
-                    // self.empty();
-                    var iter = self.channels.iterator();
-                    while (iter.next()) |e| self.deinitChannel(e.value_ptr.*);
+                    var iter = self.channels.valueIterator();
+                    while (iter.next()) |e| e.*.deinit();
                     self.channels.deinit();
                     while (self.deferred.removeOrNull()) |dp| self.allocator.free(dp.data);
                     self.deferred.deinit();
                     self.stream.deinit();
                     self.timer_op.deinit();
+                    self.allocator.free(self.name);
+                    self.allocator.destroy(self);
                 }
 
                 fn empty(self: *Topic) void {
@@ -434,22 +428,15 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn delete(self: *Topic) void {
-                    // call delete on all channels
-                    var iter = self.channels.iterator();
-                    while (iter.next()) |e| e.value_ptr.*.delete();
+                    var iter = self.channels.valueIterator();
+                    while (iter.next()) |e| e.*.delete();
+                    self.channels.clearAndFree();
+                    self.deinit();
                 }
 
-                fn removeChannel(self: *Topic, channel: *Channel) void {
+                fn removeEphemeralChannel(self: *Topic, channel: *Channel) void {
                     assert(self.channels.remove(channel.name));
-                    self.deinitChannel(channel);
-                }
-
-                fn deinitChannel(self: *Topic, channel: *Channel) void {
-                    self.stream.unsubscribe(channel.sequence);
-                    const key = channel.name;
                     channel.deinit();
-                    self.allocator.free(key);
-                    self.allocator.destroy(channel);
                     self.empty();
                 }
 
@@ -568,7 +555,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     const kv = self.channels.fetchRemove(name) orelse return error.NotFound;
                     const channel = kv.value;
                     channel.delete();
-                    self.deinitChannel(channel);
+                    self.empty();
                 }
 
                 fn pause(self: *Topic) void {
@@ -688,6 +675,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         consumer.shutdown();
                     }
                     self.consumers.clearAndFree();
+                    self.deinit();
                 }
 
                 fn deinit(self: *Channel) void {
@@ -695,6 +683,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     self.deferred.deinit();
                     self.consumers.deinit();
                     self.timer_op.deinit();
+                    self.topic.stream.unsubscribe(self.sequence);
+                    self.allocator.free(self.name);
+                    self.allocator.destroy(self);
                 }
 
                 fn subscribe(self: *Channel, consumer: *Consumer) !void {
@@ -973,7 +964,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         }
                     }
                     if (self.consumers.items.len == 0 and self.ephemeral)
-                        self.topic.removeChannel(self);
+                        self.topic.removeEphemeralChannel(self);
                 }
 
                 // Re-queue all messages which are in-flight on some consumer.
