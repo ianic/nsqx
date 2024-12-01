@@ -211,10 +211,15 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     const prev = topic.metric_prev;
                     const prefix = try std.fmt.allocPrint(self.allocator, "topic.{s}", .{topic.name});
                     defer self.allocator.free(prefix);
-                    try writer.gauge(prefix, "depth", cur.msgs);
-                    try writer.gauge(prefix, "depth_bytes", cur.bytes);
+                    // nsqd compatibility
+                    const depth = if (topic.channels.count() == 0) cur.msgs else 0;
+                    try writer.gauge(prefix, "depth", depth);
                     try writer.counter(prefix, "message_count", cur.total_msgs, prev.total_msgs);
                     try writer.counter(prefix, "message_bytes", cur.total_bytes, prev.total_bytes);
+                    // nsql specific
+                    try writer.gauge(prefix, "msgs", cur.msgs);
+                    try writer.gauge(prefix, "bytes", cur.bytes);
+                    try writer.gauge(prefix, "capacity", cur.capacity);
                 }
                 var ci = topic.channels.valueIterator();
                 while (ci.next()) |channel_ptr| {
@@ -240,10 +245,11 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 const cur = self.metric;
                 const prev = self.metric_prev;
                 const prefix = "broker";
-                try writer.gauge(prefix, "depth", cur.msgs);
-                try writer.gauge(prefix, "depth_bytes", cur.bytes);
-                try writer.counter(prefix, "message_count", cur.total_msgs, prev.total_msgs);
-                try writer.counter(prefix, "message_bytes", cur.total_bytes, prev.total_bytes);
+                try writer.gauge(prefix, "msgs", cur.msgs);
+                try writer.gauge(prefix, "bytes", cur.bytes);
+                try writer.gauge(prefix, "capacity", cur.capacity);
+                try writer.counter(prefix, "total_msgs", cur.total_msgs, prev.total_msgs);
+                try writer.counter(prefix, "total_bytes", cur.total_bytes, prev.total_bytes);
                 self.metric_prev = self.metric;
             }
         }
