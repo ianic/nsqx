@@ -22,8 +22,8 @@ go build
 cd ~/Code/nsql
 rm -f ./tmp/nsql.dump ./tmp/sub_bench
 
-# ./zig-out/bin/nsql --statsd-address localhost --statsd-prefix "" > tmp/nsql 2>&1 &
-./zig-out/bin/nsql --data-path ./tmp --max-mem=4G > tmp/nsql 2>&1 &
+./zig-out/bin/nsql --data-path ./tmp --max-mem=4G --statsd-address localhost --statsd-prefix "" > tmp/nsql 2>&1 &
+# ./zig-out/bin/nsql --data-path ./tmp --max-mem=40G > tmp/nsql 2>&1 &
 # sudo valgrind --tool=callgrind ./zig-out/bin/nsql --data-path ./tmp > tmp/nsql 2>&1 &
 # ~/Code/go/nsq/apps/nsqd/nsqd --mem-queue-size=100000000 > tmp/nsql 2>&1 &
 nsqd_pid=$!
@@ -62,11 +62,11 @@ wait $nsqd_pid
 # echo wait done
 
 
-sudo chown ianic callgrind.out.*
-mv callgrind.out.* ./tmp
+sudo chown ianic callgrind.out.* && mv callgrind.out.* ./tmp
 exit 0
 
-
-~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 10s
+cd ~/Code/go/nsq/bench/bench_writer/
+go build
+~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 2s
 
 ~/Code/go/nsq/bench/bench_reader/bench_reader --size 200 --runfor 10s
