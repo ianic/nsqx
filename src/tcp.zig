@@ -15,7 +15,6 @@ const Error = @import("io.zig").Error;
 
 const Broker = @import("main.zig").Broker;
 const Channel = Broker.Channel;
-const MsgId = @import("broker.zig").MsgId;
 const timer = @import("timer.zig");
 
 const log = std.log.scoped(.tcp);
@@ -284,19 +283,38 @@ pub const Conn = struct {
         var parser = protocol.Parser{ .buf = try self.recv_buf.append(bytes) };
         while (parser.next() catch |err| {
             log.err(
-                "{} protocol parser failed {}, un-parsed: {d}",
-                .{ self.socket, err, parser.unparsed()[0..@min(128, parser.unparsed().len)] },
+                "{} protocol parser failed with: {s}, un-parsed: '{d}'",
+                .{ self.socket, @errorName(err), parser.unparsed()[0..@min(128, parser.unparsed().len)] },
             );
-            return err;
+            switch (err) {
+                error.Invalid => try self.respond(.invalid),
+                error.InvalidName, error.InvalidNameCharacter => try self.respond(.bad_topic),
+            }
+            return err; // fatal, close connection on parser error
         }) |msg| {
-            self.receivedMsg(msg) catch |err| switch (err) {
-                error.MessageSizeOverflow,
-                error.StreamOutOfMemory,
-                => try self.respond(.pub_failed),
-                error.MessageNotInFlight => {
-                    log.warn("{} message not in flight, operation {s} ", .{ self.socket, @tagName(msg) });
-                },
-                else => return err,
+            self.receivedMsg(msg) catch |err| {
+                log.err(
+                    "{} message error: {s}, operation: {s} ",
+                    .{ self.socket, @errorName(err), @tagName(msg) },
+                );
+                switch (err) {
+                    error.Invalid,
+                    error.NotSubscribed,
+                    => try self.respond(.invalid),
+                    error.MessageSizeOverflow,
+                    error.BadMessage,
+                    => try self.respond(.bad_message),
+                    error.StreamOutOfMemory => try self.respond(.pub_failed),
+                    error.MessageNotInFlight => {
+                        switch (msg) {
+                            .finish => try self.respond(.fin_failed),
+                            .touch => try self.respond(.touch_failed),
+                            .requeue => try self.respond(.requeue_failed),
+                            else => return err,
+                        }
+                    },
+                    else => return err, // close connection on all other errors
+                }
             };
         }
 
@@ -329,12 +347,13 @@ pub const Conn = struct {
                 log.debug("{} publish: {s}", .{ self.socket, arg.topic });
             },
             .multi_publish => |arg| {
-                if (arg.msgs == 0) return;
+                if (arg.msgs == 0) return error.BadMessage;
                 try broker.multiPublish(arg.topic, arg.msgs, arg.data);
                 try self.respond(.ok);
                 log.debug("{} multi publish: {s} messages: {}", .{ self.socket, arg.topic, arg.msgs });
             },
             .deferred_publish => |arg| {
+                if (arg.delay > options.max_req_timeout) return error.Invalid;
                 try broker.deferredPublish(arg.topic, arg.data, arg.delay);
                 try self.respond(.ok);
                 log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });
@@ -348,7 +367,7 @@ pub const Conn = struct {
                 self.in_flight -|= 1;
                 try channel.finish(self.id(), msg_id);
                 self.metric.finish += 1;
-                log.debug("{} finish {}", .{ self.socket, MsgId.parse(msg_id) });
+                log.debug("{} finish {}", .{ self.socket, protocol.msg_id.decode(msg_id) });
             },
             .requeue => |arg| {
                 var channel = self.channel orelse return error.NotSubscribed;
@@ -359,12 +378,12 @@ pub const Conn = struct {
                     arg.delay;
                 try channel.requeue(self.id(), arg.msg_id, delay);
                 self.metric.requeue += 1;
-                log.debug("{} requeue {}", .{ self.socket, MsgId.parse(arg.msg_id) });
+                log.debug("{} requeue {}", .{ self.socket, protocol.msg_id.decode(arg.msg_id) });
             },
             .touch => |msg_id| {
                 var channel = self.channel orelse return error.NotSubscribed;
                 try channel.touch(self.id(), msg_id, self.msgTimeout());
-                log.debug("{} touch {}", .{ self.socket, MsgId.parse(msg_id) });
+                log.debug("{} touch {}", .{ self.socket, protocol.msg_id.decode(msg_id) });
             },
             .close => {
                 self.ready_count = 0;
@@ -376,6 +395,7 @@ pub const Conn = struct {
             },
             .auth => {
                 log.err("{} `auth` is not supported operation", .{self.socket});
+                return error.UnsupportedOperation;
             },
             .version => unreachable, // handled in the parser
         }

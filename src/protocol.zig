@@ -75,7 +75,9 @@ pub const Parser = struct {
         while (true) {
             const msg = p.parse() catch |err| switch (err) {
                 error.SplitBuffer => return null,
-                else => return err,
+                error.Invalid => return error.Invalid,
+                error.InvalidName => return error.InvalidName,
+                error.InvalidNameCharacter => return error.InvalidNameCharacter,
             };
             if (msg != .version) return msg;
         }
@@ -155,9 +157,9 @@ pub const Parser = struct {
                     'E' => {
                         // REQ <message_id> <timeout>\n
                         try p.matchString("REQ ");
-                        const msg_id = try p.readMessageId(' ');
+                        const id = try p.readMessageId(' ');
                         const delay = try p.readStringInt('\n');
-                        return .{ .requeue = .{ .msg_id = msg_id, .delay = delay } };
+                        return .{ .requeue = .{ .msg_id = id, .delay = delay } };
                     },
                     else => return error.Invalid,
                 }
@@ -165,14 +167,14 @@ pub const Parser = struct {
             'F' => {
                 // FIN <message_id>\n
                 try p.matchString("FIN ");
-                const msg_id = try p.readMessageId('\n');
-                return .{ .finish = msg_id };
+                const id = try p.readMessageId('\n');
+                return .{ .finish = id };
             },
             'T' => {
                 // TOUCH <message_id>\n
                 try p.matchString("TOUCH ");
-                const msg_id = try p.readMessageId('\n');
-                return .{ .touch = msg_id };
+                const id = try p.readMessageId('\n');
+                return .{ .touch = id };
             },
             'C' => { // CLS\n
                 try p.matchString("CLS\n");
@@ -540,7 +542,13 @@ pub const Response = enum {
     ok,
     close,
     heartbeat,
+    invalid,
     pub_failed,
+    bad_message,
+    fin_failed,
+    touch_failed,
+    requeue_failed,
+    bad_topic,
 
     pub fn body(self: Response) []const u8 {
         return switch (self) {
@@ -548,6 +556,12 @@ pub const Response = enum {
             .close => &close_frame,
             .heartbeat => &heartbeat_frame,
             .pub_failed => &pub_failed_frame,
+            .bad_message => &bad_message_frame,
+            .invalid => &invalid_frame,
+            .fin_failed => &fin_failed_frame,
+            .touch_failed => &touch_failed_frame,
+            .requeue_failed => &req_failed_frame,
+            .bad_topic => &bad_topic_frame,
         };
     }
 };
@@ -556,6 +570,17 @@ const ok_frame = frame("OK", .response);
 const close_frame = frame("CLOSE_WAIT", .response);
 const heartbeat_frame = frame("_heartbeat_", .response);
 const pub_failed_frame = frame("E_PUB_FAILED", .err);
+const bad_message_frame = frame("E_BAD_MESSAGE", .err);
+const invalid_frame = frame("E_INVALID", .err);
+const fin_failed_frame = frame("E_FIN_FAILED", .err);
+const touch_failed_frame = frame("E_TOUCH_FAILED", .err);
+const req_failed_frame = frame("E_REQ_FAILED", .err);
+const bad_topic_frame = frame("E_BAD_TOPIC", .err);
+// more possible error responses:
+// E_BAD_CHANNEL
+// E_BAD_BODY
+// E_MPUB_FAILED
+// E_DPUB_FAILED
 
 test "response body is comptime" {
     const r1: Response = .heartbeat;
@@ -566,3 +591,20 @@ test "response body is comptime" {
         r1.body(),
     );
 }
+
+pub const msg_id = struct {
+    pub fn decode(id: [16]u8) u64 {
+        return mem.readInt(u64, id[8..], .big);
+    }
+
+    pub fn encode(sequence: u64) [16]u8 {
+        var buf: [16]u8 = undefined;
+        write(&buf, sequence);
+        return buf;
+    }
+
+    pub fn write(buf: *[16]u8, sequence: u64) void {
+        mem.writeInt(u64, buf[0..8], 0, .big); // 8 bytes, unused
+        mem.writeInt(u64, buf[8..16], sequence, .big); // 8 bytes, sequence
+    }
+};

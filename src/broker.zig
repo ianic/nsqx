@@ -11,23 +11,6 @@ const Options = @import("Options.zig").Broker;
 const store = @import("store.zig");
 const timer = @import("timer.zig");
 
-pub const MsgId = struct {
-    pub fn parse(msg_id: [16]u8) u64 {
-        return mem.readInt(u64, msg_id[8..], .big);
-    }
-
-    fn from(sequence: u64) [16]u8 {
-        var buf: [16]u8 = undefined;
-        encode(&buf, sequence);
-        return buf;
-    }
-
-    fn encode(buf: *[16]u8, sequence: u64) void {
-        mem.writeInt(u64, buf[0..8], 0, .big); // 8 bytes, unused
-        mem.writeInt(u64, buf[8..16], sequence, .big); // 8 bytes, sequence
-    }
-};
-
 fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
 }
@@ -483,7 +466,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         mem.writeInt(u32, header[4..8], @intFromEnum(protocol.FrameType.message), .big); // frame type
                         mem.writeInt(u64, header[8..16], time.now, .big); // timestamp
                         mem.writeInt(u16, header[16..18], 1, .big); // attempts
-                        MsgId.encode(header[18..34], res.sequence); // msg id
+                        protocol.msg_id.write(header[18..34], res.sequence); // msg id
                     }
                     @memcpy(body, data);
                 }
@@ -924,7 +907,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn findInFlight(self: *Channel, consumer_id: u32, msg_id: [16]u8) !struct { u64, InFlightMsg } {
-                    const sequence = MsgId.parse(msg_id);
+                    const sequence = protocol.msg_id.decode(msg_id);
                     const ifm = self.in_flight.get(sequence) orelse return error.MessageNotInFlight;
                     if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
                     return .{ sequence, ifm };
@@ -1225,11 +1208,11 @@ const TestConsumer = struct {
     }
 
     fn finish(self: *Self, sequence: u64) !void {
-        try self.channel.?.finish(self.id(), MsgId.from(sequence));
+        try self.channel.?.finish(self.id(), protocol.msg_id.encode(sequence));
     }
 
     fn requeue(self: *Self, sequence: u64, delay: u32) !void {
-        try self.channel.?.requeue(self.id(), MsgId.from(sequence), delay);
+        try self.channel.?.requeue(self.id(), protocol.msg_id.encode(sequence), delay);
     }
 
     fn pull(self: *Self) !void {
