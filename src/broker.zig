@@ -11,6 +11,9 @@ const Options = @import("Options.zig").Broker;
 const store = @import("store.zig");
 const timer = @import("timer.zig");
 
+const Counter = @import("statsd.zig").Counter;
+const Gauge = @import("statsd.zig").Gauge;
+
 fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
 }
@@ -179,54 +182,47 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         // Metrics, dump, restore -----------------
 
         pub fn writeMetrics(self: *Broker, writer: anytype) !void {
+            var buf: [6 + protocol.max_name_len + 9 + protocol.max_name_len]u8 = undefined; // to fit: "topic.{s}.channel.{s}"
             var ti = self.topics.valueIterator();
             while (ti.next()) |topic_ptr| {
                 const topic = topic_ptr.*;
                 { // Topic metrics
-                    const cur = topic.stream.metric;
-                    const prev = topic.metric_prev;
-                    const prefix = try std.fmt.allocPrint(self.allocator, "topic.{s}", .{topic.name});
-                    defer self.allocator.free(prefix);
+                    var m = &topic.stream.metric;
+                    const prefix = try std.fmt.bufPrint(&buf, "topic.{s}", .{topic.name});
                     // nsqd compatibility
-                    const depth = if (topic.channels.count() == 0) cur.msgs else 0;
+                    const depth = if (topic.channels.count() == 0) m.msgs.value else 0;
                     try writer.gauge(prefix, "depth", depth);
-                    try writer.counter(prefix, "message_count", cur.total_msgs, prev.total_msgs);
-                    try writer.counter(prefix, "message_bytes", cur.total_bytes, prev.total_bytes);
+                    try writer.add(prefix, "message_count", &m.total_msgs);
+                    try writer.add(prefix, "message_bytes", &m.total_bytes);
                     // nsql specific
-                    try writer.gauge(prefix, "msgs", cur.msgs);
-                    try writer.gauge(prefix, "bytes", cur.bytes);
-                    try writer.gauge(prefix, "capacity", cur.capacity);
+                    try writer.add(prefix, "msgs", m.msgs);
+                    try writer.add(prefix, "bytes", m.bytes);
+                    try writer.add(prefix, "capacity", m.capacity);
                 }
                 var ci = topic.channels.valueIterator();
                 while (ci.next()) |channel_ptr| {
                     // Channel metrics
                     const channel = channel_ptr.*;
-                    const cur = channel.metric;
-                    const prev = channel.metric_prev;
-                    const prefix = try std.fmt.allocPrint(self.allocator, "topic.{s}.channel.{s}", .{ topic.name, channel.name });
-                    defer self.allocator.free(prefix);
+                    var m = &channel.metric;
+                    const prefix = try std.fmt.bufPrint(&buf, "topic.{s}.channel.{s}", .{ topic.name, channel.name });
                     try writer.gauge(prefix, "clients", channel.consumers.items.len);
                     try writer.gauge(prefix, "deferred_count", channel.deferred.count());
                     try writer.gauge(prefix, "in_flight_count", channel.in_flight.count());
-                    try writer.gauge(prefix, "depth", cur.depth);
-                    try writer.counter(prefix, "message_count", cur.pull, prev.pull);
-                    try writer.counter(prefix, "finish_count", cur.finish, prev.finish);
-                    try writer.counter(prefix, "timeout_count", cur.timeout, prev.timeout);
-                    try writer.counter(prefix, "requeue_count", cur.requeue, prev.requeue);
-                    channel.metric_prev = cur;
+                    try writer.add(prefix, "depth", m.depth);
+                    try writer.add(prefix, "message_count", &m.pull);
+                    try writer.add(prefix, "finish_count", &m.finish);
+                    try writer.add(prefix, "timeout_count", &m.timeout);
+                    try writer.add(prefix, "requeue_count", &m.requeue);
                 }
-                topic.metric_prev = topic.stream.metric;
             }
             { // Broker metrics (sum of all topics)
-                const cur = self.metric;
-                const prev = self.metric_prev;
                 const prefix = "broker";
-                try writer.gauge(prefix, "msgs", cur.msgs);
-                try writer.gauge(prefix, "bytes", cur.bytes);
-                try writer.gauge(prefix, "capacity", cur.capacity);
-                try writer.counter(prefix, "total_msgs", cur.total_msgs, prev.total_msgs);
-                try writer.counter(prefix, "total_bytes", cur.total_bytes, prev.total_bytes);
-                self.metric_prev = self.metric;
+                var m = &self.metric;
+                try writer.add(prefix, "msgs", m.msgs);
+                try writer.add(prefix, "bytes", m.bytes);
+                try writer.add(prefix, "capacity", m.capacity);
+                try writer.add(prefix, "total_msgs", &m.total_msgs);
+                try writer.add(prefix, "total_bytes", &m.total_bytes);
             }
         }
 
@@ -354,7 +350,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 paused: bool = false,
                 channels: std.StringHashMap(*Channel),
                 stream: store.Stream,
-                metric_prev: store.Metric = .{},
 
                 deferred: std.PriorityQueue(DeferredPublish, void, DeferredPublish.less),
                 timer_op: timer.Op = undefined,
@@ -444,7 +439,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                     channel.timer_op.init(&self.broker.timer_queue, channel, Channel.onTimer);
                     channel.sequence = self.stream.subscribe(if (first_channel) .all else .new);
-                    channel.metric.depth = if (first_channel) self.stream.metric.msgs else 0;
+                    channel.metric.depth.set(if (first_channel) self.stream.metric.msgs.value else 0);
                     self.broker.notifier.channelCreated(self.name, channel.name);
                     log.debug("topic '{s}' channel '{s}' created", .{ self.name, channel.name });
                     return channel;
@@ -614,7 +609,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 timer_op: timer.Op = undefined,
 
                 metric: Metric = .{},
-                metric_prev: Metric = .{},
                 paused: bool = false,
                 ephemeral: bool = false,
 
@@ -624,16 +618,16 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 const Metric = struct {
                     // Total number of messages ...
                     // ... pulled from topic
-                    pull: usize = 0, //  counter
+                    pull: Counter = .{},
                     // ... delivered to the client(s)
-                    finish: usize = 0, // counter
+                    finish: Counter = .{},
                     // ... time-outed while in flight.
-                    timeout: usize = 0, // counter
+                    timeout: Counter = .{},
                     // ... re-queued by the client.
-                    requeue: usize = 0, //  counter
+                    requeue: Counter = .{},
                     // Current number of messages published to the topic but not processed
                     // by this channel.
-                    depth: usize = 0, // gauge
+                    depth: Gauge = .{},
                 };
 
                 // Init/deinit -----------------
@@ -681,7 +675,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                 // Called from topic when new topic message is created.
                 fn onTopicAppend(self: *Channel, msgs: u32) void {
-                    self.metric.depth += msgs;
+                    self.metric.depth.inc(msgs);
                     if (!self.needWakeup()) return;
                     self.wakeup();
                 }
@@ -704,7 +698,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     if (sequence == self.sequence) return;
                     self.topic.stream.unsubscribe(self.sequence);
                     self.sequence = self.topic.stream.subscribe(.{ .from_sequence = sequence });
-                    self.metric.depth = self.topic.stream.last_sequence - sequence;
+                    self.metric.depth.set(self.topic.stream.last_sequence - sequence);
                 }
 
                 fn restoreMsg(self: *Channel, sequence: u64, defer_until: u64, attempts: u16) !void {
@@ -716,7 +710,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     try self.updateTimer(dm.defer_until);
                     try self.deferred.add(dm);
                     self.topic.stream.acquire(sequence);
-                    self.metric.depth += 1;
+                    self.metric.depth.inc(1);
                 }
 
                 // Defer in flight message.
@@ -812,7 +806,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     for (expired.items) |sequence| {
                         const msg = self.in_flight.get(sequence).?;
                         try self.deferInFlight(sequence, msg, 0);
-                        self.metric.timeout += 1;
+                        self.metric.timeout.inc(1);
                         if (!builtin.is_test)
                             log.warn(
                                 "{s}/{s} message timeout consumer: {}, sequence: {}",
@@ -894,7 +888,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                             }
                         }
 
-                        self.metric.pull += res.count;
+                        self.metric.pull.inc(res.count);
                         self.sequence = res.sequence.to;
                         return .{
                             .data = res.data,
@@ -917,8 +911,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     const sequence, _ = try self.findInFlight(consumer_id, msg_id);
                     self.topic.stream.release(sequence);
                     assert(self.in_flight.remove(sequence));
-                    self.metric.finish += 1;
-                    self.metric.depth -|= 1;
+                    self.metric.finish.inc(1);
+                    self.metric.depth.dec(1);
                 }
 
                 /// Extend message timeout for interval (milliseconds).
@@ -931,7 +925,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 pub fn requeue(self: *Channel, consumer_id: u32, msg_id: [16]u8, delay: u32) !void {
                     const sequence, const ifm = try self.findInFlight(consumer_id, msg_id);
                     try self.deferInFlight(sequence, ifm, delay);
-                    self.metric.requeue += 1;
+                    self.metric.requeue.inc(1);
                 }
 
                 pub fn unsubscribe(self: *Channel, consumer: *Consumer) void {
@@ -965,7 +959,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     for (sequences.items) |sequence| {
                         const msg = self.in_flight.get(sequence).?;
                         try self.deferInFlight(sequence, msg, 0);
-                        self.metric.requeue += 1;
+                        self.metric.requeue.inc(1);
                         // log.debug("{} message requeue {}", .{ msg.consumer_id, sequence });
                     }
                 }
@@ -999,7 +993,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     { // move stream pointer
                         self.topic.stream.unsubscribe(self.sequence);
                         self.sequence = self.topic.stream.subscribe(.new);
-                        self.metric.depth = 0;
+                        self.metric.depth.set(0);
                     }
                 }
             };
@@ -1073,7 +1067,7 @@ test "channel fin req" {
     try broker.publish(topic_name, "3");
 
     { // 3 messages in topic, 0 taken by channel
-        try testing.expectEqual(3, channel.metric.depth);
+        try testing.expectEqual(3, channel.metric.depth.value);
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
     }
@@ -1094,7 +1088,7 @@ test "channel fin req" {
         try consumer.finish(1);
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
-        try testing.expectEqual(2, channel.metric.depth);
+        try testing.expectEqual(2, channel.metric.depth.value);
         try testing.expectEqual(1, channel.sequence);
     }
     { // send seq 2, 1 msg in flight
@@ -1131,11 +1125,11 @@ test "channel fin req" {
         try testing.expectEqual(0, channel.deferred.count());
     }
     { // fin seq 2
-        try testing.expectEqual(1, channel.metric.depth);
+        try testing.expectEqual(1, channel.metric.depth.value);
         try consumer.finish(2);
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
-        try testing.expectEqual(0, channel.metric.depth);
+        try testing.expectEqual(0, channel.metric.depth.value);
     }
     { // consumer unsubscribe re-queues in-flight messages
         try broker.publish(topic_name, "4");
@@ -1335,7 +1329,7 @@ test "first channel gets all messages accumulated in topic" {
         try broker.publish(topic_name, "message body"); // 1-16
 
     const topic = try broker.getOrCreateTopic(topic_name);
-    try testing.expectEqual(no, topic.stream.metric.msgs);
+    try testing.expectEqual(no, topic.stream.metric.msgs.value);
 
     // subscribe creates channel
     // channel gets all messages
@@ -1344,32 +1338,32 @@ test "first channel gets all messages accumulated in topic" {
     try broker.subscribe(&consumer, topic_name, channel_name);
     var channel = consumer.channel.?;
     try testing.expectEqual(0, channel.sequence);
-    try testing.expectEqual(no, channel.metric.depth);
+    try testing.expectEqual(no, channel.metric.depth.value);
 
     for (0..no) |i| {
-        try testing.expectEqual(no - i, channel.metric.depth);
+        try testing.expectEqual(no - i, channel.metric.depth.value);
         try consumer.pullFinish();
     }
-    try testing.expectEqual(0, channel.metric.depth);
-    try testing.expectEqual(no, topic.stream.metric.msgs);
+    try testing.expectEqual(0, channel.metric.depth.value);
+    try testing.expectEqual(no, topic.stream.metric.msgs.value);
 
     try broker.publish(topic_name, "message body"); // 17
-    try testing.expectEqual(1, channel.metric.depth);
-    try testing.expectEqual(17, topic.stream.metric.msgs);
+    try testing.expectEqual(1, channel.metric.depth.value);
+    try testing.expectEqual(17, topic.stream.metric.msgs.value);
     try testing.expectEqual(17, topic.stream.last_sequence);
 
     try broker.deleteChannel(topic_name, channel_name);
-    try testing.expectEqual(0, topic.stream.metric.msgs);
+    try testing.expectEqual(0, topic.stream.metric.msgs.value);
     try broker.publish(topic_name, "message body"); // 18
-    try testing.expectEqual(1, topic.stream.metric.msgs);
+    try testing.expectEqual(1, topic.stream.metric.msgs.value);
 
     var consumer2 = TestConsumer.init(allocator);
     defer consumer2.deinit();
     try broker.subscribe(&consumer2, topic_name, channel_name);
     channel = consumer2.channel.?;
     try testing.expectEqual(17, channel.sequence);
-    try testing.expectEqual(1, topic.stream.metric.msgs);
-    try testing.expectEqual(1, channel.metric.depth);
+    try testing.expectEqual(1, topic.stream.metric.msgs.value);
+    try testing.expectEqual(1, channel.metric.depth.value);
 }
 
 test "timeout messages" {
@@ -1405,23 +1399,23 @@ test "timeout messages" {
     { // expire one message
         const expire_at = try channel.inFlightTimeout(msg_timeout + 1);
         try testing.expectEqual(msg_timeout + 2, expire_at);
-        try testing.expectEqual(0, channel.metric.requeue);
-        try testing.expectEqual(1, channel.metric.timeout);
+        try testing.expectEqual(0, channel.metric.requeue.value);
+        try testing.expectEqual(1, channel.metric.timeout.value);
         try testing.expectEqual(3, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
     }
     { // expire two more
         const expire_at = try channel.inFlightTimeout(msg_timeout + 3);
         try testing.expectEqual(msg_timeout + 4, expire_at);
-        try testing.expectEqual(0, channel.metric.requeue);
-        try testing.expectEqual(3, channel.metric.timeout);
+        try testing.expectEqual(0, channel.metric.requeue.value);
+        try testing.expectEqual(3, channel.metric.timeout.value);
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(3, channel.deferred.count());
-        try testing.expectEqual(0, channel.metric.finish);
+        try testing.expectEqual(0, channel.metric.finish.value);
     }
     { // fin last one
         try consumer.finish(consumer.lastSequence());
-        try testing.expectEqual(1, channel.metric.finish);
+        try testing.expectEqual(1, channel.metric.finish.value);
         try testing.expectEqual(0, channel.in_flight.count());
     }
     { // resend two
@@ -1455,7 +1449,7 @@ test "deferred messages" {
     { // publish two deferred messages, topic puts them into deferred queue
         try broker.deferredPublish(topic_name, "message body", 2);
         try broker.deferredPublish(topic_name, "message body", 1);
-        try testing.expectEqual(0, channel.metric.depth);
+        try testing.expectEqual(0, channel.metric.depth.value);
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(2, topic.deferred.count());
@@ -1500,7 +1494,7 @@ test "topic pause" {
     {
         try broker.publish(topic_name, "message 1");
         try broker.publish(topic_name, "message 2");
-        try testing.expectEqual(2, topic.stream.metric.msgs);
+        try testing.expectEqual(2, topic.stream.metric.msgs.value);
     }
 
     var consumer = TestConsumer.init(allocator);
@@ -1639,30 +1633,30 @@ test "depth" {
     try broker.publish(topic_name, "message 1");
     try broker.publish(topic_name, "message 2");
 
-    try testing.expectEqual(2, topic.stream.metric.msgs);
-    try testing.expectEqual(2, channel1.metric.depth);
-    try testing.expectEqual(2, channel2.metric.depth);
+    try testing.expectEqual(2, topic.stream.metric.msgs.value);
+    try testing.expectEqual(2, channel1.metric.depth.value);
+    try testing.expectEqual(2, channel2.metric.depth.value);
 
     try testing.expectEqual(0, channel1.sequence);
     try testing.expectEqual(0, channel2.sequence);
     try consumer1.pullFinish();
     try testing.expectEqual(1, channel1.sequence);
 
-    try testing.expectEqual(1, channel1.metric.depth);
-    try testing.expectEqual(2, channel2.metric.depth);
+    try testing.expectEqual(1, channel1.metric.depth.value);
+    try testing.expectEqual(2, channel2.metric.depth.value);
 
     try consumer2.pullFinish();
-    try testing.expectEqual(1, channel1.metric.depth);
-    try testing.expectEqual(1, channel2.metric.depth);
+    try testing.expectEqual(1, channel1.metric.depth.value);
+    try testing.expectEqual(1, channel2.metric.depth.value);
 
     try consumer2.pullFinish();
-    try testing.expectEqual(1, channel1.metric.depth);
-    try testing.expectEqual(0, channel2.metric.depth);
+    try testing.expectEqual(1, channel1.metric.depth.value);
+    try testing.expectEqual(0, channel2.metric.depth.value);
 
     try broker.publish(topic_name, "message 3");
 
-    try testing.expectEqual(2, channel1.metric.depth);
-    try testing.expectEqual(1, channel2.metric.depth);
+    try testing.expectEqual(2, channel1.metric.depth.value);
+    try testing.expectEqual(1, channel2.metric.depth.value);
 }
 
 test "check allocations" {
@@ -1688,7 +1682,7 @@ fn publishFinish(allocator: mem.Allocator) !void {
     // Publish some messages
     try broker.publish(topic_name, "message 1");
     try broker.publish(topic_name, "message 2");
-    try testing.expectEqual(2, topic.stream.metric.msgs);
+    try testing.expectEqual(2, topic.stream.metric.msgs.value);
     try testing.expectEqual(2, topic.stream.last_sequence);
 
     // 1 consumer for channel 1 and 2 consumers for channel 2
@@ -1712,7 +1706,7 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try channel1_consumer.pullFinish();
     try channel2_consumer1.pullFinish();
     try channel2_consumer2.pullFinish();
-    try testing.expectEqual(2, topic.stream.metric.msgs);
+    try testing.expectEqual(2, topic.stream.metric.msgs.value);
     try testing.expectEqual(2, channel1_consumer.sequences.items.len);
     try testing.expectEqual(1, channel2_consumer1.sequences.items.len);
     try testing.expectEqual(1, channel2_consumer2.sequences.items.len);
@@ -1798,8 +1792,8 @@ test "dump/restore" {
         try testing.expectEqual(103, channel2.sequence);
         channel1.pause();
 
-        try testing.expectEqual(2, channel1.metric.depth);
-        try testing.expectEqual(2, channel2.metric.depth);
+        try testing.expectEqual(2, channel1.metric.depth.value);
+        try testing.expectEqual(2, channel2.metric.depth.value);
 
         try testing.expectEqual(5, topic.stream.pages.items[0].ref_count);
         try broker.dump(dir);
@@ -1832,8 +1826,8 @@ test "dump/restore" {
         try testing.expect(channel1.paused);
         try testing.expect(!channel2.paused);
 
-        try testing.expectEqual(2, channel1.metric.depth);
-        try testing.expectEqual(2, channel2.metric.depth);
+        try testing.expectEqual(2, channel1.metric.depth.value);
+        try testing.expectEqual(2, channel2.metric.depth.value);
     }
 
     try std.fs.cwd().deleteTree(dir_name);

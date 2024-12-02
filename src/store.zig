@@ -6,6 +6,9 @@ const math = std.math;
 const maxInt = math.maxInt;
 const log = std.log.scoped(.store);
 
+const Counter = @import("statsd.zig").Counter;
+const Gauge = @import("statsd.zig").Gauge;
+
 pub const Options = struct {
     initial_page_size: u32,
     max_page_size: u32 = 0, // prevents growth
@@ -163,22 +166,22 @@ pub const RetentionPolicy = union(enum) {
 
 pub const Metric = struct {
     // Current number of messages in the stream.
-    msgs: usize = 0,
+    msgs: Gauge = .{},
     // Size in bytes of the current messages.
-    bytes: usize = 0,
+    bytes: Gauge = .{},
     // Allocated bytes for messages.
-    capacity: usize = 0,
+    capacity: Gauge = .{},
     // Total number of messages.
-    total_msgs: usize = 0,
+    total_msgs: Counter = .{},
     // Total size of all messages.
-    total_bytes: usize = 0,
+    total_bytes: Counter = .{},
     // Allocation limit
     max_mem: u64 = maxInt(u64),
 
     parent: ?*Metric = null,
 
     fn ensureCapacity(self: *Metric, size: usize) !void {
-        if (self.capacity + size > self.max_mem) {
+        if (self.capacity.value + size > self.max_mem) {
             log.err("max memory reached; {} bytes", .{self.max_mem});
             return error.StreamOutOfMemory;
         }
@@ -186,28 +189,28 @@ pub const Metric = struct {
     }
 
     fn alloc(self: *Metric, capacity: usize) void {
-        self.capacity += capacity;
+        self.capacity.inc(capacity);
         if (self.parent) |parent| parent.alloc(capacity);
     }
 
     fn free(self: *Metric, msgs: usize, bytes: usize, capacity: usize) void {
-        self.msgs -|= msgs;
-        self.bytes -|= bytes;
-        self.capacity -|= capacity;
+        self.msgs.dec(msgs);
+        self.bytes.dec(bytes);
+        self.capacity.dec(capacity);
         if (self.parent) |parent| parent.free(msgs, bytes, capacity);
     }
 
     fn append(self: *Metric, msgs: usize, bytes: usize) void {
-        self.total_msgs +%= msgs;
-        self.total_bytes +%= bytes;
-        self.msgs +%= msgs;
-        self.bytes +%= bytes;
+        self.total_msgs.inc(msgs);
+        self.total_bytes.inc(bytes);
+        self.msgs.inc(msgs);
+        self.bytes.inc(bytes);
         if (self.parent) |parent| parent.append(msgs, bytes);
     }
 
     fn dec(self: *Metric, msgs: usize, bytes: usize) void {
-        self.msgs -|= msgs;
-        self.bytes -|= bytes;
+        self.msgs.dec(msgs);
+        self.bytes.dec(bytes);
         if (self.parent) |parent| parent.dec(msgs, bytes);
     }
 };
@@ -534,10 +537,10 @@ test "topic usage" {
         // page 2
         try stream.append("4567");
     }
-    try testing.expectEqual(6, stream.metric.msgs);
-    try testing.expectEqual(6, broker_metric.msgs);
-    try testing.expectEqual(18, stream.metric.bytes);
-    try testing.expectEqual(24, stream.metric.capacity);
+    try testing.expectEqual(6, stream.metric.msgs.value);
+    try testing.expectEqual(6, broker_metric.msgs.value);
+    try testing.expectEqual(18, stream.metric.bytes.value);
+    try testing.expectEqual(24, stream.metric.capacity.value);
 
     // first subscriber gets all the messages
     var sub_1_seq = stream.subscribe(.all);
@@ -585,10 +588,10 @@ test "topic usage" {
         stream.release(res1.sequence.from);
         try testing.expectEqual(2, stream.pages.items.len);
 
-        try testing.expectEqual(3, stream.metric.msgs);
-        try testing.expectEqual(3, broker_metric.msgs);
-        try testing.expectEqual(10, stream.metric.bytes);
-        try testing.expectEqual(16, stream.metric.capacity);
+        try testing.expectEqual(3, stream.metric.msgs.value);
+        try testing.expectEqual(3, broker_metric.msgs.value);
+        try testing.expectEqual(10, stream.metric.bytes.value);
+        try testing.expectEqual(16, stream.metric.capacity.value);
     }
 }
 

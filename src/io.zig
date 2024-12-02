@@ -24,7 +24,6 @@ pub const Io = struct {
     timestamp: u64 = 0,
     recv_buf_grp: IoUring.BufferGroup = undefined,
     metric: Metric = .{},
-    metric_prev: Metric = .{},
     cqe_buf: [256]linux.io_uring_cqe = undefined,
     cqe_buf_head: usize = 0,
     cqe_buf_tail: usize = 0,
@@ -83,7 +82,7 @@ pub const Io = struct {
     }
 
     pub fn tick(self: *Io) !void {
-        self.metric.loops += 1;
+        self.metric.loops.inc(1);
         // Submit prepared sqe-s to the kernel.
         _ = try self.ring.submit();
         // Prepare pending operations
@@ -98,7 +97,7 @@ pub const Io = struct {
             self.cqe_buf_tail = 0;
             const n = try self.ring.copy_cqes(&self.cqe_buf, 1);
             self.cqe_buf_tail = n;
-            self.metric.cqes += n;
+            self.metric.cqes.inc(n);
         }
         if (self.cqe_buf_head < self.cqe_buf_tail) {
             // Process completions.
@@ -177,28 +176,24 @@ pub const Io = struct {
     };
 
     pub fn writeMetrics(self: *Io, writer: anytype) !void {
-        const cur = self.metric;
-        const prev = self.metric_prev;
-        const write = Metric.Counter.write;
+        var m = &self.metric;
 
-        try write("io.op.all", cur.all, prev.all, writer);
-        try write("io.op.send", cur.sendv, prev.sendv, writer);
-        try write("io.op.recv", cur.recv, prev.recv, writer);
-        try write("io.op.accept", cur.accept, prev.accept, writer);
-        try write("io.op.connect", cur.connect, prev.connect, writer);
-        try write("io.op.timer", cur.timer, prev.timer, writer);
+        try m.all.write("io.op.all", writer);
+        try m.sendv.write("io.op.send", writer);
+        try m.recv.write("io.op.recv", writer);
+        try m.accept.write("io.op.accept", writer);
+        try m.connect.write("io.op.connect", writer);
+        try m.timer.write("io.op.timer", writer);
         {
-            try writer.counter("io", "loops", cur.loops, prev.loops);
-            try writer.counter("io", "cqes", cur.cqes, prev.cqes);
-
-            try writer.counter("io", "send_bytes", cur.send_bytes, prev.send_bytes);
-            try writer.counter("io", "recv_bytes", cur.recv_bytes, prev.recv_bytes);
+            try writer.add("io", "loops", &m.loops);
+            try writer.add("io", "cqes", &m.cqes);
+            try writer.add("io", "send_bytes", &m.send_bytes);
+            try writer.add("io", "recv_bytes", &m.recv_bytes);
         }
         {
-            try writer.counter("io.recv_buf_grp", "success", cur.recv_buf_grp.success, prev.recv_buf_grp.success);
-            try writer.counter("io.recv_buf_grp", "no_bufs", cur.recv_buf_grp.no_bufs, prev.recv_buf_grp.no_bufs);
+            try writer.add("io.recv_buf_grp", "success", &m.recv_buf_grp.success);
+            try writer.add("io.recv_buf_grp", "no_bufs", &m.recv_buf_grp.no_bufs);
         }
-        self.metric_prev = cur;
     }
 };
 
@@ -388,8 +383,8 @@ pub const Op = struct {
                         const bytes = io.recv_buf_grp.get(buffer_id)[0..n];
                         try success(ctx, bytes);
                         io.recv_buf_grp.put(buffer_id);
-                        io.metric.recv_bytes +%= n;
-                        io.metric.recv_buf_grp.success +%= 1;
+                        io.metric.recv_bytes.inc(n);
+                        io.metric.recv_buf_grp.success.inc(1);
 
                         // NOTE: recv is not restarted if there is no more
                         // multishot cqe's (like accept). Check op.hasMore
@@ -397,7 +392,7 @@ pub const Op = struct {
                         return;
                     },
                     .NOBUFS => {
-                        io.metric.recv_buf_grp.no_bufs +%= 1;
+                        io.metric.recv_buf_grp.no_bufs.inc(1);
                     },
                     .INTR => {},
                     else => |errno| return try fail(ctx, errFromErrno(errno)),
@@ -449,7 +444,7 @@ pub const Op = struct {
                 switch (cqe.err()) {
                     .SUCCESS => {
                         const sent_bytes: usize = @intCast(cqe.res);
-                        io.metric.send_bytes +%= sent_bytes;
+                        io.metric.send_bytes.inc(sent_bytes);
 
                         var data_len: usize = 0;
                         const mh = op.args.sendv.msghdr;
@@ -517,7 +512,7 @@ pub const Op = struct {
                 switch (cqe.err()) {
                     .SUCCESS => {
                         const n: usize = @intCast(cqe.res);
-                        io.metric.send_bytes +%= n;
+                        io.metric.send_bytes.inc(n);
                         const send_buf = op.args.send.buf;
                         if (n < send_buf.len) {
                             op.args.send.buf = send_buf[n..];
@@ -950,20 +945,22 @@ test "pointer" {
     try testing.expect(ctx.op == null);
 }
 
+const statsd = @import("statsd.zig");
+
 const Metric = struct {
-    loops: usize = 0,
-    cqes: usize = 0,
-    send_bytes: usize = 0,
-    recv_bytes: usize = 0,
+    loops: statsd.Counter = .{},
+    cqes: statsd.Counter = .{},
+    send_bytes: statsd.Counter = .{},
+    recv_bytes: statsd.Counter = .{},
 
     recv_buf_grp: struct {
-        success: usize = 0,
-        no_bufs: usize = 0,
+        success: statsd.Counter = .{},
+        no_bufs: statsd.Counter = .{},
 
-        pub fn noBufs(self: @This()) f64 {
-            const total = self.success + self.no_bufs;
+        pub fn noBufsPercent(self: @This()) f64 {
+            const total = self.success.value + self.no_bufs.value;
             if (total == 0) return 0;
-            return @as(f64, @floatFromInt(self.no_bufs)) / @as(f64, @floatFromInt(total)) * 100;
+            return @as(f64, @floatFromInt(self.no_bufs.value)) / @as(f64, @floatFromInt(total)) * 100;
         }
     } = .{},
 
@@ -978,46 +975,29 @@ const Metric = struct {
 
     // Counter of submitted/completed operations
     const Counter = struct {
-        submitted: usize = 0,
-        completed: usize = 0,
-        restarted: usize = 0,
-        max_active: usize = 0,
+        submitted: statsd.Counter = .{},
+        completed: statsd.Counter = .{},
+        restarted: statsd.Counter = .{},
 
         // Current number of active operations
         pub fn active(self: Counter) usize {
-            return self.submitted - self.completed;
+            return self.submitted.value - self.completed.value;
         }
         fn submit(self: *Counter) void {
-            self.submitted += 1;
-            if (self.active() > self.max_active)
-                self.max_active = self.active();
+            self.submitted.inc(1);
         }
         fn complete(self: *Counter) void {
-            self.completed += 1;
+            self.completed.inc(1);
         }
         fn restart(self: *Counter) void {
-            self.restarted += 1;
-        }
-        pub fn format(
-            self: Counter,
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
-            writer: anytype,
-        ) !void {
-            _ = fmt;
-            _ = options;
-
-            try writer.print(
-                "active: {:>8}, max active: {:>8}, submitted: {:>8}, restarted: {:>8}, completed: {:>8}",
-                .{ self.active(), self.max_active, self.submitted, self.restarted, self.completed },
-            );
+            self.restarted.inc(1);
         }
 
-        fn write(prefix: []const u8, cur: Counter, prev: Counter, writer: anytype) !void {
-            try writer.counter(prefix, "submitted", cur.submitted, prev.submitted);
-            try writer.counter(prefix, "completed", cur.completed, prev.completed);
-            try writer.counter(prefix, "restarted", cur.restarted, prev.restarted);
-            try writer.gauge(prefix, "active", cur.active());
+        fn write(self: *Counter, prefix: []const u8, writer: anytype) !void {
+            try writer.add(prefix, "submitted", &self.submitted);
+            try writer.add(prefix, "completed", &self.completed);
+            try writer.add(prefix, "restarted", &self.restarted);
+            try writer.gauge(prefix, "active", self.active());
         }
     };
 

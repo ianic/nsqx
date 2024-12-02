@@ -351,7 +351,7 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
                 .channel_name = channel.name,
                 // Current number of messages published to the topic but not
                 // processed by this channel.
-                .depth = channel.metric.depth, // gauge
+                .depth = channel.metric.depth.value, // gauge
                 // Current number of in-flight messages, sent to the client but
                 // not fin jet.
                 .in_flight_count = channel.in_flight.count(), // gauge
@@ -360,11 +360,11 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
                 // in-flight, or by producer (defer publish).
                 .deferred_count = channel.deferred.count(), // gauge
                 // Total number of messages finished by the clinet(s).
-                .message_count = channel.metric.finish, // counter
+                .message_count = channel.metric.finish.value, // counter
                 // Total number of messages re-queued by the client(s).
-                .requeue_count = channel.metric.requeue, // counter
+                .requeue_count = channel.metric.requeue.value, // counter
                 // Total number of messages timed-out while in-flight.
-                .timeout_count = channel.metric.timeout, // counter
+                .timeout_count = channel.metric.timeout.value, // counter
                 // Current number of connected clients.
                 .client_count = client_count, // gauge
                 .paused = channel.paused,
@@ -393,11 +393,11 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
             .last_sequence = topic.stream.last_sequence,
             .page_size = topic.stream.page_size,
             .metric = .{
-                .msgs = topic.stream.metric.msgs,
-                .bytes = topic.stream.metric.bytes,
-                .capacity = topic.stream.metric.capacity,
-                .total_msgs = topic.stream.metric.total_msgs,
-                .total_bytes = topic.stream.metric.total_bytes,
+                .msgs = topic.stream.metric.msgs.value,
+                .bytes = topic.stream.metric.bytes.value,
+                .capacity = topic.stream.metric.capacity.value,
+                .total_msgs = topic.stream.metric.total_msgs.value,
+                .total_bytes = topic.stream.metric.total_bytes.value,
             },
             .pages_count = topic.stream.pages.items.len,
             .pages = pages.items,
@@ -405,9 +405,9 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
 
         try topics.append(.{
             .topic_name = topic.name,
-            .depth = if (topic.channels.count() == 0) topic.stream.metric.msgs else 0,
-            .message_count = topic.stream.metric.total_msgs,
-            .message_bytes = topic.stream.metric.total_bytes,
+            .depth = if (topic.channels.count() == 0) topic.stream.metric.msgs.value else 0,
+            .message_count = topic.stream.metric.total_msgs.value,
+            .message_bytes = topic.stream.metric.total_bytes.value,
             .paused = topic.paused,
             .channels = channels.items,
             .stream = stream,
@@ -418,11 +418,11 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
         .start_time = broker.started_at / std.time.ns_per_s,
         .topics = topics.items,
         .metric = .{
-            .msgs = broker.metric.msgs,
-            .bytes = broker.metric.bytes,
-            .capacity = broker.metric.capacity,
-            .total_msgs = broker.metric.total_msgs,
-            .total_bytes = broker.metric.total_bytes,
+            .msgs = broker.metric.msgs.value,
+            .bytes = broker.metric.bytes.value,
+            .capacity = broker.metric.capacity.value,
+            .total_msgs = broker.metric.total_msgs.value,
+            .total_bytes = broker.metric.total_bytes.value,
         },
         .producers = &.{},
     };

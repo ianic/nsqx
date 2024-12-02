@@ -90,7 +90,7 @@ pub const Connector = struct {
         var writer = MetricWriter.init(self.allocator, self.prefix);
         errdefer writer.deinit();
         self.broker.writeMetrics(&writer) catch |err| {
-            log.err("broker write metrics error {}", .{err});
+            log.err("broker write metrics error {s}", .{@errorName(err)});
             return;
         };
         self.io.writeMetrics(&writer) catch |err| {
@@ -170,18 +170,30 @@ pub const MetricWriter = struct {
     }
 
     pub fn counter(self: *Self, prefix: []const u8, metric: []const u8, current: usize, previous: usize) !void {
-        const writer = self.list.writer().any();
-        if (self.prefix.len > 0)
-            try writer.print("{s}.{s}.{s}:{d}|c\n", .{ self.prefix, prefix, metric, current -| previous })
-        else
-            try writer.print("{s}.{s}:{d}|c\n", .{ prefix, metric, current -| previous });
+        try self.write(prefix, metric, 'c', current -| previous);
     }
-    pub fn gauge(self: *Self, prefix: []const u8, metric: []const u8, value: usize) !void {
+
+    fn write(self: *Self, prefix: []const u8, metric: []const u8, typ: u8, value: usize) !void {
         const writer = self.list.writer().any();
         if (self.prefix.len > 0)
-            try writer.print("{s}.{s}.{s}:{d}|g\n", .{ self.prefix, prefix, metric, value })
+            try writer.print("{s}.{s}.{s}:{d}|{c}\n", .{ self.prefix, prefix, metric, value, typ })
         else
-            try writer.print("{s}.{s}:{d}|g\n", .{ prefix, metric, value });
+            try writer.print("{s}.{s}:{d}|{c}\n", .{ prefix, metric, value, typ });
+    }
+
+    pub fn gauge(self: *Self, prefix: []const u8, metric: []const u8, value: usize) !void {
+        try self.write(prefix, metric, 'g', value);
+    }
+
+    pub fn add(self: *Self, prefix: []const u8, metric: []const u8, value: anytype) !void {
+        switch (@TypeOf(value)) {
+            Gauge, *Gauge => try self.write(prefix, metric, 'g', value.value),
+            *Counter => {
+                if (value.diff() == 0) return;
+                try self.write(prefix, metric, 'c', value.diffReset());
+            },
+            else => unreachable,
+        }
     }
 
     pub fn toOwned(self: *Self) ![]const u8 {
@@ -226,11 +238,11 @@ fn writeMem(writer: anytype) !void {
     const mi = c.mallinfo2();
 
     try writer.gauge("mem.malloc", "arena", mi.arena);
-    try writer.gauge("mem.malloc", "ordblks", mi.ordblks);
-    try writer.gauge("mem.malloc", "smblks", mi.smblks);
-    try writer.gauge("mem.malloc", "hblks", mi.hblks);
+    // try writer.gauge("mem.malloc", "ordblks", mi.ordblks);
+    // try writer.gauge("mem.malloc", "smblks", mi.smblks);
+    // try writer.gauge("mem.malloc", "hblks", mi.hblks);
     try writer.gauge("mem.malloc", "hblkhd", mi.hblkhd);
-    try writer.gauge("mem.malloc", "usmblks", mi.usmblks);
+    // try writer.gauge("mem.malloc", "usmblks", mi.usmblks);
     try writer.gauge("mem.malloc", "fsmblks", mi.fsmblks);
     try writer.gauge("mem.malloc", "uordblks", mi.uordblks);
     try writer.gauge("mem.malloc", "fordblks", mi.fordblks);
@@ -257,16 +269,16 @@ fn writeStatm(writer: anytype) !void {
     const page_size: usize = 4096;
     const size = intFromStr(iter.next()) * page_size; // vmsize
     const rss = intFromStr(iter.next()) * page_size; // vmrss
-    const share = intFromStr(iter.next()) * page_size; // rssfile
-    const text = intFromStr(iter.next()) * page_size;
-    _ = iter.next();
-    const data = intFromStr(iter.next()) * page_size;
+    // const share = intFromStr(iter.next()) * page_size; // rssfile
+    // const text = intFromStr(iter.next()) * page_size;
+    // _ = iter.next();
+    // const data = intFromStr(iter.next()) * page_size;
 
     try writer.gauge("mem", "size", size);
     try writer.gauge("mem", "rss", rss);
-    try writer.gauge("mem", "share", share);
-    try writer.gauge("mem", "text", text);
-    try writer.gauge("mem", "data", data);
+    // try writer.gauge("mem", "share", share);
+    // try writer.gauge("mem", "text", text);
+    // try writer.gauge("mem", "data", data);
 }
 
 fn intFromStr(str: ?[]const u8) usize {
@@ -303,4 +315,90 @@ test fmtPrefix {
     prefix = try fmtPrefix(allocator, "", "hydra.my.local", 1234);
     try testing.expectEqualStrings("", prefix);
     allocator.free(prefix);
+}
+
+pub const Gauge = struct {
+    const Self = @This();
+
+    value: usize = 0,
+
+    pub fn set(self: *Self, v: usize) void {
+        self.value = v;
+    }
+
+    pub fn inc(self: *Self, v: usize) void {
+        self.value +%= v;
+    }
+
+    pub fn dec(self: *Self, v: usize) void {
+        self.value -|= v;
+    }
+};
+
+pub const Counter = struct {
+    const Self = @This();
+
+    value: usize = 0,
+    prev: usize = 0,
+
+    pub fn inc(self: *Self, v: usize) void {
+        self.value +%= v;
+    }
+
+    pub fn diff(self: Self) usize {
+        return self.value - self.prev;
+    }
+
+    pub fn reset(self: *Self) void {
+        self.prev = self.value;
+    }
+
+    pub fn diffReset(self: *Self) usize {
+        defer self.reset();
+        return self.diff();
+    }
+};
+
+test "write metrics" {
+    {
+        var mv = MetricWriter.init(testing.allocator, "nsq");
+        defer mv.deinit();
+        try mv.gauge("topic", "depth", 123);
+        try mv.counter("topic", "bytes", 789, 456);
+        try testing.expectEqualStrings("nsq.topic.depth:123|g\nnsq.topic.bytes:333|c\n", mv.list.items);
+    }
+    {
+        var mv = MetricWriter.init(testing.allocator, "nsq");
+        defer mv.deinit();
+        var g: Gauge = .{};
+        g.inc(123);
+        try mv.add("topic", "depth", &g);
+        var c: Counter = .{};
+        c.inc(789);
+        c.prev = 456;
+        try mv.add("topic", "bytes", &c);
+        try testing.expectEqualStrings("nsq.topic.depth:123|g\nnsq.topic.bytes:333|c\n", mv.list.items);
+        try testing.expectEqual(789, c.prev);
+    }
+
+    {
+        var mv = MetricWriter.init(testing.allocator, "nsq");
+        defer mv.deinit();
+        var t: struct {
+            g: Gauge = .{},
+            c: Counter = .{},
+
+            fn write(self: *@This(), writer: anytype) !void {
+                try writer.add("topic", "depth", self.g);
+                try writer.add("topic", "bytes", &self.c);
+            }
+        } = .{};
+        t.g.inc(123);
+        t.c.inc(789);
+        t.c.prev = 456;
+        try t.write(&mv);
+        try testing.expectEqualStrings("nsq.topic.depth:123|g\nnsq.topic.bytes:333|c\n", mv.list.items);
+        try testing.expectEqual(789, t.c.prev);
+        try testing.expectEqual(789, t.c.value);
+    }
 }
