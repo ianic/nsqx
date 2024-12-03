@@ -16,3 +16,5 @@ jobs:
         with:
           version: master
       - run: zig build test
+      - run: zig test -lc src/main.zig
+      - run: zig run -lc src/Options.zig -- --max-mem 1G

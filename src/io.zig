@@ -1055,13 +1055,3 @@ const Metric = struct {
         }
     }
 };
-
-test "metric stringify" {
-    var list = std.ArrayList(u8).init(testing.allocator);
-    defer list.deinit();
-    const writer = list.writer().any();
-
-    const m: Metric = .{};
-    try std.json.stringify(m, .{}, writer);
-    std.debug.print("{s}", .{list.items});
-}

@@ -431,9 +431,3 @@ test "write metrics" {
         try testing.expectEqual(789, t.c.value);
     }
 }
-
-test "pero" {
-    const a: usize = 0;
-    const b: usize = std.math.maxInt(usize);
-    std.debug.print("diff: {}\n", .{a -% b});
-}
