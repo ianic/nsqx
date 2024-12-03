@@ -100,3 +100,12 @@ c_allocator:
 [bench_reader] 2024/12/01 14:32:40 duration: 10s - 1748.114mb/s - 9165150.386ops/s - 0.109us/op messages: 92035400
 [bench_writer] 2024/12/01 14:32:50 duration: 10s - 1716.783mb/s - 9000889.721ops/s - 0.111us/op messages: 90019600
 [bench_reader] 2024/12/01 14:32:50 duration: 10s - 1721.559mb/s - 9025929.302ops/s - 0.111us/op messages: 90357178
+
+
+Nakon sto sam malo podesio reader/writer broj thread-ova:
+[bench_writer] 2024/12/03 19:20:39 duration: 10s - 2394.998mb/s - 12556684.697ops/s - 0.080us/op messages: 125569200
+[bench_reader] 2024/12/03 19:20:39 duration: 10s - 2393.980mb/s - 12551349.166ops/s - 0.080us/op messages: 125571400
+[bench_writer] 2024/12/03 19:20:49 duration: 10s - 2342.445mb/s - 12281160.613ops/s - 0.081us/op messages: 122814200
+[bench_reader] 2024/12/03 19:20:49 duration: 10s - 2342.239mb/s - 12280080.484ops/s - 0.081us/op messages: 122827600
+[bench_writer] 2024/12/03 19:20:59 duration: 10s - 2379.734mb/s - 12476659.864ops/s - 0.080us/op messages: 124769800
+[bench_reader] 2024/12/03 19:20:59 duration: 10s - 2379.633mb/s - 12476130.636ops/s - 0.080us/op messages: 124776600
