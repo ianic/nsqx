@@ -74,6 +74,9 @@ const usage =
     \\  --io-recv-buffer-len
     \\        byte size of each io_uring provided buffer (default 64k)
     \\
+    \\  --version
+    \\        print version string
+    \\
 ;
 const Options = @This();
 
@@ -164,7 +167,9 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
         if (eql("help", arg) or eql("h", arg)) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
-
+        } else if (eql("version", arg)) {
+            std.debug.print("nsql {s}\n", .{version});
+            std.process.exit(0);
             // dump data path
         } else if (iter.string("data-path")) |str| {
             opt.data_path = str;
