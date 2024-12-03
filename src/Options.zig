@@ -6,6 +6,8 @@ const time = std.time;
 const math = std.math;
 const maxInt = math.maxInt;
 
+pub const version = "0.1.0";
+
 const usage =
     \\Usage of nsqd:
     \\

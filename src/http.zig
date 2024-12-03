@@ -206,30 +206,24 @@ const bad_request =
     "content-type: text/plain\r\n\r\n" ++
     "Bad Request";
 
-const Info = struct {
-    version: []const u8 = "V2",
-    broadcast_address: []const u8,
-    hostname: []const u8,
-    http_port: u16,
-    tcp_port: u16,
-    start_time: u64,
-    max_heartbeat_interval: u32,
-};
-
 fn jsonInfo(writer: anytype, broker: *Broker, options: Options) !void {
-    var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-    const hostname = try std.posix.gethostname(&hostname_buf);
-    const start_time = broker.started_at / std.time.ns_per_s;
-
-    const info = Info{
-        .broadcast_address = "localhost",
-        .hostname = hostname,
+    const info = struct {
+        version: []const u8,
+        hostname: []const u8,
+        broadcast_address: []const u8,
+        http_port: u16,
+        tcp_port: u16,
+        start_time: u64,
+        max_heartbeat_interval: u32,
+    }{
+        .version = Options.version,
+        .hostname = options.hostname,
+        .broadcast_address = options.broadcastAddress(),
         .http_port = options.http_address.getPort(),
         .tcp_port = options.tcp_address.getPort(),
-        .start_time = start_time,
+        .start_time = broker.started_at / std.time.ns_per_s,
         .max_heartbeat_interval = options.max_heartbeat_interval,
     };
-
     try std.json.stringify(info, .{}, writer);
 }
 
@@ -242,7 +236,6 @@ const Stat = struct {
         paused: bool,
         channels: []Channel,
         e2e_processing_latency: struct { count: usize = 0 } = .{},
-        stream: Stream,
     };
     const Channel = struct {
         channel_name: []const u8,
@@ -255,13 +248,11 @@ const Stat = struct {
         client_count: usize,
         clients: []Client,
         paused: bool,
-        sequence: u64,
         e2e_processing_latency: struct { count: usize = 0 } = .{},
     };
     const Client = struct {
         client_id: []const u8,
         hostname: []const u8,
-        socket: u32,
         user_agent: []const u8,
         version: []const u8 = "V2",
         remote_address: []const u8,
@@ -272,45 +263,20 @@ const Stat = struct {
         finish_count: usize,
         requeue_count: usize,
         connect_ts: usize,
-        msg_timeout: usize,
         pub_counts: []PubCount = &.{},
     };
     const PubCount = struct {
         topic: []const u8,
         count: usize,
     };
-    const Stream = struct {
-        last_sequence: u64,
-        page_size: usize,
-        pages_count: usize,
-        metric: StreamMetric,
-        pages: []Page,
-    };
-    const StreamMetric = struct {
-        msgs: usize,
-        bytes: usize,
-        capacity: usize,
-        total_msgs: usize,
-        total_bytes: usize,
-    };
-    const Page = struct {
-        first_sequence: u64,
-        msgs: usize,
-        bytes: usize,
-        capacity: usize,
-        ref_count: u32,
-    };
 
-    version: []const u8 = "0.1.0",
+    version: []const u8 = Options.version,
     health: []const u8 = "OK",
     start_time: u64,
     topics: []Topic,
-    metric: StreamMetric,
     producers: []Client,
 };
 
-// gauge   - current value, can go up or down
-// counter - summary value since start/creation, only increases
 fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker: *Broker) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -341,7 +307,6 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
                     const remote_address = try std.fmt.allocPrint(allocator, "{}", .{consumer.addr});
                     clients[i] = Stat.Client{
                         .client_id = consumer.identify.client_id,
-                        .socket = @intCast(consumer.socket),
                         .hostname = consumer.identify.hostname,
                         .user_agent = consumer.identify.user_agent,
                         .remote_address = remote_address,
@@ -351,7 +316,6 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
                         .finish_count = consumer.metric.finish,
                         .requeue_count = consumer.metric.requeue,
                         .connect_ts = consumer.metric.connected_at / std.time.ns_per_s,
-                        .msg_timeout = consumer.identify.msg_timeout,
                     };
                 }
                 break :brk clients;
@@ -359,59 +323,17 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
 
             try channels.append(Stat.Channel{
                 .channel_name = channel.name,
-                // Current number of messages published to the topic but not
-                // processed by this channel.
-                .depth = channel.metric.depth.value, // gauge
-                // Current number of in-flight messages, sent to the client but
-                // not fin jet.
-                .in_flight_count = channel.in_flight.count(), // gauge
-                // Current number of messages in the deferred queue. Message can be
-                // deferred by the client (re-queue action), by timeout while
-                // in-flight, or by producer (defer publish).
-                .deferred_count = channel.deferred.count(), // gauge
-                // Total number of messages finished by the clinet(s).
-                .message_count = channel.metric.finish.value, // counter
-                // Total number of messages re-queued by the client(s).
-                .requeue_count = channel.metric.requeue.value, // counter
-                // Total number of messages timed-out while in-flight.
-                .timeout_count = channel.metric.timeout.value, // counter
-                // Current number of connected clients.
-                .client_count = client_count, // gauge
+                .depth = channel.metric.depth.value,
+                .in_flight_count = channel.in_flight.count(),
+                .deferred_count = channel.deferred.count(),
+                .message_count = channel.metric.finish.value,
+                .requeue_count = channel.metric.requeue.value,
+                .timeout_count = channel.metric.timeout.value,
+                .client_count = client_count,
                 .paused = channel.paused,
-                .sequence = channel.sequence,
                 .clients = clients,
             });
         }
-
-        var pages = try std.ArrayList(Stat.Page).initCapacity(allocator, topic.stream.pages.items.len);
-        var message_count: usize = 0;
-        var message_bytes: usize = 0;
-        for (topic.stream.pages.items) |page| {
-            if (args.includePages()) {
-                try pages.append(.{
-                    .first_sequence = page.first_sequence,
-                    .msgs = page.messagesCount(),
-                    .bytes = page.bytesSize(),
-                    .capacity = page.capacity(),
-                    .ref_count = page.ref_count,
-                });
-            }
-            message_count += page.messagesCount();
-            message_bytes += page.bytesSize();
-        }
-        const stream = Stat.Stream{
-            .last_sequence = topic.stream.last_sequence,
-            .page_size = topic.stream.page_size,
-            .metric = .{
-                .msgs = topic.stream.metric.msgs.value,
-                .bytes = topic.stream.metric.bytes.value,
-                .capacity = topic.stream.metric.capacity.value,
-                .total_msgs = topic.stream.metric.total_msgs.value,
-                .total_bytes = topic.stream.metric.total_bytes.value,
-            },
-            .pages_count = topic.stream.pages.items.len,
-            .pages = pages.items,
-        };
 
         try topics.append(.{
             .topic_name = topic.name,
@@ -420,20 +342,12 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
             .message_bytes = topic.stream.metric.total_bytes.value,
             .paused = topic.paused,
             .channels = channels.items,
-            .stream = stream,
         });
     }
 
     const stat = Stat{
         .start_time = broker.started_at / std.time.ns_per_s,
         .topics = topics.items,
-        .metric = .{
-            .msgs = broker.metric.msgs.value,
-            .bytes = broker.metric.bytes.value,
-            .capacity = broker.metric.capacity.value,
-            .total_msgs = broker.metric.total_msgs.value,
-            .total_bytes = broker.metric.total_bytes.value,
-        },
         .producers = &.{},
     };
 
@@ -565,18 +479,11 @@ const Command = union(enum) {
         channel: []const u8 = &.{},
         format: []const u8 = &.{},
         include_clients: []const u8 = &.{},
-        include_pages: []const u8 = &.{},
 
         fn includeClients(self: Stats) bool {
             if (mem.eql(u8, self.include_clients, "false") or
                 mem.eql(u8, self.include_clients, "0")) return false;
             return true;
-        }
-
-        fn includePages(self: Stats) bool {
-            if (mem.eql(u8, self.include_pages, "true") or
-                mem.eql(u8, self.include_pages, "1")) return true;
-            return false;
         }
     };
 };
@@ -590,7 +497,6 @@ fn parse(target: []const u8) !Command {
             .channel = try nameOrEmpty(queryStringValue(qs, "channel")),
             .format = queryStringValue(qs, "format"),
             .include_clients = queryStringValue(qs, "include_clients"),
-            .include_pages = queryStringValue(qs, "include_pages"),
         } };
     }
     if (mem.startsWith(u8, target, "/info")) return .{ .info = {} };

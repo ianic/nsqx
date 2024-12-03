@@ -50,7 +50,7 @@ reader_pid=$!
     --nsqd-http-address localhost:4151 \
     --graphite-url 'http://localhost:8080' \
     --statsd-prefix "nsq" \
-    --statsd-interval 5s \
+    --statsd-interval 10s \
     --statsd-counter-format 'stats.%s' \
         >> /dev/null 2>&1 &
 admin_pid=$!
