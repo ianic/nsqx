@@ -200,8 +200,8 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
             opt.statsd.address = addr;
         } else if (iter.string("statsd-prefix")) |str| {
             opt.statsd.prefix = str;
-        } else if (iter.int("statsd-udp-packet-size", u16)) |size| {
-            opt.statsd.udp_packet_size = size;
+        } else if (iter.byteSize(u16, "statsd-udp-packet-size")) |size| {
+            if (size != 0) opt.statsd.udp_packet_size = size;
         } else if (iter.durationMs("statsd-interval")) |d| {
             opt.statsd.interval = d;
 
@@ -323,8 +323,11 @@ const ArgIterator = struct {
     fn byteSize(self: *Self, comptime T: type, flag: []const u8) ?T {
         if (eql(flag, self.arg)) {
             const val = self.value();
-            return parseByteSize(T, val) catch {
-                fatal("unable to parse byte size '{s}', valid format: 123K, 456M, 789G", .{val});
+            return parseByteSize(T, val) catch |err| {
+                fatal(
+                    "{s}, parsing byte size '{s}', valid format: 123k, 456M, 789G",
+                    .{ @errorName(err), val },
+                );
             };
         }
         return null;
@@ -420,7 +423,7 @@ pub fn main() !void {
     std.debug.print("\n", .{});
 
     // broker options
-    std.debug.print("max_msg_size: {}\n", .{opt.max_msg_size});
+    std.debug.print("max_msg_size: {}\n", .{opt.broker.max_msg_size});
     std.debug.print("max_mem: {} {}G\n", .{ opt.broker.max_mem, opt.broker.max_mem / 1024 / 1024 / 1024 });
     std.debug.print("max_topic_mem: {}\n", .{opt.broker.max_topic_mem});
     std.debug.print("initial_page_size: {}\n", .{opt.broker.initial_page_size});
@@ -486,9 +489,9 @@ fn parseByteSize(comptime T: type, arg: []const u8) !T {
     const unit: T = switch (arg[unit_pos]) {
         'b', 'B' => 1,
         'k', 'K' => 1024,
-        'm', 'M' => 1024 * 1024,
-        'g', 'G' => 1024 * 1024 * 1024,
-        't', 'T' => if (@sizeOf(T) > 4) 1024 * 1024 * 1024 * 1024 else 0,
+        'm', 'M' => if (@sizeOf(T) > 2) 1024 * 1024 else return error.Overflow,
+        'g', 'G' => if (@sizeOf(T) > 2) 1024 * 1024 * 1024 else return error.Overflow,
+        't', 'T' => if (@sizeOf(T) > 4) 1024 * 1024 * 1024 * 1024 else return error.Overflow,
         else => brk: {
             unit_pos += 1;
             break :brk 1;

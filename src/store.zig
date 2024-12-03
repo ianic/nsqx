@@ -213,6 +213,21 @@ pub const Metric = struct {
         self.bytes.dec(bytes);
         if (self.parent) |parent| parent.dec(msgs, bytes);
     }
+
+    pub fn jsonStringify(self: *const Metric, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("msgs");
+        try jws.write(self.msgs);
+        try jws.objectField("bytes");
+        try jws.write(self.bytes);
+        try jws.objectField("capacity");
+        try jws.write(self.capacity);
+        try jws.objectField("total_msgs");
+        try jws.write(self.total_msgs);
+        try jws.objectField("total_bytes");
+        try jws.write(self.total_bytes);
+        try jws.endObject();
+    }
 };
 
 pub const Stream = struct {

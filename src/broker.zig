@@ -38,7 +38,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
         started_at: u64,
         metric: store.Metric = .{},
-        metric_prev: store.Metric = .{},
 
         timer_queue: timer.Queue,
 
@@ -180,6 +179,10 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
         }
 
         // Metrics, dump, restore -----------------
+
+        pub fn timeNow(_: *Broker) u64 {
+            return time.now;
+        }
 
         pub fn writeMetrics(self: *Broker, writer: anytype) !void {
             var buf: [6 + protocol.max_name_len + 9 + protocol.max_name_len]u8 = undefined; // to fit: "topic.{s}.channel.{s}"

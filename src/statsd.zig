@@ -97,7 +97,7 @@ pub const Connector = struct {
             log.err("io write metrics error {}", .{err});
             return;
         };
-        writeMem(&writer) catch |err| {
+        writeMalloc(&writer) catch |err| {
             log.err("mem write metrics error {}", .{err});
             return;
         };
@@ -189,7 +189,7 @@ pub const MetricWriter = struct {
         switch (@TypeOf(value)) {
             Gauge, *Gauge => try self.write(prefix, metric, 'g', value.value),
             *Counter => {
-                if (value.diff() == 0) return;
+                //if (value.diff() == 0) return;
                 try self.write(prefix, metric, 'c', value.diffReset());
             },
             else => unreachable,
@@ -233,7 +233,7 @@ pub const MetricWriter = struct {
 ///  keepcost  The total amount of releasable free space at the top of the heap.  This  is  the
 ///            maximum  number  of  bytes  that  could  ideally  (i.e., ignoring page alignment
 ///            restrictions, and so on) be released by malloc_trim(3).
-fn writeMem(writer: anytype) !void {
+fn writeMalloc(writer: anytype) !void {
     const c = @cImport(@cInclude("malloc.h"));
     const mi = c.mallinfo2();
 
@@ -260,6 +260,23 @@ fn writeMem(writer: anytype) !void {
 ///   data       (6) data + stack
 ///   dt         (7) dirty pages (unused in Linux 2.6)
 fn writeStatm(writer: anytype) !void {
+    const m = try getStatm();
+    try writer.gauge("mem", "size", m.size);
+    try writer.gauge("mem", "rss", m.rss);
+    // try writer.gauge("mem", "share", share);
+    // try writer.gauge("mem", "text", text);
+    // try writer.gauge("mem", "data", data);
+}
+
+pub const Statm = struct {
+    size: usize,
+    rss: usize,
+    share: usize,
+    text: usize,
+    data: usize,
+};
+
+pub fn getStatm() !Statm {
     var file = try std.fs.openFileAbsolute("/proc/self/statm", .{});
     defer file.close();
     var buf: [64]u8 = undefined;
@@ -269,16 +286,18 @@ fn writeStatm(writer: anytype) !void {
     const page_size: usize = 4096;
     const size = intFromStr(iter.next()) * page_size; // vmsize
     const rss = intFromStr(iter.next()) * page_size; // vmrss
-    // const share = intFromStr(iter.next()) * page_size; // rssfile
-    // const text = intFromStr(iter.next()) * page_size;
-    // _ = iter.next();
-    // const data = intFromStr(iter.next()) * page_size;
+    const share = intFromStr(iter.next()) * page_size; // rssfile
+    const text = intFromStr(iter.next()) * page_size;
+    _ = iter.next();
+    const data = intFromStr(iter.next()) * page_size;
 
-    try writer.gauge("mem", "size", size);
-    try writer.gauge("mem", "rss", rss);
-    // try writer.gauge("mem", "share", share);
-    // try writer.gauge("mem", "text", text);
-    // try writer.gauge("mem", "data", data);
+    return .{
+        .size = size,
+        .rss = rss,
+        .share = share,
+        .text = text,
+        .data = data,
+    };
 }
 
 fn intFromStr(str: ?[]const u8) usize {
@@ -333,20 +352,26 @@ pub const Gauge = struct {
     pub fn dec(self: *Self, v: usize) void {
         self.value -|= v;
     }
+
+    pub fn jsonStringify(self: *const Self, jws: anytype) !void {
+        try jws.write(self.value);
+    }
 };
 
 pub const Counter = struct {
     const Self = @This();
 
+    const initial = std.math.maxInt(usize);
     value: usize = 0,
-    prev: usize = 0,
+    prev: usize = initial,
 
     pub fn inc(self: *Self, v: usize) void {
         self.value +%= v;
     }
 
     pub fn diff(self: Self) usize {
-        return self.value - self.prev;
+        if (self.prev == initial) return self.value;
+        return self.value -% self.prev;
     }
 
     pub fn reset(self: *Self) void {
@@ -356,6 +381,10 @@ pub const Counter = struct {
     pub fn diffReset(self: *Self) usize {
         defer self.reset();
         return self.diff();
+    }
+
+    pub fn jsonStringify(self: *const Self, jws: anytype) !void {
+        try jws.write(self.value);
     }
 };
 
@@ -401,4 +430,10 @@ test "write metrics" {
         try testing.expectEqual(789, t.c.prev);
         try testing.expectEqual(789, t.c.value);
     }
+}
+
+test "pero" {
+    const a: usize = 0;
+    const b: usize = std.math.maxInt(usize);
+    std.debug.print("diff: {}\n", .{a -% b});
 }

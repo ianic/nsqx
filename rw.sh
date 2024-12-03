@@ -22,11 +22,19 @@ go build
 cd ~/Code/nsql
 rm -f ./tmp/nsql.dump ./tmp/sub_bench
 
-./zig-out/bin/nsql --data-path ./tmp --max-mem=4G --statsd-address localhost --statsd-prefix "" > tmp/nsql 2>&1 &
+./zig-out/bin/nsql \
+    --data-path ./tmp \
+    --max-mem=4G \
+    --statsd-address localhost \
+    --statsd-prefix "nsq" \
+    --statsd-udp-packet-size 8k \
+    > tmp/nsql 2>&1 &
+nsqd_pid=$!
+
 # ./zig-out/bin/nsql --data-path ./tmp --max-mem=40G > tmp/nsql 2>&1 &
 # sudo valgrind --tool=callgrind ./zig-out/bin/nsql --data-path ./tmp > tmp/nsql 2>&1 &
 # ~/Code/go/nsq/apps/nsqd/nsqd --mem-queue-size=100000000 > tmp/nsql 2>&1 &
-nsqd_pid=$!
+
 
 #sh -c 'while pkill -usr1 nsql; do sleep 10; done' &
 #stat_pid=$!
@@ -38,7 +46,13 @@ writer_pid=$!
 sh -c 'while ~/Code/go/nsq/bench/bench_reader/bench_reader --size 200 --runfor 10s; do : ; done' &
 reader_pid=$!
 
-~/Code/go/nsq/build/nsqadmin --nsqd-http-address localhost:4151 >> /dev/null 2>&1 &
+~/Code/go/nsq/build/nsqadmin \
+    --nsqd-http-address localhost:4151 \
+    --graphite-url 'http://localhost:8080' \
+    --statsd-prefix "nsq" \
+    --statsd-interval 5s \
+    --statsd-counter-format 'stats.%s' \
+        >> /dev/null 2>&1 &
 admin_pid=$!
 
 cleanup() {

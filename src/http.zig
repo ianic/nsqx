@@ -111,6 +111,16 @@ pub const Conn = struct {
         switch (cmd) {
             .stats => |args| try jsonStat(self.gpa, args, writer, broker),
             .info => try jsonInfo(writer, broker, self.listener.options),
+            .metric => |args| {
+                var arena = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena.deinit();
+                const allocator = arena.allocator();
+                switch (args) {
+                    .io => try metricIo(writer, self.io),
+                    .mem => try metricMem(writer),
+                    .broker => try metricBroker(allocator, broker, writer),
+                }
+            },
 
             .topic_create => |name| try broker.createTopic(name),
             .topic_delete => |name| try broker.deleteTopic(name),
@@ -431,6 +441,96 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
     return;
 }
 
+fn metricIo(writer: anytype, io: *Io) !void {
+    try std.json.stringify(io.metric, .{}, writer);
+}
+
+fn metricMem(writer: anytype) !void {
+    const statsd = @import("statsd.zig");
+    const c = @cImport(@cInclude("malloc.h"));
+    const mi = c.mallinfo2();
+
+    const m = struct {
+        malloc: c.struct_mallinfo2,
+        statm: statsd.Statm,
+    }{
+        .malloc = mi,
+        .statm = try statsd.getStatm(),
+    };
+
+    try std.json.stringify(m, .{}, writer);
+}
+
+fn metricBroker(allocator: mem.Allocator, broker: *Broker, writer: anytype) !void {
+    const Channel = struct {
+        name: []const u8,
+        depth: usize,
+        in_flight: usize,
+        finish: usize,
+        deferred: usize,
+        requeue: usize,
+        timeout: usize,
+        clients: usize,
+        sequence: u64,
+    };
+    const Topic = struct {
+        name: []const u8,
+        sequence: u64,
+        page_size: u32,
+        pages: usize,
+        metric: store.Metric,
+        channels: []Channel,
+    };
+
+    var topics = try std.ArrayList(Topic).initCapacity(allocator, broker.topics.count());
+
+    var iter = broker.topics.valueIterator();
+    while (iter.next()) |e| {
+        const topic = e.*;
+
+        var channels = try std.ArrayList(Channel).initCapacity(allocator, topic.channels.count());
+
+        var ci = topic.channels.valueIterator();
+        while (ci.next()) |ce| {
+            const channel = ce.*;
+            try channels.append(.{
+                .name = channel.name,
+                .depth = channel.metric.depth.value,
+                .in_flight = channel.in_flight.count(),
+                .deferred = channel.deferred.count(),
+                .finish = channel.metric.finish.value,
+                .requeue = channel.metric.requeue.value,
+                .timeout = channel.metric.timeout.value,
+                .clients = channel.consumers.items.len,
+                .sequence = channel.sequence,
+            });
+        }
+
+        try topics.append(.{
+            .name = topic.name,
+            .sequence = topic.stream.last_sequence,
+            .page_size = topic.stream.page_size,
+            .pages = topic.stream.pages.items.len,
+            .metric = topic.stream.metric,
+            .channels = channels.items,
+        });
+    }
+
+    const m = struct {
+        start_time: u64,
+        now: u64,
+        metric: store.Metric,
+        topics: []Topic,
+    }{
+        .start_time = broker.started_at / std.time.ns_per_ms,
+        .now = broker.timeNow() / std.time.ns_per_ms,
+        .metric = broker.metric,
+        .topics = topics.items,
+    };
+
+    try std.json.stringify(m, .{}, writer);
+}
+
 const Command = union(enum) {
     topic_create: []const u8,
     topic_delete: []const u8,
@@ -446,6 +546,14 @@ const Command = union(enum) {
 
     stats: Stats,
     info: void,
+
+    metric: Metric,
+
+    const Metric = union(enum) {
+        io: void,
+        mem: void,
+        broker: void,
+    };
 
     const Channel = struct {
         topic_name: []const u8,
@@ -534,6 +642,12 @@ fn parse(target: []const u8) !Command {
                 .topic_name = try findName(target[16..], "topic"),
                 .name = try findName(target[16..], "channel"),
             } };
+    }
+
+    if (mem.startsWith(u8, target, "/metric")) {
+        if (mem.startsWith(u8, target[7..], "/io")) return .{ .metric = .io };
+        if (mem.startsWith(u8, target[7..], "/mem")) return .{ .metric = .mem };
+        if (mem.startsWith(u8, target[7..], "/broker")) return .{ .metric = .broker };
     }
 
     return error.UnknownCommand;

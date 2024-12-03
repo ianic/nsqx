@@ -999,6 +999,21 @@ const Metric = struct {
             try writer.add(prefix, "restarted", &self.restarted);
             try writer.gauge(prefix, "active", self.active());
         }
+
+        pub fn jsonStringify(self: *const Counter, jws: anytype) !void {
+            try jws.beginObject();
+            try jws.objectField("active");
+            try jws.write(self.active());
+            try jws.objectField("submit");
+            try jws.write(self.submitted);
+            try jws.objectField("complete");
+            try jws.write(self.completed);
+            if (self.restarted.value > 0) {
+                try jws.objectField("restart");
+                try jws.write(self.restarted);
+            }
+            try jws.endObject();
+        }
     };
 
     fn submit(self: *Metric, kind: Op.Kind) void {
@@ -1040,3 +1055,13 @@ const Metric = struct {
         }
     }
 };
+
+test "metric stringify" {
+    var list = std.ArrayList(u8).init(testing.allocator);
+    defer list.deinit();
+    const writer = list.writer().any();
+
+    const m: Metric = .{};
+    try std.json.stringify(m, .{}, writer);
+    std.debug.print("{s}", .{list.items});
+}
