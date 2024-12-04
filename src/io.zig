@@ -788,6 +788,7 @@ pub const SendOp = struct {
     /// Prepare single buffer to be sent. Puts data into next iov.
     pub fn prep(self: *Self, data: []const u8) void {
         assert(!self.op.active());
+        assert(data.len > 0);
         const n: usize = @intCast(self.msghdr.iovlen);
         self.iov[n] = .{ .base = data.ptr, .len = data.len };
         self.msghdr.iovlen += 1;

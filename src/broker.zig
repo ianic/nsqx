@@ -562,7 +562,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                 fn emptyChannel(self: *Topic, name: []const u8) !void {
                     const channel = self.channels.get(name) orelse return error.NotFound;
-                    try channel.empty();
+                    channel.empty();
                 }
 
                 // -----------------
@@ -978,7 +978,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     self.wakeup();
                 }
 
-                fn empty(self: *Channel) !void {
+                fn empty(self: *Channel) void {
                     { // release in_flight messages
                         var iter = self.in_flight.keyIterator();
                         while (iter.next()) |e| {
@@ -994,8 +994,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         self.deferred.shrinkAndFree(0);
                     }
                     { // move stream pointer
+                        const last = self.topic.stream.subscribe(.new);
                         self.topic.stream.unsubscribe(self.sequence);
-                        self.sequence = self.topic.stream.subscribe(.new);
+                        self.sequence = last;
                         self.metric.depth.set(0);
                     }
                 }
@@ -1557,7 +1558,7 @@ test "channel empty" {
     try consumer.pull();
     try consumer.pull();
     try testing.expectEqual(2, channel.in_flight.count());
-    try channel.empty();
+    channel.empty();
     try testing.expectEqual(0, channel.in_flight.count());
 
     time.now = 0;
@@ -1736,7 +1737,7 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try channel2_consumer1.pull();
     try testing.expectEqual(3, channel2_consumer1.lastSequence());
 
-    try channel2.empty();
+    channel2.empty();
     try testing.expectEqual(0, channel2.in_flight.count());
     try broker.deleteTopic(topic_name);
 }

@@ -74,7 +74,7 @@ pub const Conn = struct {
             const body = try body_bytes.toOwnedSlice();
             const header = try std.fmt.allocPrint(allocator, header_template, .{ body.len, "application/json" });
             self.send_op.prep(header);
-            self.send_op.prep(body);
+            if (body.len > 0) self.send_op.prep(body);
         } else |err| {
             log.warn("request failed {}", .{err});
             const header = switch (err) {
