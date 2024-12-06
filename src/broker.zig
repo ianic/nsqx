@@ -987,11 +987,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         self.in_flight.clearAndFree();
                     }
                     { // release deferred messages
-                        var iter = self.deferred.iterator();
-                        while (iter.next()) |dm| {
+                        while (self.deferred.removeOrNull()) |dm|
                             self.topic.stream.release(dm.sequence);
-                        }
-                        self.deferred.shrinkAndFree(0);
                     }
                     { // move stream pointer
                         const last = self.topic.stream.subscribe(.new);
@@ -1553,13 +1550,22 @@ test "channel empty" {
     time.now = 1;
     try broker.publish(topic_name, "message 1");
     try broker.publish(topic_name, "message 2");
+    try broker.publish(topic_name, "message 3");
+    try broker.publish(topic_name, "message 4");
 
     time.now = 2;
     try consumer.pull();
     try consumer.pull();
+    try consumer.pull();
+    try consumer.requeue(1, 0);
     try testing.expectEqual(2, channel.in_flight.count());
+    try testing.expectEqual(1, channel.deferred.count());
+    try testing.expectEqual(3, channel.sequence);
+
     channel.empty();
     try testing.expectEqual(0, channel.in_flight.count());
+    try testing.expectEqual(0, channel.deferred.count());
+    try testing.expectEqual(4, channel.sequence);
 
     time.now = 0;
 }
