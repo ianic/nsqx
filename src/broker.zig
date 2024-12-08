@@ -655,6 +655,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         consumer.shutdown();
                     }
                     self.consumers.clearAndFree();
+                    self.releasePending();
                     self.deinit();
                 }
 
@@ -979,6 +980,16 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 fn empty(self: *Channel) void {
+                    self.releasePending();
+                    { // move stream pointer
+                        const last = self.topic.stream.subscribe(.new);
+                        self.topic.stream.unsubscribe(self.sequence);
+                        self.sequence = last;
+                        self.metric.depth.set(0);
+                    }
+                }
+
+                fn releasePending(self: *Channel) void {
                     { // release in_flight messages
                         var iter = self.in_flight.keyIterator();
                         while (iter.next()) |e| {
@@ -989,12 +1000,6 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     { // release deferred messages
                         while (self.deferred.removeOrNull()) |dm|
                             self.topic.stream.release(dm.sequence);
-                    }
-                    { // move stream pointer
-                        const last = self.topic.stream.subscribe(.new);
-                        self.topic.stream.unsubscribe(self.sequence);
-                        self.sequence = last;
-                        self.metric.depth.set(0);
                     }
                 }
             };

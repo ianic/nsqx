@@ -183,7 +183,7 @@ pub const Metric = struct {
     fn ensureCapacity(self: *Metric, size: usize) !void {
         if (self.capacity.value + size > self.max_mem) {
             log.err("max memory reached; {} bytes", .{self.max_mem});
-            return error.StreamOutOfMemory;
+            return error.StreamMemoryLimit;
         }
         if (self.parent) |parent| try parent.ensureCapacity(size);
     }

@@ -304,7 +304,7 @@ pub const Conn = struct {
                     error.MessageSizeOverflow,
                     error.BadMessage,
                     => try self.respond(.bad_message),
-                    error.StreamOutOfMemory => try self.respond(.pub_failed),
+                    error.StreamMemoryLimit => try self.respond(.pub_failed),
                     error.MessageNotInFlight => {
                         switch (msg) {
                             .finish => try self.respond(.fin_failed),

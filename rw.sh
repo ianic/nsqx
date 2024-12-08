@@ -1,4 +1,29 @@
 #!/bin/bash
+
+
+# reference: https://stackoverflow.com/questions/3601515/how-to-check-if-a-variable-is-set-in-bash
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -s|--silent)
+      SILENT=YES
+      shift # past argument
+      ;;
+    -c|--clear)
+      CLEAR=YES
+      shift # past argument
+      ;;
+    -*|--*)
+      echo "Unknown option $1"
+      exit 1
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1") # save positional arg
+      shift # past argument
+      ;;
+  esac
+done
+
 # set -u
 set -m
 
@@ -10,21 +35,23 @@ set -e
 
 cd ~/Code/nsql
 zig build -Doptimize=ReleaseFast
-#zig build
+#zig build -Doptimize=ReleaseSmall
+
 
 cd ~/Code/go/nsq/bench/bench_writer/
 go build
 cd ~/Code/go/nsq/bench/bench_reader/
 go build
-
-
-
 cd ~/Code/nsql
-rm -f ./tmp/nsql.dump ./tmp/sub_bench
 
-./zig-out/bin/nsql \
+if [ ! -z ${CLEAR+x} ]; then # if clear is set
+    rm -f ./tmp/nsql.dump ./tmp/sub_bench
+fi
+
+# ./zig-out/bin/nsql \
+sudo valgrind --tool=callgrind ./zig-out/bin/nsql \
     --data-path ./tmp \
-    --max-mem=4G \
+    --max-mem=16G \
     --statsd-address localhost \
     --statsd-prefix "nsq" \
     --statsd-udp-packet-size 8k \
@@ -39,12 +66,16 @@ nsqd_pid=$!
 #sh -c 'while pkill -usr1 nsql; do sleep 10; done' &
 #stat_pid=$!
 
-sleep 1
 
-sh -c 'while ~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 10s ; do : ; done' &
-writer_pid=$!
-sh -c 'while ~/Code/go/nsq/bench/bench_reader/bench_reader --size 200 --runfor 10s; do : ; done' &
-reader_pid=$!
+
+if [ -z ${SILENT+x} ]; then
+    sleep 1
+    workers=6
+    #sh -c "while ~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 10s --workers $workers ; do : ; done" &
+    #writer_pid=$!
+    sh -c "while ~/Code/go/nsq/bench/bench_reader/bench_reader --runfor 10s --workers $workers ; do : ; done" &
+    reader_pid=$!
+fi
 
 ~/Code/go/nsq/build/nsqadmin \
     --nsqd-http-address localhost:4151 \
@@ -81,6 +112,40 @@ exit 0
 
 cd ~/Code/go/nsq/bench/bench_writer/
 go build
-~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 2s
+~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 1s
 
 ~/Code/go/nsq/bench/bench_reader/bench_reader --size 200 --runfor 10s
+
+for i in $(seq 1 32); do
+    echo running $i writer workers
+    ~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 1s --workers $i
+
+    curl -s "http://localhost:4151/topic/empty?topic=sub_bench"
+    #curl -s "http://localhost:4151/channel/empty?topic=sub_bench&channel=ch"
+    #curl -s "http://localhost:4151/channel/delete?topic=sub_bench&channel=ch"
+    # ~/Code/go/nsq/bench/bench_reader/bench_reader --size 200 --runfor 2s
+done
+
+
+for i in $(seq 1 32); do
+    echo running $i writer workers
+    sh -c "~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 1s --workers $i" &
+    ~/Code/go/nsq/bench/bench_reader/bench_reader --size 200 --runfor 1s --workers $i
+
+    curl -s "http://localhost:4151/topic/empty?topic=sub_bench"
+    curl -s "http://localhost:4151/channel/empty?topic=sub_bench&channel=ch"
+    # curl -s "http://localhost:4151/channel/delete?topic=sub_bench&channel=ch"
+done
+
+workers=6
+sh -c "while ~/Code/go/nsq/bench/bench_reader/bench_reader --runfor 10s --workers $workers ; do : ; done" &
+for (( i=1; i<=1024*1024; i=i*2 )); do
+    echo size $i
+    ~/Code/go/nsq/bench/bench_writer/bench_writer --size $i --runfor 1s --workers $workers
+done
+
+
+curl -s http://localhost:4151/metric/broker
+curl -s http://localhost:4151/metric/mem
+curl -s http://localhost:4151/metric/io
+watch -n1 "curl -s 'http://localhost:4151/metric/broker'  | jq"

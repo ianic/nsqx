@@ -16,7 +16,7 @@ const timer = @import("timer.zig");
 pub const Broker = @import("broker.zig").BrokerType(tcp.Conn, lookup.Connector);
 
 pub const std_options = std.Options{
-    .log_level = if (builtin.mode == .ReleaseFast) .warn else .debug,
+    .log_level = if (builtin.mode == .Debug) .debug else .warn,
 };
 
 const log = std.log.scoped(.main);
