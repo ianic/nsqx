@@ -48,8 +48,8 @@ if [ ! -z ${CLEAR+x} ]; then # if clear is set
     rm -f ./tmp/nsql.dump ./tmp/sub_bench
 fi
 
-# ./zig-out/bin/nsql \
-sudo valgrind --tool=callgrind ./zig-out/bin/nsql \
+# sudo valgrind --tool=callgrind ./zig-out/bin/nsql \
+./zig-out/bin/nsql \
     --data-path ./tmp \
     --max-mem=16G \
     --statsd-address localhost \
@@ -71,8 +71,8 @@ nsqd_pid=$!
 if [ -z ${SILENT+x} ]; then
     sleep 1
     workers=6
-    #sh -c "while ~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 10s --workers $workers ; do : ; done" &
-    #writer_pid=$!
+    sh -c "while ~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 10s --workers $workers ; do : ; done" &
+    writer_pid=$!
     sh -c "while ~/Code/go/nsq/bench/bench_reader/bench_reader --runfor 10s --workers $workers ; do : ; done" &
     reader_pid=$!
 fi
@@ -149,3 +149,7 @@ curl -s http://localhost:4151/metric/broker
 curl -s http://localhost:4151/metric/mem
 curl -s http://localhost:4151/metric/io
 watch -n1 "curl -s 'http://localhost:4151/metric/broker'  | jq"
+
+
+~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 5s --workers 6
+while ~/Code/go/nsq/bench/bench_reader/bench_reader --runfor 1s --workers 6; do : ; done
