@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const mem = std.mem;
 const fmt = std.fmt;
 const net = std.net;
@@ -608,3 +609,18 @@ pub const msg_id = struct {
         mem.writeInt(u64, buf[8..16], sequence, .big); // 8 bytes, sequence
     }
 };
+
+pub const header_len = 34;
+pub fn writeHeader(
+    buf: []u8,
+    body_size: u32,
+    timestamp: u64,
+    sequence: u64,
+) void {
+    assert(buf.len >= header_len);
+    mem.writeInt(u32, buf[0..4], body_size + 30, .big); // size (without 4 bytes size field)
+    mem.writeInt(u32, buf[4..8], @intFromEnum(FrameType.message), .big); // frame type
+    mem.writeInt(u64, buf[8..16], timestamp, .big); // timestamp
+    mem.writeInt(u16, buf[16..18], 1, .big); // attempts
+    msg_id.write(buf[18..34], sequence); // sequence
+}

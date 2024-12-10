@@ -456,22 +456,15 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         );
                         return error.MessageSizeOverflow;
                     }
-                    const res = try self.stream.alloc(@intCast(data.len + 34));
-                    const header = res.data[0..34];
-                    const body = res.data[34..];
-                    {
-                        mem.writeInt(u32, header[0..4], @intCast(data.len + 30), .big); // size (without 4 bytes size field)
-                        mem.writeInt(u32, header[4..8], @intFromEnum(protocol.FrameType.message), .big); // frame type
-                        mem.writeInt(u64, header[8..16], time.now, .big); // timestamp
-                        mem.writeInt(u16, header[16..18], 1, .big); // attempts
-                        protocol.msg_id.write(header[18..34], res.sequence); // msg id
-                    }
+                    const res = try self.stream.alloc(@intCast(protocol.header_len + data.len));
+                    protocol.writeHeader(res.data, @intCast(data.len), time.now, res.sequence);
+                    const body = res.data[protocol.header_len..];
                     @memcpy(body, data);
                 }
 
                 fn publish(self: *Topic, data: []const u8) !void {
                     try self.appendStream(data);
-                    self.notifyChannels(1);
+                    self.onPublish(1);
                 }
 
                 fn deferredPublish(self: *Topic, data: []const u8, delay: u32) !void {
@@ -518,15 +511,15 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         try self.appendStream(data[pos..][0..len]);
                         pos += len;
                     }
-                    self.notifyChannels(msgs);
+                    self.onPublish(msgs);
                 }
 
-                // Notify all channels that there is pending messages
-                fn notifyChannels(self: *Topic, msgs: u32) void {
+                // Notify all channels that there are pending messages
+                fn onPublish(self: *Topic, msgs: u32) void {
                     var iter = self.channels.valueIterator();
                     while (iter.next()) |ptr| {
                         const channel = ptr.*;
-                        channel.onTopicAppend(msgs);
+                        channel.onPublish(msgs);
                     }
                 }
 
@@ -678,7 +671,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 // -----------------
 
                 // Called from topic when new topic message is created.
-                fn onTopicAppend(self: *Channel, msgs: u32) void {
+                fn onPublish(self: *Channel, msgs: u32) void {
                     self.metric.depth.inc(msgs);
                     if (!self.needWakeup()) return;
                     self.wakeup();
@@ -948,23 +941,21 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         self.topic.removeEphemeralChannel(self);
                 }
 
-                // Re-queue all messages which are in-flight on some consumer.
+                // Re-queue all messages which are in-flight for some consumer.
                 fn requeueAll(self: *Channel, consumer_id: u32) !void {
                     var sequences = std.ArrayList(u64).init(self.allocator);
                     defer sequences.deinit();
+
                     var iter = self.in_flight.iterator();
                     while (iter.next()) |e| {
-                        if (e.value_ptr.consumer_id == consumer_id) {
-                            const sequence = e.key_ptr.*;
-                            try sequences.append(sequence);
-                        }
+                        if (e.value_ptr.consumer_id == consumer_id)
+                            try sequences.append(e.key_ptr.*);
                     }
 
                     for (sequences.items) |sequence| {
                         const msg = self.in_flight.get(sequence).?;
                         try self.deferInFlight(sequence, msg, 0);
                         self.metric.requeue.inc(1);
-                        // log.debug("{} message requeue {}", .{ msg.consumer_id, sequence });
                     }
                 }
 

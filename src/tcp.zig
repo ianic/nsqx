@@ -185,6 +185,10 @@ pub const Conn = struct {
             self.state != .connected);
     }
 
+    pub fn readyCount(self: *Conn) u32 {
+        return if (self.ready()) self.ready_count - self.in_flight else 0;
+    }
+
     /// Pull messages from channel and send.
     pub fn wakeup(self: *Conn) void {
         if (self.send_op.active() or self.state != .connected) return;
@@ -198,20 +202,16 @@ pub const Conn = struct {
 
         { // prepare messages
             if (self.channel) |channel| {
-                if (self.in_flight < self.ready_count) {
-                    const ready_count = self.ready_count - self.in_flight;
-
-                    if (self.send_op.free() > 0) {
-                        if (channel.pull(self.id(), self.msgTimeout(), ready_count) catch |err| brk: {
-                            log.err("{} failed to pull from channel {}", .{ self.socket, err });
-                            break :brk null;
-                        }) |res| {
-                            self.send_op.prep(res.data);
-
-                            self.send_chunk = res;
-                            self.metric.send +%= res.count;
-                            self.in_flight += res.count;
-                        }
+                const ready_count = self.readyCount();
+                if (ready_count > 0 and self.send_op.free() > 0) {
+                    if (channel.pull(self.id(), self.msgTimeout(), ready_count) catch |err| brk: {
+                        log.err("{} failed to pull from channel {}", .{ self.socket, err });
+                        break :brk null;
+                    }) |res| {
+                        self.send_op.prep(res.data);
+                        self.send_chunk = res;
+                        self.metric.send +%= res.count;
+                        self.in_flight += res.count;
                     }
                 }
             }
