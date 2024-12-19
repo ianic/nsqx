@@ -1206,6 +1206,69 @@ pub fn BrokerType(Client: type) type {
     };
 }
 
+const TestBroker = BrokerType(TestClient);
+
+const TestClient = struct {
+    const Self = @This();
+
+    consumer: TestBroker.Consumer = .{},
+    sequences: std.ArrayList(u64) = undefined,
+
+    fn init(allocator: mem.Allocator) Self {
+        return .{
+            .sequences = std.ArrayList(u64).init(allocator),
+        };
+    }
+
+    fn deinit(self: *Self) void {
+        self.sequences.deinit();
+    }
+
+    fn ready(_: Self) bool {
+        return true;
+    }
+    fn onChannelReady(self: *Self) void {
+        self._pull() catch {};
+    }
+
+    fn _pull(self: *Self) !void {
+        const data = try self.consumer.pull() orelse return;
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const header = data[pos .. pos + 34];
+            const size = mem.readInt(u32, header[0..4], .big);
+            const sequence = mem.readInt(u64, header[26..34], .big);
+            pos += 4 + size;
+            try self.sequences.append(sequence);
+        }
+        self.consumer.onSend();
+    }
+    fn onChannelClose(_: Self) void {}
+
+    fn pull(self: *Self) !void {
+        self.consumer.ready_count = self.consumer.in_flight_count + 1;
+        try self._pull();
+        self.consumer.ready_count -= 1;
+    }
+
+    fn finish(self: *Self, sequence: u64) !void {
+        try self.consumer.finish(protocol.msg_id.encode(sequence));
+    }
+
+    fn pullFinish(self: *Self) !void {
+        try self.pull();
+        try self.finish(self.lastSequence());
+    }
+
+    fn requeue(self: *Self, sequence: u64, delay: u32) !void {
+        try self.consumer.requeue(protocol.msg_id.encode(sequence), delay);
+    }
+
+    fn lastSequence(self: *Self) u64 {
+        return self.sequences.items[self.sequences.items.len - 1];
+    }
+};
+
 test "consumers" {
     const allocator = testing.allocator;
     const Consumers = TestBroker.Channel.Consumers;
@@ -1278,7 +1341,7 @@ test "channel fin req" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    var broker = TestBroker.init(allocator, 0, .{});
     defer broker.deinit();
 
     var client = TestClient.init(allocator);
@@ -1367,89 +1430,6 @@ test "channel fin req" {
     }
 }
 
-var noop_notifier = NoopNotifier{};
-
-pub const NoopNotifier = struct {
-    call_count: usize = 0,
-    const Self = @This();
-    fn topicCreated(self: *Self, _: []const u8) void {
-        self.call_count += 1;
-    }
-    fn channelCreated(self: *Self, _: []const u8, _: []const u8) void {
-        self.call_count += 1;
-    }
-    fn topicDeleted(self: *Self, _: []const u8) void {
-        self.call_count += 1;
-    }
-    fn channelDeleted(self: *Self, _: []const u8, _: []const u8) void {
-        self.call_count += 1;
-    }
-    fn ensureCapacity(_: *Self, _: []const u8, _: []const u8) !void {}
-};
-
-const TestBroker = BrokerType(TestClient, NoopNotifier);
-
-const TestClient = struct {
-    const Self = @This();
-
-    consumer: TestBroker.Consumer = .{},
-    sequences: std.ArrayList(u64) = undefined,
-
-    fn init(allocator: mem.Allocator) Self {
-        return .{
-            .sequences = std.ArrayList(u64).init(allocator),
-        };
-    }
-
-    fn deinit(self: *Self) void {
-        self.sequences.deinit();
-    }
-
-    fn ready(_: Self) bool {
-        return true;
-    }
-    fn onChannelReady(self: *Self) void {
-        self._pull() catch {};
-    }
-
-    fn _pull(self: *Self) !void {
-        const data = try self.consumer.pull() orelse return;
-        var pos: usize = 0;
-        while (pos < data.len) {
-            const header = data[pos .. pos + 34];
-            const size = mem.readInt(u32, header[0..4], .big);
-            const sequence = mem.readInt(u64, header[26..34], .big);
-            pos += 4 + size;
-            try self.sequences.append(sequence);
-        }
-        self.consumer.onSend();
-    }
-    fn onChannelClose(_: Self) void {}
-
-    fn pull(self: *Self) !void {
-        self.consumer.ready_count = self.consumer.in_flight_count + 1;
-        try self._pull();
-        self.consumer.ready_count -= 1;
-    }
-
-    fn finish(self: *Self, sequence: u64) !void {
-        try self.consumer.finish(protocol.msg_id.encode(sequence));
-    }
-
-    fn pullFinish(self: *Self) !void {
-        try self.pull();
-        try self.finish(self.lastSequence());
-    }
-
-    fn requeue(self: *Self, sequence: u64, delay: u32) !void {
-        try self.consumer.requeue(protocol.msg_id.encode(sequence), delay);
-    }
-
-    fn lastSequence(self: *Self) u64 {
-        return self.sequences.items[self.sequences.items.len - 1];
-    }
-};
-
 test "multiple channels" {
     const allocator = testing.allocator;
     const topic_name = "topic";
@@ -1457,7 +1437,7 @@ test "multiple channels" {
     const channel_name2 = "channel2";
     const no = 1024;
 
-    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    var broker = TestBroker.init(allocator, 0, .{});
     defer broker.deinit();
 
     var c1 = TestClient.init(allocator);
@@ -1527,7 +1507,7 @@ test "first channel gets all messages accumulated in topic" {
     const channel_name = "channel1";
     const no = 16;
 
-    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    var broker = TestBroker.init(allocator, 0, .{});
     defer broker.deinit();
     // publish messages to the topic which don't have channels created
     for (0..no) |_|
@@ -1576,7 +1556,7 @@ test "timeout messages" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    var broker = TestBroker.init(allocator, 0, .{});
     defer broker.deinit();
 
     var client = TestClient.init(allocator);
@@ -1642,7 +1622,7 @@ test "deferred messages" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    var broker = TestBroker.init(allocator, 0, .{});
     defer broker.deinit();
 
     var client = TestClient.init(allocator);
@@ -1693,7 +1673,7 @@ test "topic pause" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    var broker = TestBroker.init(allocator, 0, .{});
     defer broker.deinit();
     const topic = try broker.getOrCreateTopic(topic_name);
 
@@ -1745,7 +1725,7 @@ test "channel empty" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    var broker = TestBroker.init(allocator, 0, .{});
     defer broker.deinit();
 
     var client = TestClient.init(allocator);
@@ -1782,7 +1762,7 @@ test "ephemeral channel" {
     const topic_name = "topic";
     const channel_name = "channel#ephemeral";
 
-    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    var broker = TestBroker.init(allocator, 0, .{});
     defer broker.deinit();
 
     var client = TestClient.init(allocator);
@@ -1798,41 +1778,11 @@ test "ephemeral channel" {
     try testing.expectEqual(0, topic.channels.count());
 }
 
-test noop_notifier {
-    const allocator = testing.allocator;
-
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
-    defer broker.deinit();
-
-    var consumer1 = TestClient.init(allocator);
-    defer consumer1.deinit();
-    _ = try broker.subscribe(&consumer1, "topic1", "channel1");
-    try testing.expectEqual(2, notifier.call_count);
-
-    var consumer2 = TestClient.init(allocator);
-    defer consumer2.deinit();
-    _ = try broker.subscribe(&consumer2, "topic1", "channel2");
-    try testing.expectEqual(3, notifier.call_count);
-
-    var consumer3 = TestClient.init(allocator);
-    defer consumer3.deinit();
-    _ = try broker.subscribe(&consumer3, "topic2", "channel2");
-    try testing.expectEqual(5, notifier.call_count);
-
-    // test deletes
-    try testing.expectEqual(5, notifier.call_count);
-    try broker.deleteTopic("topic1");
-    try testing.expectEqual(6, notifier.call_count);
-    try broker.deleteChannel("topic2", "channel2");
-    try testing.expectEqual(7, notifier.call_count);
-}
-
 test "depth" {
     const allocator = testing.allocator;
     const topic_name = "topic";
 
-    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    var broker = TestBroker.init(allocator, 0, .{});
     defer broker.deinit();
 
     var client1 = TestClient.init(allocator);
@@ -1886,7 +1836,7 @@ test "check allocations" {
 fn publishFinish(allocator: mem.Allocator) !void {
     const topic_name = "topic";
 
-    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    var broker = TestBroker.init(allocator, 0, .{});
     defer broker.deinit();
 
     // Create 2 channels
@@ -1969,7 +1919,7 @@ test "dump/restore" {
     defer dir.close();
 
     { // dump
-        var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+        var broker = TestBroker.init(allocator, 0, .{});
         defer broker.deinit();
         const topic = try broker.getOrCreateTopic(topic_name);
 
@@ -2017,7 +1967,7 @@ test "dump/restore" {
     }
 
     { // restore in another instance
-        var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+        var broker = TestBroker.init(allocator, 0, .{});
         defer broker.deinit();
         try broker.restore(dir);
 
@@ -2053,7 +2003,7 @@ test "dump/restore" {
 
 test "registrations" {
     const allocator = testing.allocator;
-    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    var broker = TestBroker.init(allocator, 0, .{});
     defer broker.deinit();
 
     const T = struct {
