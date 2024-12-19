@@ -102,28 +102,17 @@ pub const Conn = struct {
     recv_op: Op = .{},
     send_op: SendOp = .{},
     timer_op: timer.Op = undefined,
-    send_chunk: ?Channel.PullChunk = null,
     shutdown_op: Op = .{},
     pending_responses: std.ArrayList(protocol.Response),
-    ready_count: u32 = 0,
-    in_flight: u32 = 0,
+
     timer_ts: u64,
     heartbeat_interval: u32 = initial_heartbeat,
     outstanding_heartbeats: u8 = 0,
     recv_buf: RecvBuf, // Unprocessed bytes from previous receive
-    send_buf: [34]u8 = undefined, // Send buffer for control messages
 
-    channel: ?*Channel = null,
+    consumer: Broker.Consumer,
     identify: protocol.Identify = .{},
     state: State = .connected,
-
-    metric: struct {
-        connected_at: u64 = 0,
-        // Total number of
-        send: usize = 0,
-        finish: usize = 0,
-        requeue: usize = 0,
-    } = .{},
 
     const State = enum {
         connected,
@@ -142,10 +131,11 @@ pub const Conn = struct {
             .socket = socket,
             .addr = addr,
             .recv_buf = RecvBuf.init(listener.allocator),
-            .metric = .{ .connected_at = listener.io.now() },
             .timer_ts = listener.io.tsFromDelay(initial_heartbeat),
             .pending_responses = std.ArrayList(protocol.Response).init(allocator),
+            .consumer = .{ .client = self, .metric = .{ .connected_at = listener.io.now() } },
         };
+
         try self.send_op.init(allocator, socket, self, onSend, onSendFail);
         errdefer self.send_op.deinit(allocator);
 
@@ -167,52 +157,31 @@ pub const Conn = struct {
 
     // Channel api -----------------
 
-    /// Unique consumer identification. Used to know which in-flight message is
-    /// sent to which consumer.
-    pub fn id(self: *Conn) u32 {
-        return @intCast(self.socket);
-    }
-
-    /// Setting from identify message.
-    pub fn msgTimeout(self: *Conn) u32 {
-        return self.identify.msg_timeout;
-    }
-
-    /// Is connection ready to send messages.
     pub fn ready(self: *Conn) bool {
-        return !(self.send_op.active() or
-            self.in_flight >= self.ready_count or
-            self.state != .connected);
+        return (!self.send_op.active() and self.state == .connected);
     }
 
-    pub fn readyCount(self: *Conn) u32 {
-        return if (self.ready()) self.ready_count - self.in_flight else 0;
+    pub fn onChannelReady(self: *Conn) void {
+        self.send();
     }
 
-    /// Pull messages from channel and send.
-    pub fn wakeup(self: *Conn) void {
-        if (self.send_op.active() or self.state != .connected) return;
+    fn send(self: *Conn) void {
+        if (!self.ready()) return;
 
-        { // prepare pending responses
+        { // Prepare pending responses
             while (self.send_op.free() > 0) {
                 const rsp = self.pending_responses.popOrNull() orelse break;
                 self.send_op.prep(rsp.body());
             }
         }
 
-        { // prepare messages
-            if (self.channel) |channel| {
-                const ready_count = self.readyCount();
-                if (ready_count > 0 and self.send_op.free() > 0) {
-                    if (channel.pull(self.id(), self.msgTimeout(), ready_count) catch |err| brk: {
-                        log.err("{} failed to pull from channel {}", .{ self.socket, err });
-                        break :brk null;
-                    }) |res| {
-                        self.send_op.prep(res.data);
-                        self.send_chunk = res;
-                        self.metric.send +%= res.count;
-                        self.in_flight += res.count;
-                    }
+        { // Pull messages from channel
+            if (self.send_op.free() > 0) {
+                if (self.consumer.pull() catch |err| brk: {
+                    log.err("{} failed to pull from channel {}", .{ self.socket, err });
+                    break :brk null;
+                }) |data| {
+                    self.send_op.prep(data);
                 }
             }
         }
@@ -257,19 +226,12 @@ pub const Conn = struct {
     }
 
     fn onSend(self: *Conn) Error!void {
-        self.sendDone();
-        self.wakeup();
-    }
-
-    fn sendDone(self: *Conn) void {
-        if (self.send_chunk) |sc| {
-            sc.done();
-            self.send_chunk = null;
-        }
+        self.consumer.onSend();
+        self.send();
     }
 
     fn onSendFail(self: *Conn, err: anyerror) Error!void {
-        self.sendDone();
+        self.consumer.onSend();
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.err("{} send failed {}", .{ self.socket, err }),
@@ -319,7 +281,7 @@ pub const Conn = struct {
         }
 
         try self.recv_buf.set(parser.unparsed());
-        self.wakeup();
+        self.send();
     }
 
     fn receivedMsg(self: *Conn, msg: protocol.Message) !void {
@@ -334,6 +296,7 @@ pub const Conn = struct {
                 try self.respond(.ok);
                 self.identify = identify;
                 self.heartbeat_interval = identify.heartbeat_interval / 2;
+                self.consumer.msg_timeout = identify.msg_timeout;
                 log.debug("{} identify {}", .{ self.socket, identify });
             },
             .subscribe => |arg| {
@@ -359,34 +322,27 @@ pub const Conn = struct {
                 log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });
             },
             .ready => |count| {
-                self.ready_count = if (count > options.max_rdy_count) options.max_rdy_count else count;
+                self.consumer.ready_count = if (count > options.max_rdy_count) options.max_rdy_count else count;
                 log.debug("{} ready: {}", .{ self.socket, count });
             },
             .finish => |msg_id| {
-                var channel = self.channel orelse return error.NotSubscribed;
-                self.in_flight -|= 1;
-                try channel.finish(self.id(), msg_id);
-                self.metric.finish += 1;
+                try self.consumer.finish(msg_id);
                 log.debug("{} finish {}", .{ self.socket, protocol.msg_id.decode(msg_id) });
             },
             .requeue => |arg| {
-                var channel = self.channel orelse return error.NotSubscribed;
-                self.in_flight -|= 1;
                 const delay = if (arg.delay > options.max_req_timeout)
                     options.max_req_timeout
                 else
                     arg.delay;
-                try channel.requeue(self.id(), arg.msg_id, delay);
-                self.metric.requeue += 1;
+                try self.consumer.requeue(arg.msg_id, delay);
                 log.debug("{} requeue {}", .{ self.socket, protocol.msg_id.decode(arg.msg_id) });
             },
             .touch => |msg_id| {
-                var channel = self.channel orelse return error.NotSubscribed;
-                try channel.touch(self.id(), msg_id, self.msgTimeout());
+                try self.consumer.touch(msg_id);
                 log.debug("{} touch {}", .{ self.socket, protocol.msg_id.decode(msg_id) });
             },
             .close => {
-                self.ready_count = 0;
+                self.consumer.ready_count = 0;
                 try self.respond(.close);
                 log.debug("{} close", .{self.socket});
             },
@@ -417,7 +373,7 @@ pub const Conn = struct {
         switch (self.state) {
             .connected => {
                 // Start shutdown.
-                self.ready_count = 0; // stop sending
+                self.consumer.ready_count = 0; // stop sending
                 self.state = .closing;
                 self.shutdown_op = Op.shutdown(self.socket, self, onClose);
                 self.io.submit(&self.shutdown_op);
@@ -435,7 +391,7 @@ pub const Conn = struct {
                     self.shutdown_op.active())
                     return;
 
-                if (self.channel) |channel| channel.unsubscribe(self);
+                self.consumer.unsubscribe();
 
                 log.debug("{} closed", .{self.socket});
                 self.deinit();

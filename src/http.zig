@@ -304,14 +304,15 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
             const clients: []Stat.Client = if (args.includeClients()) brk: {
                 var clients = try allocator.alloc(Stat.Client, client_count);
                 for (channel.consumers.items, 0..) |consumer, i| {
-                    const remote_address = try std.fmt.allocPrint(allocator, "{}", .{consumer.addr});
+                    const client = consumer.client;
+                    const remote_address = try std.fmt.allocPrint(allocator, "{}", .{client.addr});
                     clients[i] = Stat.Client{
-                        .client_id = consumer.identify.client_id,
-                        .hostname = consumer.identify.hostname,
-                        .user_agent = consumer.identify.user_agent,
+                        .client_id = client.identify.client_id,
+                        .hostname = client.identify.hostname,
+                        .user_agent = client.identify.user_agent,
                         .remote_address = remote_address,
                         .ready_count = consumer.ready_count,
-                        .in_flight_count = consumer.in_flight,
+                        .in_flight_count = consumer.in_flight_count,
                         .message_count = consumer.metric.send,
                         .finish_count = consumer.metric.finish,
                         .requeue_count = consumer.metric.requeue,

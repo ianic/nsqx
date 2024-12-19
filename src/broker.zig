@@ -25,11 +25,95 @@ var time: struct {
     }
 } = .{};
 
-pub fn BrokerType(Consumer: type, Notifier: type) type {
+pub fn BrokerType(Client: type, Notifier: type) type {
     return struct {
         const Broker = @This();
         const Topic = TopicType();
-        pub const Channel = ChannelType();
+        const Channel = ChannelType();
+
+        pub const Consumer = struct {
+            // set by client
+            ready_count: u32 = 0,
+            msg_timeout: u32 = 0,
+            // set in subscribe
+            client: *Client = undefined,
+            channel: ?*Channel = null,
+            //
+            in_flight_count: u32 = 0,
+            pull_chunk: ?Channel.PullChunk = null,
+            metric: struct {
+                connected_at: u64 = 0,
+                // Total number of
+                send: usize = 0,
+                finish: usize = 0,
+                requeue: usize = 0,
+            } = .{},
+
+            const Self = @This();
+
+            /// Is client ready to send
+            fn ready(self: Self) bool {
+                return self.pull_chunk == null and
+                    self.in_flight_count < self.ready_count and
+                    self.client.ready();
+            }
+
+            fn readyCount(self: Self) u32 {
+                return if (self.ready()) self.ready_count - self.in_flight_count else 0;
+            }
+
+            // Client api -----------------
+
+            pub fn finish(self: *Self, msg_id: [16]u8) !void {
+                self.in_flight_count -|= 1;
+                var channel = self.channel orelse return error.NotSubscribed;
+                try channel.finish(self, msg_id);
+                self.metric.finish += 1;
+            }
+
+            pub fn requeue(self: *Self, msg_id: [16]u8, delay: u32) !void {
+                self.in_flight_count -|= 1;
+                var channel = self.channel orelse return error.NotSubscribed;
+                try channel.requeue(self, msg_id, delay);
+                self.metric.requeue += 1;
+            }
+
+            pub fn touch(self: *Self, msg_id: [16]u8) !void {
+                var channel = self.channel orelse return error.NotSubscribed;
+                try channel.touch(self, msg_id);
+            }
+
+            pub fn unsubscribe(self: *Self) void {
+                if (self.channel) |channel| channel.unsubscribe(self);
+            }
+
+            /// Client pulls data to send.
+            pub fn pull(self: *Self) !?[]const u8 {
+                const channel = self.channel orelse return null;
+                const pc = try channel.pull(self) orelse return null;
+                self.pull_chunk = pc;
+                self.metric.send +%= pc.count;
+                self.in_flight_count += pc.count;
+                return pc.data;
+            }
+
+            /// Notification that client has finished sending data from last
+            /// pull. Buffer returned from pull is no more in kernel and can be
+            /// released now.
+            pub fn onSend(self: *Self) void {
+                if (self.pull_chunk) |pc| {
+                    pc.done();
+                    self.pull_chunk = null;
+                }
+            }
+
+            // Client api -----------------
+
+            fn close(self: *Self) void {
+                self.channel = null;
+                self.client.shutdown();
+            }
+        };
 
         allocator: mem.Allocator,
         topics: std.StringHashMap(*Topic),
@@ -94,9 +178,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
             return topic;
         }
 
-        pub fn subscribe(self: *Broker, consumer: *Consumer, topic_name: []const u8, channel_name: []const u8) !void {
+        pub fn subscribe(self: *Broker, client: *Client, topic_name: []const u8, channel_name: []const u8) !void {
             const topic = try self.getOrCreateTopic(topic_name);
-            try topic.subscribe(consumer, channel_name);
+            try topic.subscribe(client, channel_name);
         }
 
         pub fn publish(self: *Broker, topic_name: []const u8, data: []const u8) !void {
@@ -421,9 +505,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     self.empty();
                 }
 
-                fn subscribe(self: *Topic, consumer: *Consumer, name: []const u8) !void {
+                fn subscribe(self: *Topic, client: *Client, name: []const u8) !void {
                     const channel = try self.getOrCreateChannel(name);
-                    try channel.subscribe(consumer);
+                    try channel.subscribe(client);
                 }
 
                 fn getOrCreateChannel(self: *Topic, name: []const u8) !*Channel {
@@ -564,9 +648,9 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
         pub fn ChannelType() type {
             return struct {
-                pub const InFlightMsg = struct {
+                const InFlightMsg = struct {
                     timeout_at: u64 = 0,
-                    consumer_id: u32 = 0,
+                    consumer: *Consumer = undefined,
                     attempts: u16 = 1,
 
                     const Self = @This();
@@ -644,8 +728,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                 fn delete(self: *Channel) void {
                     for (self.consumers.items) |consumer| {
-                        consumer.channel = null;
-                        consumer.shutdown();
+                        consumer.close();
                     }
                     self.consumers.clearAndFree();
                     self.releasePending();
@@ -662,10 +745,11 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     self.allocator.destroy(self);
                 }
 
-                fn subscribe(self: *Channel, consumer: *Consumer) !void {
-                    assert(consumer.channel == null);
-                    try self.consumers.append(consumer);
-                    consumer.channel = self;
+                fn subscribe(self: *Channel, client: *Client) !void {
+                    assert(client.consumer.channel == null);
+                    client.consumer.client = client;
+                    client.consumer.channel = self;
+                    try self.consumers.append(&client.consumer);
                 }
 
                 // -----------------
@@ -686,7 +770,7 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 // Notify consumers that there are messages to pull.
                 fn wakeup(self: *Channel) void {
                     while (self.consumers_iterator.next()) |consumer| {
-                        consumer.wakeup();
+                        consumer.client.onChannelReady();
                         if (!self.needWakeup()) break;
                     }
                 }
@@ -727,15 +811,15 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 // Find deferred message, make copy of that message, set
                 // increased attempts to message payload, put it in-flight and
                 // return payload.
-                fn popDeferred(self: *Channel, consumer_id: u32, msg_timeout: u32) !?PullChunk {
+                fn popDeferred(self: *Channel, consumer: *Consumer) !?PullChunk {
                     if (self.deferred.peek()) |dm| if (dm.defer_until <= time.now) {
                         try self.in_flight.ensureUnusedCapacity(1);
                         const payload = try self.allocator.dupe(u8, self.topic.stream.message(dm.sequence));
                         errdefer self.allocator.free(payload);
 
                         const ifm = InFlightMsg{
-                            .timeout_at = time.after(msg_timeout),
-                            .consumer_id = consumer_id,
+                            .timeout_at = time.after(consumer.msg_timeout),
+                            .consumer = consumer,
                             .attempts = dm.attempts,
                         };
                         ifm.setAttempts(payload);
@@ -744,8 +828,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         _ = self.deferred.remove();
 
                         return .{
-                            .data = payload,
                             .count = 1,
+                            .data = payload,
                             .allocator = self.allocator,
                         };
                     };
@@ -806,8 +890,8 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                         self.metric.timeout.inc(1);
                         if (!builtin.is_test)
                             log.warn(
-                                "{s}/{s} message timeout consumer: {}, sequence: {}",
-                                .{ self.topic.name, self.name, msg.consumer_id, sequence },
+                                "{s}/{s} message timeout sequence: {}",
+                                .{ self.topic.name, self.name, sequence },
                             );
                     }
 
@@ -838,12 +922,12 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                 // Chunk of data to send to the consumer
                 pub const PullChunk = struct {
+                    allocator: ?mem.Allocator = null,
                     data: []const u8,
-                    count: u32 = 1,
 
                     stream: ?*store.Stream = null,
                     sequence: u64 = 0,
-                    allocator: ?mem.Allocator = null,
+                    count: u32,
 
                     // Consumer should call this when data is no more in use by
                     // underlying network interface; when io_uring send
@@ -858,27 +942,26 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                     }
                 };
 
-                pub fn pull(self: *Channel, consumer_id: u32, msg_timeout: u32, ready_count: u32) !?PullChunk {
-                    assert(ready_count > 0);
-                    assert(consumer_id > 0);
+                pub fn pull(self: *Channel, consumer: *Consumer) !?PullChunk {
+                    if (!consumer.ready()) return null;
                     if (self.paused) return null;
 
                     // if there is deferred message return one
-                    if (try self.popDeferred(consumer_id, msg_timeout)) |sc| return sc;
+                    if (try self.popDeferred(consumer)) |pc| return pc;
 
                     // else find next chunk in stream
                     if (self.topic.paused) return null;
-                    if (self.topic.stream.pull(self.sequence, ready_count)) |res| {
+                    if (self.topic.stream.pull(self.sequence, consumer.readyCount())) |res| {
                         errdefer res.revert(&self.topic.stream);
 
                         { // add all sequence to in_flight
                             try self.in_flight.ensureUnusedCapacity(res.count);
-                            const timeout_at = time.after(msg_timeout);
+                            const timeout_at = time.after(consumer.msg_timeout);
                             try self.updateTimer(timeout_at);
                             for (res.sequence.from..res.sequence.to + 1) |sequence| {
                                 const ifm = InFlightMsg{
                                     .timeout_at = timeout_at,
-                                    .consumer_id = consumer_id,
+                                    .consumer = consumer,
                                     .attempts = 1,
                                 };
                                 self.in_flight.putAssumeCapacityNoClobber(sequence, ifm);
@@ -887,25 +970,26 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
 
                         self.metric.pull.inc(res.count);
                         self.sequence = res.sequence.to;
+
                         return .{
-                            .data = res.data,
                             .count = res.count,
                             .stream = &self.topic.stream,
                             .sequence = res.sequence.from,
+                            .data = res.data,
                         };
                     }
                     return null;
                 }
 
-                fn findInFlight(self: *Channel, consumer_id: u32, msg_id: [16]u8) !struct { u64, InFlightMsg } {
+                fn findInFlight(self: *Channel, consumer: *Consumer, msg_id: [16]u8) !struct { u64, InFlightMsg } {
                     const sequence = protocol.msg_id.decode(msg_id);
                     const ifm = self.in_flight.get(sequence) orelse return error.MessageNotInFlight;
-                    if (ifm.consumer_id != consumer_id) return error.MessageNotInFlight;
+                    if (ifm.consumer != consumer) return error.MessageNotInFlight;
                     return .{ sequence, ifm };
                 }
 
-                pub fn finish(self: *Channel, consumer_id: u32, msg_id: [16]u8) !void {
-                    const sequence, _ = try self.findInFlight(consumer_id, msg_id);
+                pub fn finish(self: *Channel, consumer: *Consumer, msg_id: [16]u8) !void {
+                    const sequence, _ = try self.findInFlight(consumer, msg_id);
                     self.topic.stream.release(sequence);
                     assert(self.in_flight.remove(sequence));
                     self.metric.finish.inc(1);
@@ -913,50 +997,57 @@ pub fn BrokerType(Consumer: type, Notifier: type) type {
                 }
 
                 /// Extend message timeout for interval (milliseconds).
-                pub fn touch(self: *Channel, consumer_id: u32, msg_id: [16]u8, interval: u32) !void {
-                    const sequence, _ = try self.findInFlight(consumer_id, msg_id);
+                pub fn touch(self: *Channel, consumer: *Consumer, msg_id: [16]u8) !void {
+                    const sequence, _ = try self.findInFlight(consumer, msg_id);
                     const ifm = self.in_flight.getPtr(sequence).?;
-                    ifm.timeout_at += nsFromMs(interval);
+                    ifm.timeout_at += nsFromMs(consumer.msg_timeout);
                 }
 
-                pub fn requeue(self: *Channel, consumer_id: u32, msg_id: [16]u8, delay: u32) !void {
-                    const sequence, const ifm = try self.findInFlight(consumer_id, msg_id);
+                pub fn requeue(self: *Channel, consumer: *Consumer, msg_id: [16]u8, delay: u32) !void {
+                    const sequence, const ifm = try self.findInFlight(consumer, msg_id);
                     try self.deferInFlight(sequence, ifm, delay);
                     self.metric.requeue.inc(1);
                 }
 
                 pub fn unsubscribe(self: *Channel, consumer: *Consumer) void {
-                    self.requeueAll(consumer.id()) catch |err| {
-                        log.warn("failed to remove in flight messages for socket {}, {}", .{ consumer.id(), err });
+                    self.requeueAll(consumer) catch |err| {
+                        log.warn("failed to remove in flight messages {}", .{err});
                     };
 
-                    // Remove consumer
-                    for (self.consumers.items, 0..) |item, i| {
-                        if (item == consumer) {
-                            _ = self.consumers.swapRemove(i);
-                            break;
-                        }
-                    }
+                    self.removeConsumer(consumer);
+
                     if (self.consumers.items.len == 0 and self.ephemeral)
                         self.topic.removeEphemeralChannel(self);
                 }
 
+                fn removeConsumer(self: *Channel, consumer: *Consumer) void {
+                    for (self.consumers.items, 0..) |ptr, i| {
+                        if (ptr == consumer) {
+                            _ = self.consumers.swapRemove(i);
+                            return;
+                        }
+                    }
+                    unreachable;
+                }
+
                 // Re-queue all messages which are in-flight for some consumer.
-                fn requeueAll(self: *Channel, consumer_id: u32) !void {
+                fn requeueAll(self: *Channel, consumer: *Consumer) !void {
                     var sequences = std.ArrayList(u64).init(self.allocator);
                     defer sequences.deinit();
 
                     var iter = self.in_flight.iterator();
                     while (iter.next()) |e| {
-                        if (e.value_ptr.consumer_id == consumer_id)
+                        if (e.value_ptr.consumer == consumer)
                             try sequences.append(e.key_ptr.*);
                     }
 
+                    assert(sequences.items.len == consumer.in_flight_count);
                     for (sequences.items) |sequence| {
                         const msg = self.in_flight.get(sequence).?;
                         try self.deferInFlight(sequence, msg, 0);
                         self.metric.requeue.inc(1);
                     }
+                    consumer.in_flight_count = 0;
                 }
 
                 // Http admin interface  -----------------
@@ -1005,43 +1096,43 @@ test "channel consumers iterator" {
     var broker = TestBroker.init(allocator, &notifier, 0, .{});
     defer broker.deinit();
 
-    var consumer1 = TestConsumer.init(allocator);
-    try broker.subscribe(&consumer1, "topic", "channel");
-    const channel = consumer1.channel.?;
-    consumer1.ready_count = 1;
+    var client1 = TestClient.init(allocator);
+    try broker.subscribe(&client1, "topic", "channel");
+    const channel = client1.consumer.channel.?;
+    client1.consumer.ready_count = 1;
 
     var iter = channel.consumers_iterator;
-    try testing.expectEqual(&consumer1, iter.next().?);
-    try testing.expectEqual(&consumer1, iter.next().?);
-    consumer1.ready_count = 0;
+    try testing.expectEqual(&client1.consumer, iter.next().?);
+    try testing.expectEqual(&client1.consumer, iter.next().?);
+    client1.consumer.ready_count = 0;
     try testing.expectEqual(null, iter.next());
 
-    consumer1.ready_count = 1;
-    var consumer2 = TestConsumer.init(allocator);
-    var consumer3 = TestConsumer.init(allocator);
-    try broker.subscribe(&consumer2, "topic", "channel");
-    try broker.subscribe(&consumer3, "topic", "channel");
+    client1.consumer.ready_count = 1;
+    var client2 = TestClient.init(allocator);
+    var client3 = TestClient.init(allocator);
+    try broker.subscribe(&client2, "topic", "channel");
+    try broker.subscribe(&client3, "topic", "channel");
     try testing.expectEqual(3, channel.consumers.items.len);
-    consumer2.ready_count = 1;
-    consumer3.ready_count = 1;
+    client2.consumer.ready_count = 1;
+    client3.consumer.ready_count = 1;
 
     try testing.expectEqual(3, channel.consumers.items.len);
-    try testing.expectEqual(&consumer2, iter.next().?);
-    try testing.expectEqual(&consumer3, iter.next().?);
-    try testing.expectEqual(&consumer1, iter.next().?);
-    try testing.expectEqual(&consumer2, iter.next().?);
+    try testing.expectEqual(&client2.consumer, iter.next().?);
+    try testing.expectEqual(&client3.consumer, iter.next().?);
+    try testing.expectEqual(&client1.consumer, iter.next().?);
+    try testing.expectEqual(&client2.consumer, iter.next().?);
 
-    try testing.expectEqual(&consumer3, iter.next().?);
-    try testing.expectEqual(&consumer1, iter.next().?);
-    try testing.expectEqual(&consumer2, iter.next().?);
-    consumer3.ready_count = 0;
-    try testing.expectEqual(&consumer1, iter.next().?);
-    try testing.expectEqual(&consumer2, iter.next().?);
-    try testing.expectEqual(&consumer1, iter.next().?);
-    consumer2.ready_count = 0;
-    try testing.expectEqual(&consumer1, iter.next().?);
-    try testing.expectEqual(&consumer1, iter.next().?);
-    consumer1.ready_count = 0;
+    try testing.expectEqual(&client3.consumer, iter.next().?);
+    try testing.expectEqual(&client1.consumer, iter.next().?);
+    try testing.expectEqual(&client2.consumer, iter.next().?);
+    client3.consumer.ready_count = 0;
+    try testing.expectEqual(&client1.consumer, iter.next().?);
+    try testing.expectEqual(&client2.consumer, iter.next().?);
+    try testing.expectEqual(&client1.consumer, iter.next().?);
+    client2.consumer.ready_count = 0;
+    try testing.expectEqual(&client1.consumer, iter.next().?);
+    try testing.expectEqual(&client1.consumer, iter.next().?);
+    client1.consumer.ready_count = 0;
     try testing.expect(iter.next() == null);
 }
 
@@ -1053,11 +1144,11 @@ test "channel fin req" {
     var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
-    var consumer = TestConsumer.init(allocator);
-    defer consumer.deinit();
+    var client = TestClient.init(allocator);
+    defer client.deinit();
 
-    try broker.subscribe(&consumer, topic_name, channel_name);
-    const channel = consumer.channel.?;
+    try broker.subscribe(&client, topic_name, channel_name);
+    const channel = client.consumer.channel.?;
 
     try broker.publish(topic_name, "1");
     try broker.publish(topic_name, "2");
@@ -1074,65 +1165,65 @@ test "channel fin req" {
         try testing.expectEqual(0, channel.deferred.count());
     }
     { // consumer is ready
-        try consumer.pull();
-        try testing.expectEqual(1, consumer.lastSequence());
+        try client.pull();
+        try testing.expectEqual(1, client.lastSequence());
         // 1 is in flight
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(1, channel.sequence);
     }
     { // consumer sends fin, 0 in flight after that
-        try consumer.finish(1);
+        try client.finish(1);
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(2, channel.metric.depth.value);
         try testing.expectEqual(1, channel.sequence);
     }
     { // send seq 2, 1 msg in flight
-        try consumer.pull();
-        try testing.expectEqual(2, consumer.lastSequence());
+        try client.pull();
+        try testing.expectEqual(2, client.lastSequence());
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(2, channel.sequence);
     }
     { // send seq 3, 2 msgs in flight
-        try consumer.pull();
-        try testing.expectEqual(3, consumer.lastSequence());
+        try client.pull();
+        try testing.expectEqual(3, client.lastSequence());
         try testing.expectEqual(2, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(3, channel.sequence);
     }
     { // 2 is re-queued
-        try consumer.requeue(2, 0);
+        try client.requeue(2, 0);
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
     }
     { // out of order fin, fin seq 3 while 2 is still in flight
-        try consumer.finish(3);
+        try client.finish(3);
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
     }
     { // re send 2
-        try testing.expectEqual(3, consumer.sequences.items.len);
+        try testing.expectEqual(3, client.sequences.items.len);
         try testing.expectEqual(1, channel.deferred.count());
-        try consumer.pull();
-        try testing.expectEqual(4, consumer.sequences.items.len);
-        try testing.expectEqual(2, consumer.lastSequence());
+        try client.pull();
+        try testing.expectEqual(4, client.sequences.items.len);
+        try testing.expectEqual(2, client.lastSequence());
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
     }
     { // fin seq 2
         try testing.expectEqual(1, channel.metric.depth.value);
-        try consumer.finish(2);
+        try client.finish(2);
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
         try testing.expectEqual(0, channel.metric.depth.value);
     }
     { // consumer unsubscribe re-queues in-flight messages
         try broker.publish(topic_name, "4");
-        try consumer.pull();
+        try client.pull();
         try testing.expectEqual(1, channel.in_flight.count());
-        channel.unsubscribe(&consumer);
+        client.consumer.unsubscribe();
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
         try testing.expectEqual(0, channel.consumers.items.len);
@@ -1242,7 +1333,68 @@ pub const NoopNotifier = struct {
 };
 
 var noop_notifier = NoopNotifier{};
-const TestBroker = BrokerType(TestConsumer, NoopNotifier);
+const TestBroker = BrokerType(TestClient, NoopNotifier);
+
+const TestClient = struct {
+    const Self = @This();
+
+    consumer: TestBroker.Consumer = .{},
+    sequences: std.ArrayList(u64) = undefined,
+
+    fn init(allocator: mem.Allocator) Self {
+        return .{
+            .sequences = std.ArrayList(u64).init(allocator),
+        };
+    }
+
+    fn deinit(self: *Self) void {
+        self.sequences.deinit();
+    }
+
+    fn ready(_: Self) bool {
+        return true;
+    }
+    fn onChannelReady(self: *Self) void {
+        self._pull() catch {};
+    }
+
+    fn _pull(self: *Self) !void {
+        const data = try self.consumer.pull() orelse return;
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const header = data[pos .. pos + 34];
+            const size = mem.readInt(u32, header[0..4], .big);
+            const sequence = mem.readInt(u64, header[26..34], .big);
+            pos += 4 + size;
+            try self.sequences.append(sequence);
+        }
+        self.consumer.onSend();
+    }
+    fn shutdown(_: Self) void {}
+
+    fn pull(self: *Self) !void {
+        self.consumer.ready_count = self.consumer.in_flight_count + 1;
+        try self._pull();
+        self.consumer.ready_count -= 1;
+    }
+
+    fn finish(self: *Self, sequence: u64) !void {
+        try self.consumer.finish(protocol.msg_id.encode(sequence));
+    }
+
+    fn pullFinish(self: *Self) !void {
+        try self.pull();
+        try self.finish(self.lastSequence());
+    }
+
+    fn requeue(self: *Self, sequence: u64, delay: u32) !void {
+        try self.consumer.requeue(protocol.msg_id.encode(sequence), delay);
+    }
+
+    fn lastSequence(self: *Self) u64 {
+        return self.sequences.items[self.sequences.items.len - 1];
+    }
+};
 
 test "multiple channels" {
     const allocator = testing.allocator;
@@ -1254,16 +1406,18 @@ test "multiple channels" {
     var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
-    var c1 = TestConsumer.init(allocator);
+    var c1 = TestClient.init(allocator);
     defer c1.deinit();
     try broker.subscribe(&c1, topic_name, channel_name1);
-    c1.ready_count = no * 3;
+    c1.consumer.ready_count = no * 3;
 
     { // single channel, single consumer
         for (0..no) |_|
             try broker.publish(topic_name, "message body");
 
         try testing.expectEqual(no, c1.sequences.items.len);
+        try testing.expectEqual(no, c1.consumer.in_flight_count);
+        try testing.expectEqual(no * 2, c1.consumer.readyCount());
         var expected: u64 = 1;
         for (c1.sequences.items) |seq| {
             try testing.expectEqual(expected, seq);
@@ -1271,10 +1425,10 @@ test "multiple channels" {
         }
     }
 
-    var c2 = TestConsumer.init(allocator);
+    var c2 = TestClient.init(allocator);
     defer c2.deinit();
     try broker.subscribe(&c2, topic_name, channel_name2);
-    c2.ready_count = no * 2;
+    c2.consumer.ready_count = no * 2;
 
     { // two channels on the same topic
         for (0..no) |_|
@@ -1284,10 +1438,10 @@ test "multiple channels" {
         try testing.expectEqual(no, c2.sequences.items.len);
     }
 
-    var c3 = TestConsumer.init(allocator);
+    var c3 = TestClient.init(allocator);
     defer c3.deinit();
     try broker.subscribe(&c3, topic_name, channel_name2);
-    c3.ready_count = no;
+    c3.consumer.ready_count = no;
 
     { // two channels, one has single consumer another has two consumers
         for (0..no) |_|
@@ -1330,16 +1484,16 @@ test "first channel gets all messages accumulated in topic" {
 
     // subscribe creates channel
     // channel gets all messages
-    var consumer = TestConsumer.init(allocator);
-    defer consumer.deinit();
-    try broker.subscribe(&consumer, topic_name, channel_name);
-    var channel = consumer.channel.?;
+    var client = TestClient.init(allocator);
+    defer client.deinit();
+    try broker.subscribe(&client, topic_name, channel_name);
+    var channel = client.consumer.channel.?;
     try testing.expectEqual(0, channel.sequence);
     try testing.expectEqual(no, channel.metric.depth.value);
 
     for (0..no) |i| {
         try testing.expectEqual(no - i, channel.metric.depth.value);
-        try consumer.pullFinish();
+        try client.pullFinish();
     }
     try testing.expectEqual(0, channel.metric.depth.value);
     try testing.expectEqual(no, topic.stream.metric.msgs.value);
@@ -1354,10 +1508,10 @@ test "first channel gets all messages accumulated in topic" {
     try broker.publish(topic_name, "message body"); // 18
     try testing.expectEqual(1, topic.stream.metric.msgs.value);
 
-    var consumer2 = TestConsumer.init(allocator);
-    defer consumer2.deinit();
-    try broker.subscribe(&consumer2, topic_name, channel_name);
-    channel = consumer2.channel.?;
+    var clinet2 = TestClient.init(allocator);
+    defer clinet2.deinit();
+    try broker.subscribe(&clinet2, topic_name, channel_name);
+    channel = clinet2.consumer.channel.?;
     try testing.expectEqual(17, channel.sequence);
     try testing.expectEqual(1, topic.stream.metric.msgs.value);
     try testing.expectEqual(1, channel.metric.depth.value);
@@ -1371,15 +1525,16 @@ test "timeout messages" {
     var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
-    var consumer = TestConsumer.init(allocator);
-    defer consumer.deinit();
-    try broker.subscribe(&consumer, topic_name, channel_name);
-    const channel = consumer.channel.?;
+    var client = TestClient.init(allocator);
+    defer client.deinit();
+    try broker.subscribe(&client, topic_name, channel_name);
+    const channel = client.consumer.channel.?;
+    client.consumer.msg_timeout = 60000;
 
     for (0..4) |i| {
         time.now = i + 1;
         try broker.publish(topic_name, "message body");
-        try consumer.pull();
+        try client.pull();
     }
     try testing.expectEqual(4, channel.in_flight.count());
 
@@ -1387,8 +1542,8 @@ test "timeout messages" {
         var iter = channel.in_flight.valueIterator();
         while (iter.next()) |msg| {
             try testing.expectEqual(1, msg.attempts);
-            try testing.expect(msg.timeout_at > nsFromMs(consumer.msgTimeout()) and
-                msg.timeout_at <= nsFromMs(consumer.msgTimeout()) + 4);
+            try testing.expect(msg.timeout_at > nsFromMs(client.consumer.msg_timeout) and
+                msg.timeout_at <= nsFromMs(client.consumer.msg_timeout) + 4);
         }
     }
     const ns_per_s = std.time.ns_per_s;
@@ -1411,13 +1566,13 @@ test "timeout messages" {
         try testing.expectEqual(0, channel.metric.finish.value);
     }
     { // fin last one
-        try consumer.finish(consumer.lastSequence());
+        try client.finish(client.lastSequence());
         try testing.expectEqual(1, channel.metric.finish.value);
         try testing.expectEqual(0, channel.in_flight.count());
     }
     { // resend two
-        try consumer.pull();
-        try consumer.pull();
+        try client.pull();
+        try client.pull();
         try testing.expectEqual(2, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
         var iter = channel.in_flight.valueIterator();
@@ -1436,12 +1591,12 @@ test "deferred messages" {
     var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
-    var consumer = TestConsumer.init(allocator);
-    defer consumer.deinit();
-    try broker.subscribe(&consumer, topic_name, channel_name);
-    const channel = consumer.channel.?;
+    var client = TestClient.init(allocator);
+    defer client.deinit();
+    try broker.subscribe(&client, topic_name, channel_name);
+    const channel = client.consumer.channel.?;
     const topic = channel.topic;
-    consumer.ready_count = 3;
+    client.consumer.ready_count = 3;
 
     { // publish two deferred messages, topic puts them into deferred queue
         try broker.deferredPublish(topic_name, "message body", 2);
@@ -1461,7 +1616,7 @@ test "deferred messages" {
         try testing.expectEqual(1, topic.deferred.count());
     }
     { // re-queue
-        try consumer.requeue(1, 2);
+        try client.requeue(1, 2);
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
     }
@@ -1494,20 +1649,21 @@ test "topic pause" {
         try testing.expectEqual(2, topic.stream.metric.msgs.value);
     }
 
-    var consumer = TestConsumer.init(allocator);
-    defer consumer.deinit();
-    try broker.subscribe(&consumer, topic_name, channel_name);
-    const channel = consumer.channel.?;
+    var client = TestClient.init(allocator);
+    defer client.deinit();
+    try broker.subscribe(&client, topic_name, channel_name);
+    const channel = client.consumer.channel.?;
 
     { // while channel is paused topic messages are not delivered to the channel
         try testing.expect(!channel.paused);
         try broker.pauseChannel(topic_name, channel_name);
         try testing.expect(channel.paused);
 
-        try consumer.pull();
+        try client.pull();
         try testing.expectEqual(0, channel.in_flight.count());
 
         // unpause will pull message
+        client.consumer.ready_count += 1;
         try broker.unpauseChannel(topic_name, channel_name);
         try testing.expectEqual(1, channel.in_flight.count());
     }
@@ -1517,16 +1673,17 @@ test "topic pause" {
         try broker.pauseTopic(topic_name);
         try testing.expect(topic.paused);
 
-        try consumer.pull();
+        try client.pull();
         try testing.expectEqual(1, channel.in_flight.count());
 
         // unpause
+        client.consumer.ready_count += 1;
         try broker.unpauseTopic(topic_name);
         try testing.expectEqual(2, channel.in_flight.count());
     }
 
     try broker.deleteTopic(topic_name);
-    try testing.expect(consumer.channel == null);
+    try testing.expect(client.consumer.channel == null);
 }
 
 test "channel empty" {
@@ -1537,11 +1694,11 @@ test "channel empty" {
     var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
-    var consumer = TestConsumer.init(allocator);
-    defer consumer.deinit();
+    var client = TestClient.init(allocator);
+    defer client.deinit();
 
-    try broker.subscribe(&consumer, topic_name, channel_name);
-    const channel = consumer.channel.?;
+    try broker.subscribe(&client, topic_name, channel_name);
+    const channel = client.consumer.channel.?;
 
     time.now = 1;
     try broker.publish(topic_name, "message 1");
@@ -1550,10 +1707,10 @@ test "channel empty" {
     try broker.publish(topic_name, "message 4");
 
     time.now = 2;
-    try consumer.pull();
-    try consumer.pull();
-    try consumer.pull();
-    try consumer.requeue(1, 0);
+    try client.pull();
+    try client.pull();
+    try client.pull();
+    try client.requeue(1, 0);
     try testing.expectEqual(2, channel.in_flight.count());
     try testing.expectEqual(1, channel.deferred.count());
     try testing.expectEqual(3, channel.sequence);
@@ -1574,16 +1731,16 @@ test "ephemeral channel" {
     var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
-    var consumer = TestConsumer.init(allocator);
-    defer consumer.deinit();
+    var client = TestClient.init(allocator);
+    defer client.deinit();
 
-    try broker.subscribe(&consumer, topic_name, channel_name);
-    const channel = consumer.channel.?;
-    const topic = consumer.channel.?.topic;
+    try broker.subscribe(&client, topic_name, channel_name);
+    const channel = client.consumer.channel.?;
+    const topic = channel.topic;
     try testing.expect(channel.ephemeral);
 
     try testing.expectEqual(1, topic.channels.count());
-    channel.unsubscribe(&consumer);
+    client.consumer.unsubscribe();
     try testing.expectEqual(0, topic.channels.count());
 }
 
@@ -1594,17 +1751,17 @@ test noop_notifier {
     var broker = TestBroker.init(allocator, &notifier, 0, .{});
     defer broker.deinit();
 
-    var consumer1 = TestConsumer.init(allocator);
+    var consumer1 = TestClient.init(allocator);
     defer consumer1.deinit();
     _ = try broker.subscribe(&consumer1, "topic1", "channel1");
     try testing.expectEqual(2, notifier.call_count);
 
-    var consumer2 = TestConsumer.init(allocator);
+    var consumer2 = TestClient.init(allocator);
     defer consumer2.deinit();
     _ = try broker.subscribe(&consumer2, "topic1", "channel2");
     try testing.expectEqual(3, notifier.call_count);
 
-    var consumer3 = TestConsumer.init(allocator);
+    var consumer3 = TestClient.init(allocator);
     defer consumer3.deinit();
     _ = try broker.subscribe(&consumer3, "topic2", "channel2");
     try testing.expectEqual(5, notifier.call_count);
@@ -1624,16 +1781,16 @@ test "depth" {
     var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
     defer broker.deinit();
 
-    var consumer1 = TestConsumer.init(allocator);
-    defer consumer1.deinit();
-    try broker.subscribe(&consumer1, topic_name, "channel1");
+    var client1 = TestClient.init(allocator);
+    defer client1.deinit();
+    try broker.subscribe(&client1, topic_name, "channel1");
 
-    var consumer2 = TestConsumer.init(allocator);
-    defer consumer2.deinit();
-    try broker.subscribe(&consumer2, topic_name, "channel2");
+    var client2 = TestClient.init(allocator);
+    defer client2.deinit();
+    try broker.subscribe(&client2, topic_name, "channel2");
 
-    const channel1 = consumer1.channel.?;
-    const channel2 = consumer2.channel.?;
+    const channel1 = client1.consumer.channel.?;
+    const channel2 = client2.consumer.channel.?;
     const topic = channel1.topic;
 
     try broker.publish(topic_name, "message 1");
@@ -1645,17 +1802,17 @@ test "depth" {
 
     try testing.expectEqual(0, channel1.sequence);
     try testing.expectEqual(0, channel2.sequence);
-    try consumer1.pullFinish();
+    try client1.pullFinish();
     try testing.expectEqual(1, channel1.sequence);
 
     try testing.expectEqual(1, channel1.metric.depth.value);
     try testing.expectEqual(2, channel2.metric.depth.value);
 
-    try consumer2.pullFinish();
+    try client2.pullFinish();
     try testing.expectEqual(1, channel1.metric.depth.value);
     try testing.expectEqual(1, channel2.metric.depth.value);
 
-    try consumer2.pullFinish();
+    try client2.pullFinish();
     try testing.expectEqual(1, channel1.metric.depth.value);
     try testing.expectEqual(0, channel2.metric.depth.value);
 
@@ -1692,20 +1849,20 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try testing.expectEqual(2, topic.stream.last_sequence);
 
     // 1 consumer for channel 1 and 2 consumers for channel 2
-    var channel1_consumer = TestConsumer.init(allocator);
+    var channel1_consumer = TestClient.init(allocator);
     defer channel1_consumer.deinit();
     try broker.subscribe(&channel1_consumer, topic_name, channel1_name);
 
-    var channel2_consumer1 = TestConsumer.init(allocator);
+    var channel2_consumer1 = TestClient.init(allocator);
     defer channel2_consumer1.deinit();
     try broker.subscribe(&channel2_consumer1, topic_name, channel2_name);
-    var channel2_consumer2 = TestConsumer.init(allocator);
+    var channel2_consumer2 = TestClient.init(allocator);
     defer channel2_consumer2.deinit();
-    channel2_consumer2._id = 2;
+    //channel2_consumer2._id = 2;
     try broker.subscribe(&channel2_consumer2, topic_name, channel2_name);
 
-    try testing.expectEqual(0, channel1_consumer.channel.?.sequence);
-    try testing.expectEqual(0, channel2_consumer1.channel.?.sequence);
+    try testing.expectEqual(0, channel1_consumer.consumer.channel.?.sequence);
+    try testing.expectEqual(0, channel2_consumer1.consumer.channel.?.sequence);
 
     // Consume messages
     try channel1_consumer.pullFinish();
@@ -1723,7 +1880,7 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try broker.deleteChannel(topic_name, channel1_name);
 
     // Re-queue from one consumer 1 to consumer 2
-    const channel2 = channel2_consumer2.channel.?;
+    const channel2 = channel2_consumer2.consumer.channel.?;
     try channel2_consumer1.pull();
     try testing.expectEqual(3, channel2_consumer1.lastSequence());
     try channel2_consumer1.requeue(3, 0);
@@ -1732,8 +1889,8 @@ fn publishFinish(allocator: mem.Allocator) !void {
     try testing.expectEqual(3, channel2_consumer2.lastSequence());
     // Unsubscribe consumer2
     try testing.expectEqual(1, channel2.in_flight.count());
-    try channel2.requeueAll(channel2_consumer2.id());
-    channel2.unsubscribe(&channel2_consumer2);
+    try channel2.requeueAll(&channel2_consumer2.consumer);
+    channel2_consumer2.consumer.unsubscribe();
     try testing.expectEqual(0, channel2.in_flight.count());
     try testing.expectEqual(1, channel2.deferred.count());
     try channel2_consumer1.pull();
@@ -1762,14 +1919,14 @@ test "dump/restore" {
         defer broker.deinit();
         const topic = try broker.getOrCreateTopic(topic_name);
 
-        var consumer1 = TestConsumer.init(allocator);
+        var consumer1 = TestClient.init(allocator);
         defer consumer1.deinit();
-        var consumer2 = TestConsumer.init(allocator);
+        var consumer2 = TestClient.init(allocator);
         defer consumer2.deinit();
         try broker.subscribe(&consumer1, topic_name, &channel1_name);
-        var channel1 = consumer1.channel.?;
+        var channel1 = consumer1.consumer.channel.?;
         try broker.subscribe(&consumer2, topic_name, &channel2_name);
-        var channel2 = consumer2.channel.?;
+        var channel2 = consumer2.consumer.channel.?;
 
         { // add 3 messages to the topic
             topic.stream.last_sequence = 100;
