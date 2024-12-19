@@ -54,8 +54,7 @@ pub fn BrokerType(Client: type, Notifier: type) type {
             /// Is client ready to send
             fn ready(self: Self) bool {
                 return self.pull_chunk == null and
-                    self.in_flight_count < self.ready_count and
-                    self.client.ready();
+                    self.in_flight_count < self.ready_count;
             }
 
             fn readyCount(self: Self) u32 {
@@ -108,6 +107,10 @@ pub fn BrokerType(Client: type, Notifier: type) type {
             }
 
             // Client api -----------------
+
+            fn onChannelReady(self: *Self) void {
+                self.client.onChannelReady();
+            }
 
             fn close(self: *Self) void {
                 self.channel = null;
@@ -292,7 +295,7 @@ pub fn BrokerType(Client: type, Notifier: type) type {
                     const channel = channel_ptr.*;
                     var m = &channel.metric;
                     const prefix = try std.fmt.bufPrint(&buf, "topic.{s}.channel.{s}", .{ topic.name, channel.name });
-                    try writer.gauge(prefix, "clients", channel.consumers.items.len);
+                    try writer.gauge(prefix, "clients", channel.consumers.count());
                     try writer.gauge(prefix, "deferred_count", channel.deferred.count());
                     try writer.gauge(prefix, "in_flight_count", channel.in_flight.count());
                     try writer.add(prefix, "depth", m.depth);
@@ -678,9 +681,7 @@ pub fn BrokerType(Client: type, Notifier: type) type {
                 allocator: mem.Allocator,
                 name: []const u8,
                 topic: *Topic,
-                consumers: std.ArrayList(*Consumer),
-                // Round robin consumers iterator.
-                consumers_iterator: ConsumersIterator,
+                consumers: Consumers,
 
                 // Sent but not jet acknowledged (fin) messages.
                 in_flight: std.AutoHashMap(u64, InFlightMsg),
@@ -710,6 +711,65 @@ pub fn BrokerType(Client: type, Notifier: type) type {
                     depth: Gauge = .{},
                 };
 
+                const Consumers = struct {
+                    list: std.ArrayList(*Consumer),
+                    last_idx: usize = 0,
+                    fn init(allocator: mem.Allocator) Consumers {
+                        return .{ .list = std.ArrayList(*Consumer).init(allocator) };
+                    }
+                    fn deinit(self: *Consumers) void {
+                        self.list.deinit();
+                    }
+                    fn append(self: *Consumers, consumer: *Consumer) !void {
+                        try self.list.append(consumer);
+                    }
+                    fn close(self: *Consumers) void {
+                        for (self.list.items) |consumer| {
+                            consumer.close();
+                        }
+                        self.list.clearAndFree();
+                    }
+                    fn remove(self: *Consumers, consumer: *Consumer) void {
+                        for (self.list.items, 0..) |ptr, i| {
+                            if (ptr == consumer) {
+                                _ = self.list.swapRemove(i);
+                                return;
+                            }
+                        }
+                        unreachable;
+                    }
+                    pub fn count(self: *Consumers) usize {
+                        return self.list.items.len;
+                    }
+                    fn iter(self: *Consumers) Iterator {
+                        return .{
+                            .parent = self,
+                            .idx = self.last_idx,
+                            .len = self.list.items.len,
+                        };
+                    }
+
+                    const Iterator = struct {
+                        parent: *Consumers,
+                        idx: usize,
+                        len: usize,
+
+                        fn next(self: *Iterator) ?*Consumer {
+                            while (self.len > 0) {
+                                self.len -= 1;
+                                const items = self.parent.list.items;
+                                self.idx = if (self.idx + 1 >= items.len) 0 else self.idx + 1;
+                                const consumer = items[self.idx];
+                                if (consumer.ready()) {
+                                    self.parent.last_idx = self.idx;
+                                    return consumer;
+                                }
+                            }
+                            return null;
+                        }
+                    };
+                };
+
                 // Init/deinit -----------------
 
                 fn init(self: *Channel, topic: *Topic, name: []const u8) !void {
@@ -718,8 +778,7 @@ pub fn BrokerType(Client: type, Notifier: type) type {
                         .allocator = allocator,
                         .name = name,
                         .topic = topic,
-                        .consumers = std.ArrayList(*Consumer).init(allocator),
-                        .consumers_iterator = .{ .channel = self },
+                        .consumers = Consumers.init(allocator),
                         .in_flight = std.AutoHashMap(u64, InFlightMsg).init(allocator),
                         .deferred = std.PriorityQueue(DeferredMsg, void, DeferredMsg.less).init(allocator, {}),
                         .ephemeral = protocol.isEphemeral(name),
@@ -727,10 +786,7 @@ pub fn BrokerType(Client: type, Notifier: type) type {
                 }
 
                 fn delete(self: *Channel) void {
-                    for (self.consumers.items) |consumer| {
-                        consumer.close();
-                    }
-                    self.consumers.clearAndFree();
+                    self.consumers.close();
                     self.releasePending();
                     self.deinit();
                 }
@@ -754,7 +810,7 @@ pub fn BrokerType(Client: type, Notifier: type) type {
 
                 // -----------------
 
-                // Called from topic when new topic message is created.
+                // Called from topic when message is published to the topic.
                 fn onPublish(self: *Channel, msgs: u32) void {
                     self.metric.depth.inc(msgs);
                     if (!self.needWakeup()) return;
@@ -769,8 +825,9 @@ pub fn BrokerType(Client: type, Notifier: type) type {
 
                 // Notify consumers that there are messages to pull.
                 fn wakeup(self: *Channel) void {
-                    while (self.consumers_iterator.next()) |consumer| {
-                        consumer.client.onChannelReady();
+                    var iter = self.consumers.iter();
+                    while (iter.next()) |consumer| {
+                        consumer.onChannelReady();
                         if (!self.needWakeup()) break;
                     }
                 }
@@ -1014,20 +1071,10 @@ pub fn BrokerType(Client: type, Notifier: type) type {
                         log.warn("failed to remove in flight messages {}", .{err});
                     };
 
-                    self.removeConsumer(consumer);
+                    self.consumers.remove(consumer);
 
-                    if (self.consumers.items.len == 0 and self.ephemeral)
+                    if (self.consumers.count() == 0 and self.ephemeral)
                         self.topic.removeEphemeralChannel(self);
-                }
-
-                fn removeConsumer(self: *Channel, consumer: *Consumer) void {
-                    for (self.consumers.items, 0..) |ptr, i| {
-                        if (ptr == consumer) {
-                            _ = self.consumers.swapRemove(i);
-                            return;
-                        }
-                    }
-                    unreachable;
                 }
 
                 // Re-queue all messages which are in-flight for some consumer.
@@ -1089,50 +1136,70 @@ pub fn BrokerType(Client: type, Notifier: type) type {
     };
 }
 
-test "channel consumers iterator" {
+test "consumers" {
     const allocator = testing.allocator;
+    const Consumers = TestBroker.Channel.Consumers;
+    var cs = Consumers.init(allocator);
+    defer cs.deinit();
 
-    var notifier = NoopNotifier{};
-    var broker = TestBroker.init(allocator, &notifier, 0, .{});
-    defer broker.deinit();
+    var c1: TestBroker.Consumer = .{};
+    try cs.append(&c1);
 
-    var client1 = TestClient.init(allocator);
-    try broker.subscribe(&client1, "topic", "channel");
-    const channel = client1.consumer.channel.?;
-    client1.consumer.ready_count = 1;
+    // c1 is not ready
+    var iter = cs.iter();
+    try testing.expect(iter.next() == null);
 
-    var iter = channel.consumers_iterator;
-    try testing.expectEqual(&client1.consumer, iter.next().?);
-    try testing.expectEqual(&client1.consumer, iter.next().?);
-    client1.consumer.ready_count = 0;
-    try testing.expectEqual(null, iter.next());
+    // iterator on single consumer
+    c1.ready_count = 1;
+    iter = cs.iter();
+    try testing.expectEqual(&c1, iter.next().?);
+    try testing.expect(iter.next() == null);
 
-    client1.consumer.ready_count = 1;
-    var client2 = TestClient.init(allocator);
-    var client3 = TestClient.init(allocator);
-    try broker.subscribe(&client2, "topic", "channel");
-    try broker.subscribe(&client3, "topic", "channel");
-    try testing.expectEqual(3, channel.consumers.items.len);
-    client2.consumer.ready_count = 1;
-    client3.consumer.ready_count = 1;
+    // append another
+    var c2: TestBroker.Consumer = .{};
+    try cs.append(&c2);
+    c2.ready_count = 1;
+    // iterator on 2 consumers
+    iter = cs.iter();
+    try testing.expectEqual(&c2, iter.next().?);
+    try testing.expectEqual(&c1, iter.next().?);
+    try testing.expect(iter.next() == null);
+    // starts from next
+    iter = cs.iter();
+    try testing.expectEqual(&c2, iter.next().?);
+    try testing.expectEqual(&c1, iter.next().?);
+    try testing.expect(iter.next() == null);
 
-    try testing.expectEqual(3, channel.consumers.items.len);
-    try testing.expectEqual(&client2.consumer, iter.next().?);
-    try testing.expectEqual(&client3.consumer, iter.next().?);
-    try testing.expectEqual(&client1.consumer, iter.next().?);
-    try testing.expectEqual(&client2.consumer, iter.next().?);
-
-    try testing.expectEqual(&client3.consumer, iter.next().?);
-    try testing.expectEqual(&client1.consumer, iter.next().?);
-    try testing.expectEqual(&client2.consumer, iter.next().?);
-    client3.consumer.ready_count = 0;
-    try testing.expectEqual(&client1.consumer, iter.next().?);
-    try testing.expectEqual(&client2.consumer, iter.next().?);
-    try testing.expectEqual(&client1.consumer, iter.next().?);
-    client2.consumer.ready_count = 0;
-    try testing.expectEqual(&client1.consumer, iter.next().?);
-    try testing.expectEqual(&client1.consumer, iter.next().?);
-    client1.consumer.ready_count = 0;
+    // append another
+    var c3: TestBroker.Consumer = .{};
+    try cs.append(&c3);
+    c3.ready_count = 1;
+    // iterator on 3 consumers
+    iter = cs.iter();
+    try testing.expectEqual(&c2, iter.next().?);
+    try testing.expectEqual(&c3, iter.next().?);
+    try testing.expectEqual(&c1, iter.next().?);
+    try testing.expect(iter.next() == null);
+    // partial iteration
+    iter = cs.iter();
+    try testing.expectEqual(&c2, iter.next().?);
+    try testing.expectEqual(&c3, iter.next().?);
+    // continues on next consumer
+    iter = cs.iter();
+    try testing.expectEqual(&c1, iter.next().?);
+    try testing.expectEqual(&c2, iter.next().?);
+    try testing.expectEqual(&c3, iter.next().?);
+    try testing.expect(iter.next() == null);
+    // skips not ready consumers
+    c2.ready_count = 0;
+    iter = cs.iter();
+    try testing.expectEqual(&c1, iter.next().?);
+    try testing.expectEqual(&c3, iter.next().?);
+    try testing.expect(iter.next() == null);
+    // remove
+    cs.remove(&c3);
+    iter = cs.iter();
+    try testing.expectEqual(&c1, iter.next().?);
     try testing.expect(iter.next() == null);
 }
 
@@ -1226,7 +1293,7 @@ test "channel fin req" {
         client.consumer.unsubscribe();
         try testing.expectEqual(0, channel.in_flight.count());
         try testing.expectEqual(1, channel.deferred.count());
-        try testing.expectEqual(0, channel.consumers.items.len);
+        try testing.expectEqual(0, channel.consumers.count());
     }
 }
 

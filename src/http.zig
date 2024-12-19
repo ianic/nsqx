@@ -300,10 +300,10 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
             if (args.channel.len > 0 and !mem.eql(u8, channel.name, args.channel))
                 continue;
 
-            const client_count = channel.consumers.items.len;
+            const client_count = channel.consumers.count();
             const clients: []Stat.Client = if (args.includeClients()) brk: {
                 var clients = try allocator.alloc(Stat.Client, client_count);
-                for (channel.consumers.items, 0..) |consumer, i| {
+                for (channel.consumers.list.items, 0..) |consumer, i| {
                     const client = consumer.client;
                     const remote_address = try std.fmt.allocPrint(allocator, "{}", .{client.addr});
                     clients[i] = Stat.Client{
@@ -416,7 +416,7 @@ fn metricBroker(allocator: mem.Allocator, broker: *Broker, writer: anytype) !voi
                 .finish = channel.metric.finish.value,
                 .requeue = channel.metric.requeue.value,
                 .timeout = channel.metric.timeout.value,
-                .clients = channel.consumers.items.len,
+                .clients = channel.consumers.count(),
                 .sequence = channel.sequence,
             });
         }
