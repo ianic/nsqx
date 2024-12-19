@@ -114,7 +114,7 @@ pub fn BrokerType(Client: type, Notifier: type) type {
 
             fn close(self: *Self) void {
                 self.channel = null;
-                self.client.shutdown();
+                self.client.onChannelClose();
             }
         };
 
@@ -1297,89 +1297,7 @@ test "channel fin req" {
     }
 }
 
-const TestConsumer = struct {
-    const Self = @This();
-
-    allocator: mem.Allocator,
-    channel: ?*TestBroker.Channel = null,
-    sequences: std.ArrayList(u64) = undefined,
-    ready_count: u32 = 0,
-    _id: u32 = 1,
-
-    fn init(allocator: mem.Allocator) Self {
-        return .{
-            .allocator = allocator,
-            .sequences = std.ArrayList(u64).init(allocator),
-        };
-    }
-
-    pub fn id(self: Self) u32 {
-        return self._id;
-    }
-
-    pub fn msgTimeout(_: *Self) u32 {
-        return 60000;
-    }
-
-    fn deinit(self: *Self) void {
-        self.sequences.deinit();
-    }
-
-    fn wakeup(self: *Self) void {
-        self.wakeup_() catch {};
-    }
-
-    fn wakeup_(self: *Self) !void {
-        {
-            // Making this method fallible in check all allocations
-            const buf = try self.allocator.alloc(u8, 8);
-            defer self.allocator.free(buf);
-        }
-        while (self.ready_count > 0) {
-            const sc = try self.channel.?.pull(self.id(), self.msgTimeout(), self.ready_count) orelse break;
-            var pos: usize = 0;
-            while (pos < sc.data.len) {
-                const header = sc.data[pos .. pos + 34];
-                const size = mem.readInt(u32, header[0..4], .big);
-                const page = mem.readInt(u32, header[22..26], .big);
-                const sequence = mem.readInt(u64, header[26..34], .big);
-                pos += 4 + size;
-                _ = page;
-                try self.sequences.append(sequence);
-            }
-            self.ready_count -= sc.count;
-            sc.done();
-        }
-    }
-
-    fn ready(self: *Self) bool {
-        return self.ready_count > 0;
-    }
-
-    fn finish(self: *Self, sequence: u64) !void {
-        try self.channel.?.finish(self.id(), protocol.msg_id.encode(sequence));
-    }
-
-    fn requeue(self: *Self, sequence: u64, delay: u32) !void {
-        try self.channel.?.requeue(self.id(), protocol.msg_id.encode(sequence), delay);
-    }
-
-    fn pull(self: *Self) !void {
-        self.ready_count = 1;
-        try self.wakeup_();
-    }
-
-    fn pullFinish(self: *Self) !void {
-        try self.pull();
-        try self.finish(self.lastSequence());
-    }
-
-    fn lastSequence(self: *Self) u64 {
-        return self.sequences.items[self.sequences.items.len - 1];
-    }
-
-    fn shutdown(_: *Self) void {}
-};
+var noop_notifier = NoopNotifier{};
 
 pub const NoopNotifier = struct {
     call_count: usize = 0,
@@ -1399,7 +1317,6 @@ pub const NoopNotifier = struct {
     fn ensureCapacity(_: *Self, _: []const u8, _: []const u8) !void {}
 };
 
-var noop_notifier = NoopNotifier{};
 const TestBroker = BrokerType(TestClient, NoopNotifier);
 
 const TestClient = struct {
@@ -1437,7 +1354,7 @@ const TestClient = struct {
         }
         self.consumer.onSend();
     }
-    fn shutdown(_: Self) void {}
+    fn onChannelClose(_: Self) void {}
 
     fn pull(self: *Self) !void {
         self.consumer.ready_count = self.consumer.in_flight_count + 1;

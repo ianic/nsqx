@@ -157,16 +157,16 @@ pub const Conn = struct {
 
     // Channel api -----------------
 
-    pub fn ready(self: *Conn) bool {
-        return (!self.send_op.active() and self.state == .connected);
-    }
-
     pub fn onChannelReady(self: *Conn) void {
         self.send();
     }
 
+    pub fn onChannelClose(self: *Conn) void {
+        self.shutdown();
+    }
+
     fn send(self: *Conn) void {
-        if (!self.ready()) return;
+        if (self.send_op.active() or self.state != .connected) return;
 
         { // Prepare pending responses
             while (self.send_op.free() > 0) {
