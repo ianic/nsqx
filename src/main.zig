@@ -45,7 +45,7 @@ pub fn main() !void {
     var lookup_connector: lookup.Connector = undefined;
     try lookup_connector.init(allocator, &io, &broker.registrations.stream, options.lookup_tcp_addresses, options);
     defer lookup_connector.deinit();
-    broker.setRegistrationsCallback(&lookup_connector, lookup.Connector.onAppendCallback);
+    broker.setRegistrationsCallback(&lookup_connector, lookup.Connector.onRegister);
 
     var tcp_listener: tcp.Listener = undefined;
     try tcp_listener.init(allocator, &io, &broker, options, try socket(options.tcp_address));

@@ -93,7 +93,7 @@ pub const Connector = struct {
         }
     }
 
-    pub fn onAppendCallback(ptr: *anyopaque) void {
+    pub fn onRegister(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         for (self.connections.items) |conn| conn.pull();
     }

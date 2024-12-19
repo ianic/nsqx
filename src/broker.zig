@@ -123,7 +123,7 @@ pub fn BrokerType(Client: type) type {
             stream: store.Stream,
 
             ptr: ?*anyopaque = null,
-            onAppendCallback: *const fn (ptr: *anyopaque) void = undefined,
+            onRegister: *const fn (ptr: *anyopaque) void = undefined,
 
             fn init(allocator: mem.Allocator) Self {
                 return .{
@@ -175,7 +175,7 @@ pub fn BrokerType(Client: type) type {
                 const res = try self.stream.alloc(@intCast(bytes_count));
                 _ = try std.fmt.bufPrint(res.data, fmt, args);
                 if (self.ptr) |ptr|
-                    self.onAppendCallback(ptr);
+                    self.onRegister(ptr);
             }
         };
 
@@ -218,10 +218,10 @@ pub fn BrokerType(Client: type) type {
         pub fn setRegistrationsCallback(
             self: *Broker,
             ptr: *anyopaque,
-            onAppendCallback: *const fn (ptr: *anyopaque) void,
+            onRegister: *const fn (ptr: *anyopaque) void,
         ) void {
             self.registrations.ptr = ptr;
-            self.registrations.onAppendCallback = onAppendCallback;
+            self.registrations.onRegister = onRegister;
         }
 
         pub fn tick(self: *Broker, ts: u64) !u64 {
@@ -2008,13 +2008,13 @@ test "registrations" {
 
     const T = struct {
         call_count: usize = 0,
-        fn onAppendCallback(ptr: *anyopaque) void {
+        fn onRegister(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.call_count += 1;
         }
     };
     var t: T = .{};
-    broker.setRegistrationsCallback(&t, T.onAppendCallback);
+    broker.setRegistrationsCallback(&t, T.onRegister);
 
     try broker.createChannel("foo", "bar");
     try testing.expectEqual(2, t.call_count);
