@@ -25,7 +25,7 @@ var time: struct {
     }
 } = .{};
 
-pub fn BrokerType(Client: type, Notifier: type) type {
+pub fn BrokerType(Client: type) type {
     return struct {
         const Broker = @This();
         const Topic = TopicType();
@@ -118,9 +118,70 @@ pub fn BrokerType(Client: type, Notifier: type) type {
             }
         };
 
+        const Registrations = struct {
+            const Self = @This();
+            stream: store.Stream,
+
+            ptr: ?*anyopaque = null,
+            onAppendCallback: *const fn (ptr: *anyopaque) void = undefined,
+
+            fn init(allocator: mem.Allocator) Self {
+                return .{
+                    .stream = store.Stream.init(
+                        allocator,
+                        .{
+                            .initial_page_size = 64 * 1024,
+                            .max_page_size = 1024 * 1024,
+                            .ack_policy = .none,
+                            .retention_policy = .all,
+                        },
+                        null,
+                    ),
+                };
+            }
+
+            fn deinit(self: *Self) void {
+                self.stream.deinit();
+            }
+
+            pub fn topicCreated(self: *Self, name: []const u8) void {
+                self.append("REGISTER {s}\n", .{name});
+            }
+
+            pub fn channelCreated(self: *Self, topic_name: []const u8, name: []const u8) void {
+                self.append("REGISTER {s} {s}\n", .{ topic_name, name });
+            }
+
+            pub fn topicDeleted(self: *Self, name: []const u8) void {
+                self.append("UNREGISTER {s}\n", .{name});
+            }
+
+            pub fn channelDeleted(self: *Self, topic_name: []const u8, name: []const u8) void {
+                self.append("UNREGISTER {s} {s}\n", .{ topic_name, name });
+            }
+
+            pub fn ensureCapacity(self: *Self, topic_name: []const u8, channel_name: []const u8) !void {
+                try self.stream.ensureUnusedCapacity(@intCast(10 + 1 + topic_name.len + 1 + channel_name.len + 1));
+            }
+
+            fn append(self: *Self, comptime fmt: []const u8, args: anytype) void {
+                self.appendStream(fmt, args) catch |err| {
+                    log.err("add registration failed {}", .{err});
+                };
+            }
+
+            fn appendStream(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+                const bytes_count = std.fmt.count(fmt, args);
+                const res = try self.stream.alloc(@intCast(bytes_count));
+                _ = try std.fmt.bufPrint(res.data, fmt, args);
+                if (self.ptr) |ptr|
+                    self.onAppendCallback(ptr);
+            }
+        };
+
         allocator: mem.Allocator,
         topics: std.StringHashMap(*Topic),
-        notifier: *Notifier,
+        registrations: Registrations,
         options: Options,
 
         started_at: u64,
@@ -132,18 +193,17 @@ pub fn BrokerType(Client: type, Notifier: type) type {
 
         pub fn init(
             allocator: mem.Allocator,
-            notifier: *Notifier,
             now: u64,
             options: Options,
         ) Broker {
             return .{
                 .allocator = allocator,
                 .topics = std.StringHashMap(*Topic).init(allocator),
-                .notifier = notifier,
                 .started_at = now,
                 .options = options,
                 .metric = .{ .max_mem = options.max_mem },
                 .timer_queue = timer.Queue.init(allocator),
+                .registrations = Registrations.init(allocator),
             };
         }
 
@@ -152,6 +212,16 @@ pub fn BrokerType(Client: type, Notifier: type) type {
             while (iter.next()) |e| e.*.deinit();
             self.topics.deinit();
             self.timer_queue.deinit();
+            self.registrations.deinit();
+        }
+
+        pub fn setRegistrationsCallback(
+            self: *Broker,
+            ptr: *anyopaque,
+            onAppendCallback: *const fn (ptr: *anyopaque) void,
+        ) void {
+            self.registrations.ptr = ptr;
+            self.registrations.onAppendCallback = onAppendCallback;
         }
 
         pub fn tick(self: *Broker, ts: u64) !u64 {
@@ -164,7 +234,7 @@ pub fn BrokerType(Client: type, Notifier: type) type {
         fn getOrCreateTopic(self: *Broker, name: []const u8) !*Topic {
             if (self.topics.get(name)) |t| return t;
 
-            try self.notifier.ensureCapacity(name, "");
+            try self.registrations.ensureCapacity(name, "");
             try self.topics.ensureUnusedCapacity(1);
 
             const topic = try self.allocator.create(Topic);
@@ -176,7 +246,7 @@ pub fn BrokerType(Client: type, Notifier: type) type {
             topic.timer_op.init(&self.timer_queue, topic, Topic.onTimer);
 
             self.topics.putAssumeCapacityNoClobber(key, topic);
-            self.notifier.topicCreated(key);
+            self.registrations.topicCreated(key);
             log.debug("created topic {s}", .{name});
             return topic;
         }
@@ -208,11 +278,11 @@ pub fn BrokerType(Client: type, Notifier: type) type {
         }
 
         pub fn deleteTopic(self: *Broker, name: []const u8) !void {
-            try self.notifier.ensureCapacity(name, "");
+            try self.registrations.ensureCapacity(name, "");
             const kv = self.topics.fetchRemove(name) orelse return error.NotFound;
             const topic = kv.value;
             topic.delete();
-            self.notifier.topicDeleted(name);
+            self.registrations.topicDeleted(name);
             log.debug("deleted topic {s}", .{name});
         }
 
@@ -223,9 +293,9 @@ pub fn BrokerType(Client: type, Notifier: type) type {
 
         pub fn deleteChannel(self: *Broker, topic_name: []const u8, name: []const u8) !void {
             const topic = self.topics.get(topic_name) orelse return error.NotFound;
-            try self.notifier.ensureCapacity(topic_name, name);
+            try self.registrations.ensureCapacity(topic_name, name);
             try topic.deleteChannel(name);
-            self.notifier.channelDeleted(topic_name, name);
+            self.registrations.channelDeleted(topic_name, name);
             log.debug("deleted channel {s} on topic {s}", .{ name, topic_name });
         }
 
@@ -516,7 +586,7 @@ pub fn BrokerType(Client: type, Notifier: type) type {
                 fn getOrCreateChannel(self: *Topic, name: []const u8) !*Channel {
                     if (self.channels.get(name)) |channel| return channel;
 
-                    try self.broker.notifier.ensureCapacity(self.name, name);
+                    try self.broker.registrations.ensureCapacity(self.name, name);
                     const first_channel = self.channels.count() == 0;
                     const channel = try self.allocator.create(Channel);
                     errdefer self.allocator.destroy(channel);
@@ -530,7 +600,7 @@ pub fn BrokerType(Client: type, Notifier: type) type {
                     channel.timer_op.init(&self.broker.timer_queue, channel, Channel.onTimer);
                     channel.sequence = self.stream.subscribe(if (first_channel) .all else .new);
                     channel.metric.depth.set(if (first_channel) self.stream.metric.msgs.value else 0);
-                    self.broker.notifier.channelCreated(self.name, channel.name);
+                    self.broker.registrations.channelCreated(self.name, channel.name);
                     log.debug("topic '{s}' channel '{s}' created", .{ self.name, channel.name });
                     return channel;
                 }
@@ -1979,4 +2049,40 @@ test "dump/restore" {
 
     try std.fs.cwd().deleteTree(dir_name);
     time.now = 0;
+}
+
+test "registrations" {
+    const allocator = testing.allocator;
+    var broker = TestBroker.init(allocator, &noop_notifier, 0, .{});
+    defer broker.deinit();
+
+    const T = struct {
+        call_count: usize = 0,
+        fn onAppendCallback(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+        }
+    };
+    var t: T = .{};
+    broker.setRegistrationsCallback(&t, T.onAppendCallback);
+
+    try broker.createChannel("foo", "bar");
+    try testing.expectEqual(2, t.call_count);
+    try broker.createChannel("jozo", "bozo");
+    try broker.deleteChannel("jozo", "bozo");
+    try broker.deleteTopic("jozo");
+    try testing.expectEqual(6, t.call_count);
+
+    const expected =
+        \\REGISTER foo
+        \\REGISTER foo bar
+        \\REGISTER jozo
+        \\REGISTER jozo bozo
+        \\UNREGISTER jozo bozo
+        \\UNREGISTER jozo
+        \\
+    ;
+
+    const res = broker.registrations.stream.pull(0, 100).?;
+    try testing.expectEqualStrings(expected, res.data);
 }

@@ -13,7 +13,7 @@ const http = @import("http.zig");
 const lookup = @import("lookup.zig");
 const statsd = @import("statsd.zig");
 const timer = @import("timer.zig");
-pub const Broker = @import("broker.zig").BrokerType(tcp.Conn, lookup.Connector);
+pub const Broker = @import("broker.zig").BrokerType(tcp.Conn);
 
 pub const std_options = std.Options{
     .log_level = if (builtin.mode == .Debug) .debug else .warn,
@@ -39,12 +39,13 @@ pub fn main() !void {
     try io.init(allocator, options.io);
     defer io.deinit();
 
-    var lookup_connector: lookup.Connector = undefined;
-    try lookup_connector.init(allocator, &io, options.lookup_tcp_addresses, options);
-    defer lookup_connector.deinit();
-
-    var broker = Broker.init(allocator, &lookup_connector, io.now(), options.broker);
+    var broker = Broker.init(allocator, io.now(), options.broker);
     defer broker.deinit();
+
+    var lookup_connector: lookup.Connector = undefined;
+    try lookup_connector.init(allocator, &io, &broker.registrations.stream, options.lookup_tcp_addresses, options);
+    defer lookup_connector.deinit();
+    broker.setRegistrationsCallback(&lookup_connector, lookup.Connector.onAppendCallback);
 
     var tcp_listener: tcp.Listener = undefined;
     try tcp_listener.init(allocator, &io, &broker, options, try socket(options.tcp_address));

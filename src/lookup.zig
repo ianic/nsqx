@@ -23,7 +23,7 @@ pub const Connector = struct {
     connections: std.ArrayList(*Conn),
     identify: []const u8,
     ticker_op: Op = .{},
-    stream: Stream,
+    stream: *Stream = undefined,
     state: State,
     const State = enum {
         connected,
@@ -35,6 +35,7 @@ pub const Connector = struct {
         self: *Self,
         allocator: mem.Allocator,
         io: *Io,
+        stream: *Stream,
         lookup_tcp_addresses: []net.Address,
         options: Options,
     ) !void {
@@ -53,16 +54,7 @@ pub const Connector = struct {
             .connections = std.ArrayList(*Conn).init(allocator),
             .identify = identify,
             .state = .connected,
-            .stream = Stream.init(
-                allocator,
-                .{
-                    .initial_page_size = 64 * 1024,
-                    .max_page_size = 1024 * 1024,
-                    .ack_policy = .none,
-                    .retention_policy = .all,
-                },
-                null,
-            ),
+            .stream = stream,
         };
         errdefer self.deinit();
         try self.connections.ensureUnusedCapacity(lookup_tcp_addresses.len);
@@ -93,7 +85,6 @@ pub const Connector = struct {
         }
         self.connections.deinit();
         self.allocator.free(self.identify);
-        self.stream.deinit();
     }
 
     fn onTick(self: *Self) void {
@@ -102,38 +93,9 @@ pub const Connector = struct {
         }
     }
 
-    pub fn topicCreated(self: *Self, name: []const u8) void {
-        self.append("REGISTER {s}\n", .{name});
-    }
-
-    pub fn channelCreated(self: *Self, topic_name: []const u8, name: []const u8) void {
-        self.append("REGISTER {s} {s}\n", .{ topic_name, name });
-    }
-
-    pub fn topicDeleted(self: *Self, name: []const u8) void {
-        self.append("UNREGISTER {s}\n", .{name});
-    }
-
-    pub fn channelDeleted(self: *Self, topic_name: []const u8, name: []const u8) void {
-        self.append("UNREGISTER {s} {s}\n", .{ topic_name, name });
-    }
-
-    pub fn ensureCapacity(self: *Self, topic_name: []const u8, channel_name: []const u8) !void {
-        try self.stream.ensureUnusedCapacity(@intCast(10 + 1 + topic_name.len + 1 + channel_name.len + 1));
-    }
-
-    fn append(self: *Self, comptime fmt: []const u8, args: anytype) void {
-        self.appendStream(fmt, args) catch |err| {
-            // TODO: what now
-            log.err("add registration failed {}", .{err});
-        };
-    }
-
-    fn appendStream(self: *Self, comptime fmt: []const u8, args: anytype) !void {
-        const bytes_count = std.fmt.count(fmt, args);
-        const res = try self.stream.alloc(@intCast(bytes_count));
-        _ = try std.fmt.bufPrint(res.data, fmt, args);
-        for (self.connections.items) |conn| conn.wakeup();
+    pub fn onAppendCallback(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        for (self.connections.items) |conn| conn.pull();
     }
 };
 
@@ -240,10 +202,10 @@ const Conn = struct {
     }
 
     fn onSend(self: *Self) Error!void {
-        self.wakeup();
+        self.pull();
     }
 
-    fn wakeup(self: *Self) void {
+    fn pull(self: *Self) void {
         if (self.send_op.active()) return;
         if (self.state != .connected) return;
 
