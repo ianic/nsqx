@@ -251,6 +251,7 @@ pub const Conn = struct {
             switch (err) {
                 error.Invalid => try self.respond(.invalid),
                 error.InvalidName, error.InvalidNameCharacter => try self.respond(.bad_topic),
+                else => return err,
             }
             return err; // fatal, close connection on parser error
         }) |msg| {

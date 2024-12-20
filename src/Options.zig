@@ -51,6 +51,8 @@ const usage =
     \\  limits:
     \\  --max-msg-size int(kMG)
     \\        maximum size of a single message in bytes (default 1M)
+    \\  --max-body-size int(kMG)
+    \\        maximum size of a single command body (default 5M)
     \\  --max-mem int(kMG)
     \\        maximum amount of memory used for all messages in broker (default 50% system memory)
     \\  --max-topic-mem int(kMG)
@@ -106,6 +108,7 @@ statsd: Statsd = .{},
 
 pub const Broker = struct {
     max_msg_size: u32 = 1024 * 1024,
+    max_body_size: u32 = 5 * 1024 * 1024,
     max_mem: u64 = maxInt(u64),
     max_topic_mem: u64 = maxInt(u64),
 
@@ -215,6 +218,8 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
             // broker options
         } else if (iter.byteSize(u32, "max-msg-size")) |size| {
             opt.broker.max_msg_size = size;
+        } else if (iter.byteSize(u32, "max-body-size")) |size| {
+            opt.broker.max_body_size = size;
         } else if (iter.byteSize(u64, "max-mem")) |d| {
             opt.broker.max_mem = d;
         } else if (iter.byteSize(u64, "max-topic-mem")) |d| {
@@ -431,6 +436,7 @@ pub fn main() !void {
 
     // broker options
     std.debug.print("max_msg_size: {}\n", .{opt.broker.max_msg_size});
+    std.debug.print("max_body_size: {}\n", .{opt.broker.max_body_size});
     std.debug.print("max_mem: {} {}G\n", .{ opt.broker.max_mem, opt.broker.max_mem / 1024 / 1024 / 1024 });
     std.debug.print("max_topic_mem: {}\n", .{opt.broker.max_topic_mem});
     std.debug.print("initial_page_size: {}\n", .{opt.broker.initial_page_size});

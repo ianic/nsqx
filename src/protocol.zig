@@ -69,6 +69,9 @@ pub const Parser = struct {
     buf: []const u8,
     pos: usize = 0,
 
+    max_msg_size: u32 = 0,
+    max_body_size: u32 = 0,
+
     // null - Not enough data in the buf.
     // pos  - Tail position after successful message parsing.
     //        First byte of the next message in buf or buf.len.
@@ -79,6 +82,7 @@ pub const Parser = struct {
                 error.Invalid => return error.Invalid,
                 error.InvalidName => return error.InvalidName,
                 error.InvalidNameCharacter => return error.InvalidNameCharacter,
+                error.Overflow => return error.Overflow,
             };
             if (msg != .version) return msg;
         }
@@ -101,7 +105,7 @@ pub const Parser = struct {
             'I' => {
                 // IDENTIFY\n[ 4-byte size in bytes ][ N-byte JSON data ]
                 try p.matchString("IDENTIFY\n");
-                return .{ .identify = try p.readBytes(try p.readInt()) };
+                return .{ .identify = try p.readBytes(try p.readInt(p.max_body_size)) };
             },
             'S' => {
                 // SUB <topic_name> <channel_name>\n
@@ -114,7 +118,7 @@ pub const Parser = struct {
                 // PUB <topic_name>\n[ 4-byte size in bytes ][ N-byte binary data ]
                 try p.matchString("PUB ");
                 const topic = try validateName(try p.readString('\n'));
-                const data = try p.readBytes(try p.readInt());
+                const data = try p.readBytes(try p.readInt(p.max_msg_size));
                 return .{ .publish = .{ .topic = topic, .data = data } };
             },
             'M' => {
@@ -122,15 +126,15 @@ pub const Parser = struct {
                 // [ 4-byte message #1 size ][ N-byte binary data ]
                 try p.matchString("MPUB ");
                 const topic = try validateName(try p.readString('\n'));
-                const size = try p.readInt();
+                const size = try p.readInt(p.max_body_size);
                 if (size < 4) return error.Invalid;
-                const msgs = try p.readInt();
+                const msgs = try p.readInt(0);
                 const data = try p.readBytes(size - 4);
                 // check that individual messages has [size][data]
                 const data_end_pos = p.pos;
                 p.pos -= data.len;
                 for (0..msgs) |_| {
-                    const msg_size = p.readInt() catch return error.Invalid;
+                    const msg_size = p.readInt(p.max_msg_size) catch return error.Invalid;
                     _ = p.readBytes(msg_size) catch return error.Invalid;
                 }
                 if (p.pos != data_end_pos) return error.Invalid;
@@ -143,7 +147,7 @@ pub const Parser = struct {
                 try p.matchString("DPUB ");
                 const topic = try validateName(try p.readString(' '));
                 const delay = try p.readStringInt('\n');
-                const size = try p.readInt();
+                const size = try p.readInt(p.max_msg_size);
                 const data = try p.readBytes(size);
                 return .{ .deferred_publish = .{ .topic = topic, .delay = delay, .data = data } };
             },
@@ -187,7 +191,7 @@ pub const Parser = struct {
             },
             'A' => { // AUTH\n[ 4-byte size in bytes ][ N-byte Auth Secret ]
                 try p.matchString("AUTH\n");
-                const size = try p.readInt();
+                const size = try p.readInt(p.max_body_size);
                 const data = try p.readBytes(size);
                 return .{ .auth = data };
             },
@@ -214,11 +218,14 @@ pub const Parser = struct {
         return fmt.parseInt(u32, try p.readString(delim), 10) catch return error.Invalid;
     }
 
-    fn readInt(p: *Parser) !u32 {
+    fn readInt(p: *Parser, max_value: u32) !u32 {
         const buf = p.buf[p.pos..];
         if (buf.len < 4) return error.SplitBuffer;
         p.pos += 4;
-        return mem.readInt(u32, buf[0..4], .big);
+        const value = mem.readInt(u32, buf[0..4], .big);
+        if (max_value > 0 and value > max_value)
+            return error.Overflow;
+        return value;
     }
 
     fn readString(p: *Parser, delim: u8) ![]const u8 {
@@ -314,6 +321,10 @@ test "pub" {
         p = Parser{ .buf = buf[0..12] };
         try testing.expectError(error.SplitBuffer, p.parse());
         try testing.expectEqual(0, p.pos);
+    }
+    { // message size overflow
+        var p = Parser{ .buf = buf, .max_msg_size = 4 };
+        try testing.expectError(error.Overflow, p.parse());
     }
 }
 

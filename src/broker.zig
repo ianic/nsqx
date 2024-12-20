@@ -660,6 +660,13 @@ pub fn BrokerType(Client: type) type {
                 }
 
                 fn multiPublish(self: *Topic, msgs: u32, data: []const u8) !void {
+                    if (data.len > self.broker.options.max_body_size) {
+                        log.err(
+                            "{s} multi publish failed, messages length of {} bytes over limit of {} bytes ",
+                            .{ self.name, data.len, self.broker.options.max_body_size },
+                        );
+                        return error.MessageSizeOverflow;
+                    }
                     if (msgs == 0) return;
                     var pos: usize = 0;
                     for (0..msgs) |_| {

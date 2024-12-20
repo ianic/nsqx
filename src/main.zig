@@ -28,6 +28,7 @@ pub fn main() !void {
 
     var options = try Options.initFromArgs(allocator);
     defer options.deinit(allocator);
+
     var data_dir = std.fs.cwd().openDir(options.data_path, .{}) catch |err| switch (err) {
         error.FileNotFound => fatal("unable to open data path {s}", .{options.data_path}),
         else => return err,
