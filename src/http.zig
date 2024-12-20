@@ -106,8 +106,11 @@ pub const Conn = struct {
             .{ self.socket, head.method, head.target, content_length },
         );
 
+        var target_buf: [256]u8 = undefined;
+        const target = std.Uri.percentDecodeBackwards(&target_buf, head.target);
+        const cmd = parse(target) catch return error.NotFound;
+
         const broker = self.listener.broker;
-        const cmd = parse(head.target) catch return error.NotFound;
         switch (cmd) {
             .stats => |args| try jsonStat(self.gpa, args, writer, broker),
             .info => try jsonInfo(writer, broker, self.listener.options),
