@@ -613,10 +613,44 @@ pub fn BrokerType(Client: type) type {
                         );
                         return error.MessageSizeOverflow;
                     }
-                    const res = try self.stream.alloc(@intCast(protocol.header_len + data.len));
+                    const res = self.stream.alloc(@intCast(protocol.header_len + data.len)) catch |err| brk: switch (err) {
+                        error.StreamMemoryLimit => {
+                            if (self.cleanupStream())
+                                break :brk try self.stream.alloc(@intCast(protocol.header_len + data.len));
+                            return err;
+                        },
+                        else => return err,
+                    };
                     protocol.writeHeader(res.data, @intCast(data.len), time.now, res.sequence);
                     const body = res.data[protocol.header_len..];
                     @memcpy(body, data);
+                }
+
+                fn cleanupStream(self: *Topic) bool {
+                    // Find channel which is holding oldest reference in store.
+                    const last_channel = brk: {
+                        var last_channel: ?*Channel = null;
+                        var min_sequence: u64 = math.maxInt(u64);
+                        var iter = self.channels.valueIterator();
+                        while (iter.next()) |e| {
+                            const channel = e.*;
+                            if (channel.minSequence() < min_sequence) {
+                                min_sequence = channel.minSequence();
+                                last_channel = channel;
+                            }
+                        }
+                        break :brk last_channel;
+                    };
+                    // If that channel is ephemeral, remove it.
+                    if (last_channel) |lc| if (lc.ephemeral) {
+                        _ = self.channels.fetchRemove(lc.name);
+                        lc.delete();
+                        self.stream.empty();
+                        // There is probably some space cleared in store.
+                        return true;
+                    };
+                    // No cleanup.
+                    return false;
                 }
 
                 fn publish(self: *Topic, data: []const u8) !void {
@@ -681,8 +715,8 @@ pub fn BrokerType(Client: type) type {
                 // Notify all channels that there are pending messages
                 fn onPublish(self: *Topic, msgs: u32) void {
                     var iter = self.channels.valueIterator();
-                    while (iter.next()) |ptr| {
-                        const channel = ptr.*;
+                    while (iter.next()) |e| {
+                        const channel = e.*;
                         channel.onPublish(msgs);
                     }
                 }
@@ -1207,6 +1241,26 @@ pub fn BrokerType(Client: type) type {
                         while (self.deferred.removeOrNull()) |dm|
                             self.topic.stream.release(dm.sequence);
                     }
+                }
+
+                fn minSequence(self: *Channel) u64 {
+                    if (self.in_flight.count() == 0 and self.deferred.count() == 0)
+                        return self.sequence;
+
+                    var min_sequence: u64 = self.sequence;
+                    {
+                        var iter = self.in_flight.keyIterator();
+                        while (iter.next()) |e| {
+                            if (e.* < min_sequence) min_sequence = e.*;
+                        }
+                    }
+                    {
+                        var iter = self.deferred.iterator();
+                        while (iter.next()) |dm| {
+                            if (dm.sequence < min_sequence) min_sequence = dm.sequence;
+                        }
+                    }
+                    return min_sequence;
                 }
             };
         }
