@@ -208,12 +208,9 @@ pub const Conn = struct {
     }
 
     fn onRecv(self: *Conn, bytes: []const u8) Error!void {
-        // Any error is lack of resources, free this connection in the case of
-        // any error.
-        self.receivedData(bytes) catch |err| {
-            log.err("{} recv failed {}", .{ self.socket, err });
-            return self.shutdown();
-        };
+        // Any error is lack of resources, shutdown this connection in the case
+        // of error.
+        self.receivedData(bytes) catch return self.shutdown();
         if (!self.recv_op.hasMore()) self.shutdown();
     }
 

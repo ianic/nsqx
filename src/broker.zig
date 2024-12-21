@@ -185,6 +185,7 @@ pub fn BrokerType(Client: type) type {
         options: Options,
 
         started_at: u64,
+        pub_err: ?anyerror = null,
         metric: store.Metric = .{},
 
         timer_queue: timer.Queue,
@@ -258,17 +259,26 @@ pub fn BrokerType(Client: type) type {
 
         pub fn publish(self: *Broker, topic_name: []const u8, data: []const u8) !void {
             const topic = try self.getOrCreateTopic(topic_name);
-            try topic.publish(data);
+            try self.setPubErr(topic.publish(data));
         }
 
         pub fn multiPublish(self: *Broker, topic_name: []const u8, msgs: u32, data: []const u8) !void {
             const topic = try self.getOrCreateTopic(topic_name);
-            try topic.multiPublish(msgs, data);
+            try self.setPubErr(topic.multiPublish(msgs, data));
         }
 
         pub fn deferredPublish(self: *Broker, topic_name: []const u8, data: []const u8, delay: u32) !void {
             const topic = try self.getOrCreateTopic(topic_name);
-            try topic.deferredPublish(data, delay);
+            try self.setPubErr(topic.deferredPublish(data, delay));
+        }
+
+        pub fn setPubErr(self: *Broker, error_union: anytype) !void {
+            if (error_union) |_| {
+                self.pub_err = null;
+            } else |err| {
+                self.pub_err = err;
+                return err;
+            }
         }
 
         // Http interface actions -----------------

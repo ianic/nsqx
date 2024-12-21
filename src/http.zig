@@ -79,6 +79,7 @@ pub const Conn = struct {
             log.warn("request failed {}", .{err});
             const header = switch (err) {
                 error.NotFound => not_found,
+                error.InternalServerError => internal_server_error,
                 else => bad_request,
             };
             self.send_op.prep(header);
@@ -112,7 +113,9 @@ pub const Conn = struct {
 
         const broker = self.listener.broker;
         switch (cmd) {
-            .ping => {},
+            .ping => {
+                if (broker.pub_err != null) return error.InternalServerError;
+            },
             .stats => |args| try jsonStat(self.gpa, args, writer, broker),
             .info => try jsonInfo(writer, broker, self.listener.options),
             .metric => |args| {
@@ -203,6 +206,12 @@ const not_found =
     "content-length: 9\r\n" ++
     "content-type: text/plain\r\n\r\n" ++
     "Not Found";
+
+const internal_server_error =
+    "HTTP/1.1 500 Internal Server Error\r\n" ++
+    "content-length: 21\r\n" ++
+    "content-type: text/plain\r\n\r\n" ++
+    "Internal Server Error";
 
 const bad_request =
     "HTTP/1.1 404 Bad Request\r\n" ++

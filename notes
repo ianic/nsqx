@@ -109,3 +109,14 @@ Nakon sto sam malo podesio reader/writer broj thread-ova:
 [bench_reader] 2024/12/03 19:20:49 duration: 10s - 2342.239mb/s - 12280080.484ops/s - 0.081us/op messages: 122827600
 [bench_writer] 2024/12/03 19:20:59 duration: 10s - 2379.734mb/s - 12476659.864ops/s - 0.080us/op messages: 124769800
 [bench_reader] 2024/12/03 19:20:59 duration: 10s - 2379.633mb/s - 12476130.636ops/s - 0.080us/op messages: 124776600
+
+
+
+Limit memory usage, test OutOfMemory error, ping returning 500
+$ prlimit --pid 12345 --as=2048000000
+
+Analyze core dump file with gdb, you need binary in ExecutablePath:
+$ mkdir dump2
+$ cd dump2
+$ apport-unpack /var/crash/_home_ianic_Code_nsql_.zig-cache_o_0986ad03ec6f6c62db4008d9de6d134b_test.1000.crash .
+$ gdb `cat ExecutablePath` CoreDump
