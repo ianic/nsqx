@@ -112,6 +112,7 @@ pub const Conn = struct {
 
         const broker = self.listener.broker;
         switch (cmd) {
+            .ping => {},
             .stats => |args| try jsonStat(self.gpa, args, writer, broker),
             .info => try jsonInfo(writer, broker, self.listener.options),
             .metric => |args| {
@@ -464,6 +465,7 @@ const Command = union(enum) {
 
     stats: Stats,
     info: void,
+    ping: void,
 
     metric: Metric,
 
@@ -504,6 +506,7 @@ fn parse(target: []const u8) !Command {
         } };
     }
     if (mem.startsWith(u8, target, "/info")) return .{ .info = {} };
+    if (mem.startsWith(u8, target, "/ping")) return .{ .ping = {} };
 
     if (mem.startsWith(u8, target, "/topic")) {
         if (mem.startsWith(u8, target[6..], "/create?topic="))

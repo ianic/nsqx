@@ -245,8 +245,10 @@ pub const Parser = struct {
 
 const testing = std.testing;
 
+const identify_msg = "IDENTIFY\n\x00\x00\x00\x0aHelloWorldIDENTIFY\n\x00\x00\x00\x03Foo";
+
 test "identify" {
-    var buf = "IDENTIFY\n\x00\x00\x00\x0aHelloWorldIDENTIFY\n\x00\x00\x00\x03Foo_----";
+    var buf = identify_msg ++ "_----";
     {
         var p = Parser{ .buf = buf };
         var m = try p.parse();
@@ -272,8 +274,10 @@ test "identify" {
     }
 }
 
+const sub_msg = "SUB pero zdero\nSUB jozo bozo\n";
+
 test "sub" {
-    const buf = "SUB pero zdero\nSUB jozo bozo\n-_____";
+    const buf = sub_msg ++ "-_____";
     {
         var p = Parser{ .buf = buf };
         var m = try p.parse();
@@ -298,8 +302,10 @@ test "sub" {
     }
 }
 
+const pub_msg = "PUB pero\n\x00\x00\x00\x05zderoPUB foo\n\x00\x00\x00\x03bar";
+
 test "pub" {
-    const buf = "PUB pero\n\x00\x00\x00\x05zderoPUB foo\n\x00\x00\x00\x03bar-_____";
+    const buf = pub_msg ++ "-_____";
     {
         var p = Parser{ .buf = buf };
         var m = try p.parse();
@@ -328,12 +334,14 @@ test "pub" {
     }
 }
 
+const mpub_msg = "MPUB pero\n" ++
+    "\x00\x00\x00\x14" ++ // body size
+    "\x00\x00\x00\x02" ++ // number of message
+    "\x00\x00\x00\x05zdero" ++ // message 1 [size][body]
+    "\x00\x00\x00\x03bar"; // message 2 [size][body];
+
 test "multi_publish" {
-    const buf = "MPUB pero\n" ++
-        "\x00\x00\x00\x14" ++ // body size
-        "\x00\x00\x00\x02" ++ // number of message
-        "\x00\x00\x00\x05zdero" ++ // message 1 [size][body]
-        "\x00\x00\x00\x03bar"; // message 2 [size][body]
+    const buf = mpub_msg;
     {
         var p = Parser{ .buf = buf };
         const m = try p.parse();
@@ -369,22 +377,22 @@ test "multi_publish" {
     }
 }
 
+const dpub_msg = "DPUB pero 1234\n" ++
+    "\x00\x00\x00\x03bar"; // [size][body]
+
 test "deferred_publish" {
-    const buf = "DPUB pero 1234\n" ++
-        "\x00\x00\x00\x03bar"; // [size][body]
-    {
-        var p = Parser{ .buf = buf };
-        const m = try p.parse();
-        try testing.expectEqualStrings("pero", m.deferred_publish.topic);
-        try testing.expectEqual(1234, m.deferred_publish.delay);
-        try testing.expectEqual(3, m.deferred_publish.data.len);
-        try testing.expectEqual(buf.len, p.pos);
-    }
+    var p = Parser{ .buf = dpub_msg };
+    const m = try p.parse();
+    try testing.expectEqualStrings("pero", m.deferred_publish.topic);
+    try testing.expectEqual(1234, m.deferred_publish.delay);
+    try testing.expectEqual(3, m.deferred_publish.data.len);
+    try testing.expectEqual(dpub_msg.len, p.pos);
 }
 
+const other_msgs = "RDY 123\nFIN 0123456789abcdef\nTOUCH 0123401234012345\nCLS\nNOP\nREQ 5678956789567890 4567\n";
+
 test "ready,finish.." {
-    const buf = "RDY 123\nFIN 0123456789abcdef\nTOUCH 0123401234012345\nCLS\nNOP\nREQ 5678956789567890 4567\n";
-    var p = Parser{ .buf = buf };
+    var p = Parser{ .buf = other_msgs };
     var m = try p.parse();
     try testing.expectEqual(123, m.ready);
     m = try p.parse();
@@ -634,4 +642,25 @@ pub fn writeHeader(
     mem.writeInt(u64, buf[8..16], timestamp, .big); // timestamp
     mem.writeInt(u16, buf[16..18], 1, .big); // attempts
     msg_id.write(buf[18..34], sequence); // sequence
+}
+
+test "fuzz parser" {
+    const wrap = struct {
+        fn testOne(input: []const u8) anyerror!void {
+            var p = Parser{ .buf = input };
+            while (true) {
+                _ = p.parse() catch return;
+            }
+        }
+    };
+    try std.testing.fuzz(wrap.testOne, .{
+        .corpus = &.{
+            identify_msg,
+            sub_msg,
+            pub_msg,
+            mpub_msg,
+            dpub_msg,
+            other_msgs,
+        },
+    });
 }
