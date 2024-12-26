@@ -8,7 +8,6 @@ const linux = std.os.linux;
 const IoUring = linux.IoUring;
 const socket_t = std.posix.socket_t;
 const errFromErrno = @import("errno.zig").toError;
-const Options = @import("Options.zig").Io;
 const Fifo = @import("fifo.zig").Fifo;
 
 const ns_per_ms = std.time.ns_per_ms;
@@ -17,6 +16,15 @@ const ns_per_s = std.time.ns_per_s;
 const log = std.log.scoped(.io);
 
 pub const Error = error{OutOfMemory};
+
+pub const Options = struct {
+    /// Number of io_uring sqe entries
+    entries: u16 = 16 * 1024,
+    /// Number of receive buffers
+    recv_buffers: u16 = 1024,
+    /// Length of each receive buffer in bytes
+    recv_buffer_len: u32 = 64 * 1024,
+};
 
 pub const Io = struct {
     allocator: mem.Allocator,
@@ -174,27 +182,6 @@ pub const Io = struct {
         fn onTimer(_: *Self) Error!void {}
         fn onTimerFail(_: *Self, _: anyerror) Error!void {}
     };
-
-    pub fn writeMetrics(self: *Io, writer: anytype) !void {
-        var m = &self.metric;
-
-        try m.all.write("io.op.all", writer);
-        try m.sendv.write("io.op.send", writer);
-        try m.recv.write("io.op.recv", writer);
-        try m.accept.write("io.op.accept", writer);
-        try m.connect.write("io.op.connect", writer);
-        try m.timer.write("io.op.timer", writer);
-        {
-            try writer.add("io", "loops", &m.loops);
-            try writer.add("io", "cqes", &m.cqes);
-            try writer.add("io", "send_bytes", &m.send_bytes);
-            try writer.add("io", "recv_bytes", &m.recv_bytes);
-        }
-        {
-            try writer.add("io.recv_buf_grp", "success", &m.recv_buf_grp.success);
-            try writer.add("io.recv_buf_grp", "no_bufs", &m.recv_buf_grp.no_bufs);
-        }
-    }
 };
 
 fn flagMore(cqe: linux.io_uring_cqe) bool {
@@ -946,17 +933,15 @@ test "pointer" {
     try testing.expect(ctx.op == null);
 }
 
-const statsd = @import("statsd.zig");
-
 const Metric = struct {
-    loops: statsd.Counter = .{},
-    cqes: statsd.Counter = .{},
-    send_bytes: statsd.Counter = .{},
-    recv_bytes: statsd.Counter = .{},
+    loops: Counter = .{},
+    cqes: Counter = .{},
+    send_bytes: Counter = .{},
+    recv_bytes: Counter = .{},
 
     recv_buf_grp: struct {
-        success: statsd.Counter = .{},
-        no_bufs: statsd.Counter = .{},
+        success: Counter = .{},
+        no_bufs: Counter = .{},
 
         pub fn noBufsPercent(self: @This()) f64 {
             const total = self.success.value + self.no_bufs.value;
@@ -965,43 +950,90 @@ const Metric = struct {
         }
     } = .{},
 
-    all: Counter = .{},
-    accept: Counter = .{},
-    connect: Counter = .{},
-    close: Counter = .{},
-    recv: Counter = .{},
-    writev: Counter = .{},
-    sendv: Counter = .{},
-    timer: Counter = .{},
+    all: OpCounter = .{},
+    accept: OpCounter = .{},
+    connect: OpCounter = .{},
+    close: OpCounter = .{},
+    recv: OpCounter = .{},
+    writev: OpCounter = .{},
+    sendv: OpCounter = .{},
+    timer: OpCounter = .{},
+
+    pub fn write(self: *Metric, writer: anytype) !void {
+        {
+            try self.all.write("io.op.all", writer);
+            try self.sendv.write("io.op.send", writer);
+            try self.recv.write("io.op.recv", writer);
+            try self.accept.write("io.op.accept", writer);
+            try self.connect.write("io.op.connect", writer);
+            try self.timer.write("io.op.timer", writer);
+        }
+        {
+            try writer.counter("io", "loops", self.loops.diff());
+            try writer.counter("io", "cqes", self.cqes.diff());
+            try writer.counter("io", "send_bytes", self.send_bytes.diff());
+            try writer.counter("io", "recv_bytes", self.recv_bytes.diff());
+        }
+        {
+            try writer.counter("io.recv_buf_grp", "success", self.recv_buf_grp.success.diff());
+            try writer.counter("io.recv_buf_grp", "no_bufs", self.recv_buf_grp.no_bufs.diff());
+        }
+    }
+
+    const Counter = struct {
+        const Self = @This();
+
+        const initial = std.math.maxInt(usize);
+        value: usize = 0,
+        prev: usize = initial,
+
+        pub fn inc(self: *Self, v: usize) void {
+            self.value +%= v;
+        }
+
+        pub fn diff(self: *Self) usize {
+            if (self.prev == initial) return self.value;
+            defer self.reset();
+            return self.value -% self.prev;
+        }
+
+        fn reset(self: *Self) void {
+            self.prev = self.value;
+        }
+
+        pub fn jsonStringify(self: *const Self, jws: anytype) !void {
+            try jws.write(self.value);
+        }
+    };
 
     // Counter of submitted/completed operations
-    const Counter = struct {
-        submitted: statsd.Counter = .{},
-        completed: statsd.Counter = .{},
-        restarted: statsd.Counter = .{},
+    const OpCounter = struct {
+        submitted: Counter = .{},
+        completed: Counter = .{},
+        restarted: Counter = .{},
 
         // Current number of active operations
-        pub fn active(self: Counter) usize {
+        pub fn active(self: OpCounter) usize {
             return self.submitted.value - self.completed.value;
         }
-        fn submit(self: *Counter) void {
+        fn submit(self: *OpCounter) void {
             self.submitted.inc(1);
         }
-        fn complete(self: *Counter) void {
+        fn complete(self: *OpCounter) void {
             self.completed.inc(1);
         }
-        fn restart(self: *Counter) void {
+        fn restart(self: *OpCounter) void {
             self.restarted.inc(1);
         }
 
-        fn write(self: *Counter, prefix: []const u8, writer: anytype) !void {
-            try writer.add(prefix, "submitted", &self.submitted);
-            try writer.add(prefix, "completed", &self.completed);
-            try writer.add(prefix, "restarted", &self.restarted);
-            try writer.gauge(prefix, "active", self.active());
+        fn write(self: *OpCounter, prefix: []const u8, stats: anytype) !void {
+            try stats.counter(prefix, "submitted", self.submitted.diff());
+            try stats.counter(prefix, "completed", self.completed.diff());
+            try stats.counter(prefix, "restarted", self.restarted.diff());
+            try stats.gauge(prefix, "active", self.active());
         }
 
-        pub fn jsonStringify(self: *const Counter, jws: anytype) !void {
+        pub fn jsonStringify(self: *const OpCounter, jws: anytype) !void {
             try jws.beginObject();
             try jws.objectField("active");
             try jws.write(self.active());

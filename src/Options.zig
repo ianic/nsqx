@@ -116,14 +116,7 @@ pub const Broker = struct {
     max_page_size: u32 = 1024 * 1024,
 };
 
-pub const Io = struct {
-    /// Number of io_uring sqe entries
-    entries: u16 = 16 * 1024,
-    /// Number of receive buffers
-    recv_buffers: u16 = 1024,
-    /// Length of each receive buffer in bytes
-    recv_buffer_len: u32 = 64 * 1024,
-};
+pub const Io = @import("io.zig").Options;
 
 pub const Statsd = struct {
     /// statsd daemon for pushing stats

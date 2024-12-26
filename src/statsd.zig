@@ -90,19 +90,19 @@ pub const Connector = struct {
         var writer = MetricWriter.init(self.allocator, self.prefix);
         errdefer writer.deinit();
         self.broker.writeMetrics(&writer) catch |err| {
-            log.err("broker write metrics error {s}", .{@errorName(err)});
+            log.err("broker write metrics {}", .{err});
             return;
         };
-        self.io.writeMetrics(&writer) catch |err| {
-            log.err("io write metrics error {}", .{err});
+        self.io.metric.write(&writer) catch |err| {
+            log.err("io write metrics {}", .{err});
             return;
         };
         writeMalloc(&writer) catch |err| {
-            log.err("mem write metrics error {}", .{err});
+            log.err("mem write metrics {}", .{err});
             return;
         };
         writeStatm(&writer) catch |err| {
-            log.err("statm write metrics error {}", .{err});
+            log.err("statm write metrics {}", .{err});
             return;
         };
         const buf = try writer.toOwned();
@@ -169,8 +169,8 @@ pub const MetricWriter = struct {
         };
     }
 
-    pub fn counter(self: *Self, prefix: []const u8, metric: []const u8, current: usize, previous: usize) !void {
-        try self.write(prefix, metric, 'c', current -| previous);
+    pub fn counter(self: *Self, prefix: []const u8, metric: []const u8, diff: usize) !void {
+        try self.write(prefix, metric, 'c', diff);
     }
 
     fn write(self: *Self, prefix: []const u8, metric: []const u8, typ: u8, value: usize) !void {
@@ -393,7 +393,7 @@ test "write metrics" {
         var mv = MetricWriter.init(testing.allocator, "nsq");
         defer mv.deinit();
         try mv.gauge("topic", "depth", 123);
-        try mv.counter("topic", "bytes", 789, 456);
+        try mv.counter("topic", "bytes", 789 - 456);
         try testing.expectEqualStrings("nsq.topic.depth:123|g\nnsq.topic.bytes:333|c\n", mv.list.items);
     }
     {
