@@ -6,9 +6,9 @@ const posix = std.posix;
 const socket_t = std.posix.socket_t;
 const testing = std.testing;
 
-const Io = @import("io.zig").Io;
-const Op = @import("io.zig").Op;
-const Error = @import("io.zig").Error;
+const Io = @import("io/io.zig").Io;
+const Op = @import("io/io.zig").Op;
+const Error = @import("io/io.zig").Error;
 const RecvBuf = @import("tcp.zig").RecvBuf;
 const Options = @import("Options.zig");
 const Stream = @import("store.zig").Stream;

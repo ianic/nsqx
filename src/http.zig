@@ -7,10 +7,10 @@ const fd_t = std.posix.fd_t;
 
 const validateName = @import("protocol.zig").validateName;
 const Options = @import("Options.zig");
-const Io = @import("io.zig").Io;
-const Op = @import("io.zig").Op;
-const SendOp = @import("io.zig").SendOp;
-const Error = @import("io.zig").Error;
+const Io = @import("io/io.zig").Io;
+const Op = @import("io/io.zig").Op;
+const SendOp = @import("io/io.zig").SendOp;
+const Error = @import("io/io.zig").Error;
 const Broker = @import("main.zig").Broker;
 const store = @import("store.zig");
 pub const Listener = @import("tcp.zig").ListenerType(Conn);

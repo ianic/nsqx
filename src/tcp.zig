@@ -8,10 +8,10 @@ const fd_t = std.posix.fd_t;
 const protocol = @import("protocol.zig");
 const Options = @import("Options.zig");
 
-const Io = @import("io.zig").Io;
-const Op = @import("io.zig").Op;
-const SendOp = @import("io.zig").SendOp;
-const Error = @import("io.zig").Error;
+const Io = @import("io/io.zig").Io;
+const Op = @import("io/io.zig").Op;
+const SendOp = @import("io/io.zig").SendOp;
+const Error = @import("io/io.zig").Error;
 
 const Broker = @import("main.zig").Broker;
 const Channel = Broker.Channel;

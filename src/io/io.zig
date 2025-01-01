@@ -9,6 +9,7 @@ const IoUring = linux.IoUring;
 const socket_t = std.posix.socket_t;
 const errFromErrno = @import("errno.zig").toError;
 const Fifo = @import("fifo.zig").Fifo;
+pub const Tcp = @import("tcp.zig").Tcp;
 
 const ns_per_ms = std.time.ns_per_ms;
 const ns_per_s = std.time.ns_per_s;
@@ -26,7 +27,7 @@ pub const Options = struct {
     recv_buffer_len: u32 = 64 * 1024,
 };
 
-pub const Ev = Io;
+pub const Loop = Io;
 
 pub const Io = struct {
     allocator: mem.Allocator,

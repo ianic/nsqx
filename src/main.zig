@@ -7,7 +7,7 @@ const mem = std.mem;
 
 const Options = @import("Options.zig");
 const fatal = @import("Options.zig").fatal;
-const Io = @import("io.zig").Io;
+const Io = @import("io/io.zig").Io;
 const tcp = @import("tcp.zig");
 const http = @import("http.zig");
 const lookup = @import("lookup.zig");
@@ -239,7 +239,7 @@ test {
     _ = @import("broker.zig");
     _ = @import("protocol.zig");
     _ = @import("Options.zig");
-    _ = @import("io.zig");
+    _ = @import("io/io.zig");
     _ = @import("tcp.zig");
     _ = @import("http.zig");
     _ = @import("lookup.zig");
