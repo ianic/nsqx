@@ -158,15 +158,7 @@ const Conn = struct {
         assert(!self.recv_op.active());
         assert(self.socket == 0);
 
-        self.connect_op = Op.connect(
-            .{
-                .domain = self.address.any.family,
-                .addr = &self.address,
-            },
-            self,
-            onConnect,
-            onConnectFail,
-        );
+        self.connect_op = Op.connect(.{ .addr = &self.address }, self, onConnect, onConnectFail);
         self.io.submit(&self.connect_op);
         self.state = .connecting;
     }

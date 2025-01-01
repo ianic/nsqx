@@ -67,7 +67,6 @@ pub const Connector = struct {
         if (self.connect_op.active()) return;
         self.connect_op = Op.connect(
             .{
-                .domain = self.address.any.family,
                 .socket_type = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
                 .addr = &self.address,
             },

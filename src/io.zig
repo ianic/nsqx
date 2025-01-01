@@ -26,6 +26,8 @@ pub const Options = struct {
     recv_buffer_len: u32 = 64 * 1024,
 };
 
+pub const Ev = Io;
+
 pub const Io = struct {
     allocator: mem.Allocator,
     ring: IoUring = undefined,
@@ -37,6 +39,9 @@ pub const Io = struct {
     cqe_buf_tail: usize = 0,
     pending: Fifo(Op) = .{},
     loop_timer: LoopTimer,
+
+    // default for connect operations
+    connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
 
     pub fn init(self: *Io, allocator: mem.Allocator, options: Options) !void {
         // Flags reference: https://nick-black.com/dankwiki/index.php/Io_uring
@@ -118,6 +123,7 @@ pub const Io = struct {
     fn flushCompletions(self: *Io) Error!void {
         while (self.cqe_buf_head < self.cqe_buf_tail) : (self.cqe_buf_head += 1) {
             const cqe = self.cqe_buf[self.cqe_buf_head];
+            if (cqe.user_data == 0) continue;
             const has_more = flagMore(cqe);
             const op: *Op = @ptrFromInt(@as(usize, @intCast(cqe.user_data)));
             const op_kind: Op.Kind = op.args;
@@ -226,11 +232,11 @@ pub const Op = struct {
     };
 
     const SocketArgs = struct {
-        domain: u32,
+        addr: *std.net.Address,
         socket_type: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
         protocol: u32 = 0,
+        domain: u32 = 0,
         socket: socket_t = 0,
-        addr: *std.net.Address,
     };
     const TimerArgs = struct {
         ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
@@ -293,7 +299,13 @@ pub const Op = struct {
     fn prep(op: *Op, io: *Io) !void {
         switch (op.args) {
             .accept => |*arg| _ = try io.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),
-            .connect => |*arg| _ = try io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen()),
+            .connect => |*arg| {
+                // connect and linked timeout operation
+                // if timeout is reached connect will get error.OperationCanceled
+                var sqe = try io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen());
+                sqe.flags |= linux.IOSQE_IO_LINK;
+                _ = try io.ring.link_timeout(0, &io.connect_timeout, 0);
+            },
             .close => |*arg| _ = try io.ring.close(@intFromPtr(op), arg.socket),
             .recv => |socket| _ = try io.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
             .sendv => |*arg| _ = if (arg.zero_copy)
@@ -302,7 +314,13 @@ pub const Op = struct {
                 try io.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
             .send => |*arg| _ = try io.ring.send(@intFromPtr(op), arg.socket, arg.buf, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
             .timer => |*arg| _ = try io.ring.timeout(@intFromPtr(op), &arg.ts, arg.count, arg.flags),
-            .socket => |*arg| _ = try io.ring.socket(@intFromPtr(op), arg.domain, arg.socket_type, arg.protocol, 0),
+            .socket => |*arg| _ = try io.ring.socket(
+                @intFromPtr(op),
+                if (arg.domain == 0) arg.addr.any.family else arg.domain,
+                arg.socket_type,
+                arg.protocol,
+                0,
+            ),
             .shutdown => |socket| _ = try io.ring.shutdown(@intFromPtr(op), socket, posix.SHUT.RDWR),
             .cancel => |op_to_cancel| switch (op_to_cancel.args) {
                 .timer => _ = try io.ring.timeout_remove(@intFromPtr(op), @intFromPtr(op_to_cancel), 0),
@@ -353,7 +371,7 @@ pub const Op = struct {
     pub fn recv(
         socket: socket_t,
         context: anytype,
-        comptime success: fn (@TypeOf(context), []const u8) Error!void,
+        comptime success: fn (@TypeOf(context), []u8) Error!void,
         comptime fail: fn (@TypeOf(context), anyerror) Error!void,
     ) Op {
         const Context = @TypeOf(context);
@@ -890,13 +908,7 @@ test "size" {
         buf: []const u8,
     };
 
-    const Socket = struct {
-        domain: u32,
-        socket_type: u32,
-        protocol: u32,
-        socket: socket_t,
-        address: *std.net.Address,
-    };
+    try testing.expectEqual(24, @sizeOf(Op.SocketArgs));
 
     try testing.expectEqual(64, @sizeOf(Op));
     try testing.expectEqual(32, @sizeOf(Op.Args));
@@ -904,7 +916,7 @@ test "size" {
     try testing.expectEqual(24, @sizeOf(Accept));
     try testing.expectEqual(24, @sizeOf(Writev));
     try testing.expectEqual(24, @sizeOf(Send));
-    try testing.expectEqual(24, @sizeOf(Socket));
+
     try testing.expectEqual(16, @sizeOf(Connect));
     try testing.expectEqual(16, @sizeOf(Sendv));
     try testing.expectEqual(112, @sizeOf(net.Address));
