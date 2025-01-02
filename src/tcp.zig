@@ -110,7 +110,7 @@ pub const Conn = struct {
     outstanding_heartbeats: u8 = 0,
     recv_buf: RecvBuf, // Unprocessed bytes from previous receive
 
-    consumer: Broker.Consumer,
+    consumer: ?Broker.Consumer = null,
     identify: protocol.Identify = .{},
     state: State = .connected,
 
@@ -133,7 +133,6 @@ pub const Conn = struct {
             .recv_buf = RecvBuf.init(listener.allocator),
             .timer_ts = listener.io.tsFromDelay(initial_heartbeat),
             .pending_responses = std.ArrayList(protocol.Response).init(allocator),
-            .consumer = .{ .client = self, .metric = .{ .connected_at = listener.io.now() } },
         };
 
         try self.send_op.init(allocator, socket, self, onSend, onSendFail);
@@ -181,11 +180,13 @@ pub const Conn = struct {
 
         { // Pull messages from channel
             if (self.send_op.free() > 0) {
-                if (self.consumer.pull() catch |err| brk: {
-                    log.err("{} failed to pull from channel {}", .{ self.socket, err });
-                    break :brk null;
-                }) |data| {
-                    self.send_op.prep(data);
+                if (self.consumer) |*consumer| {
+                    if (consumer.pull() catch |err| brk: {
+                        log.err("{} failed to pull from channel {}", .{ self.socket, err });
+                        break :brk null;
+                    }) |data| {
+                        self.send_op.prep(data);
+                    }
                 }
             }
         }
@@ -227,12 +228,14 @@ pub const Conn = struct {
     }
 
     fn onSend(self: *Conn) Error!void {
-        self.consumer.onSend();
+        if (self.consumer) |*consumer|
+            consumer.onSend();
         self.send();
     }
 
     fn onSendFail(self: *Conn, err: anyerror) Error!void {
-        self.consumer.onSend();
+        if (self.consumer) |*consumer|
+            consumer.onSend();
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.err("{} send failed {}", .{ self.socket, err }),
@@ -298,11 +301,12 @@ pub const Conn = struct {
                 try self.respond(.ok);
                 self.identify = identify;
                 self.heartbeat_interval = identify.heartbeat_interval / 2;
-                self.consumer.msg_timeout = identify.msg_timeout;
                 log.debug("{} identify {}", .{ self.socket, identify });
             },
             .subscribe => |arg| {
                 try broker.subscribe(self, arg.topic, arg.channel);
+                if (self.consumer) |*consumer|
+                    consumer.msg_timeout = self.identify.msg_timeout;
                 try self.respond(.ok);
                 log.debug("{} subscribe: {s} {s}", .{ self.socket, arg.topic, arg.channel });
             },
@@ -324,11 +328,13 @@ pub const Conn = struct {
                 log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });
             },
             .ready => |count| {
-                self.consumer.ready_count = if (count > options.max_rdy_count) options.max_rdy_count else count;
+                var consumer = &(self.consumer orelse return error.NotSubscribed);
+                consumer.ready_count = if (count > options.max_rdy_count) options.max_rdy_count else count;
                 log.debug("{} ready: {}", .{ self.socket, count });
             },
             .finish => |msg_id| {
-                try self.consumer.finish(msg_id);
+                var consumer = &(self.consumer orelse return error.NotSubscribed);
+                try consumer.finish(msg_id);
                 log.debug("{} finish {}", .{ self.socket, protocol.msg_id.decode(msg_id) });
             },
             .requeue => |arg| {
@@ -336,15 +342,18 @@ pub const Conn = struct {
                     options.max_req_timeout
                 else
                     arg.delay;
-                try self.consumer.requeue(arg.msg_id, delay);
+                var consumer = &(self.consumer orelse return error.NotSubscribed);
+                try consumer.requeue(arg.msg_id, delay);
                 log.debug("{} requeue {}", .{ self.socket, protocol.msg_id.decode(arg.msg_id) });
             },
             .touch => |msg_id| {
-                try self.consumer.touch(msg_id);
+                var consumer = &(self.consumer orelse return error.NotSubscribed);
+                try consumer.touch(msg_id);
                 log.debug("{} touch {}", .{ self.socket, protocol.msg_id.decode(msg_id) });
             },
             .close => {
-                self.consumer.ready_count = 0;
+                if (self.consumer) |*consumer|
+                    consumer.ready_count = 0;
                 try self.respond(.close);
                 log.debug("{} close", .{self.socket});
             },
@@ -375,7 +384,8 @@ pub const Conn = struct {
         switch (self.state) {
             .connected => {
                 // Start shutdown.
-                self.consumer.ready_count = 0; // stop sending
+                if (self.consumer) |*consumer|
+                    consumer.ready_count = 0; // stop sending
                 self.state = .closing;
                 self.shutdown_op = Op.shutdown(self.socket, self, onClose);
                 self.io.submit(&self.shutdown_op);
@@ -393,7 +403,10 @@ pub const Conn = struct {
                     self.shutdown_op.active())
                     return;
 
-                self.consumer.unsubscribe();
+                if (self.consumer) |*consumer| {
+                    consumer.unsubscribe();
+                    self.consumer = null;
+                }
 
                 log.debug("{} closed", .{self.socket});
                 self.deinit();

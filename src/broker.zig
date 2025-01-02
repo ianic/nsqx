@@ -37,7 +37,7 @@ pub fn BrokerType(Client: type) type {
             msg_timeout: u32 = 0,
             // set in subscribe
             client: *Client = undefined,
-            channel: ?*Channel = null,
+            channel: *Channel = undefined,
             //
             in_flight_count: u32 = 0,
             in_kernel_buffers: u32 = 0,
@@ -65,32 +65,28 @@ pub fn BrokerType(Client: type) type {
             // Client api -----------------
 
             pub fn finish(self: *Self, msg_id: [16]u8) !void {
-                var channel = self.channel orelse return error.NotSubscribed;
                 self.in_flight_count -|= 1;
-                try channel.finish(self, msg_id);
+                try self.channel.finish(self, msg_id);
                 self.metric.finish += 1;
             }
 
             pub fn requeue(self: *Self, msg_id: [16]u8, delay: u32) !void {
-                var channel = self.channel orelse return error.NotSubscribed;
                 self.in_flight_count -|= 1;
-                try channel.requeue(self, msg_id, delay);
+                try self.channel.requeue(self, msg_id, delay);
                 self.metric.requeue += 1;
             }
 
             pub fn touch(self: *Self, msg_id: [16]u8) !void {
-                var channel = self.channel orelse return error.NotSubscribed;
-                try channel.touch(self, msg_id);
+                try self.channel.touch(self, msg_id);
             }
 
             pub fn unsubscribe(self: *Self) void {
-                if (self.channel) |channel| channel.unsubscribe(self);
+                self.channel.unsubscribe(self);
             }
 
             /// Client pulls data to send.
             pub fn pull(self: *Self) !?[]const u8 {
-                const channel = self.channel orelse return null;
-                const pc = try channel.pull(self) orelse return null;
+                const pc = try self.channel.pull(self) orelse return null;
                 self.pull_chunk = pc;
                 self.metric.send +%= pc.count;
                 self.in_flight_count += pc.count;
@@ -985,10 +981,12 @@ pub fn BrokerType(Client: type) type {
                 }
 
                 fn subscribe(self: *Channel, client: *Client) !void {
-                    assert(client.consumer.channel == null);
-                    client.consumer.client = client;
-                    client.consumer.channel = self;
-                    try self.consumers.append(&client.consumer);
+                    client.consumer = .{
+                        .client = client,
+                        .channel = self,
+                        .metric = .{ .connected_at = time.now },
+                    };
+                    try self.consumers.append(&client.consumer.?);
                 }
 
                 // -----------------
