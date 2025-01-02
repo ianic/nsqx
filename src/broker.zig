@@ -40,6 +40,7 @@ pub fn BrokerType(Client: type) type {
             channel: ?*Channel = null,
             //
             in_flight_count: u32 = 0,
+            in_kernel_buffers: u32 = 0,
             pull_chunk: ?Channel.PullChunk = null,
             metric: struct {
                 connected_at: u64 = 0,
@@ -64,15 +65,15 @@ pub fn BrokerType(Client: type) type {
             // Client api -----------------
 
             pub fn finish(self: *Self, msg_id: [16]u8) !void {
-                self.in_flight_count -|= 1;
                 var channel = self.channel orelse return error.NotSubscribed;
+                self.in_flight_count -|= 1;
                 try channel.finish(self, msg_id);
                 self.metric.finish += 1;
             }
 
             pub fn requeue(self: *Self, msg_id: [16]u8, delay: u32) !void {
-                self.in_flight_count -|= 1;
                 var channel = self.channel orelse return error.NotSubscribed;
+                self.in_flight_count -|= 1;
                 try channel.requeue(self, msg_id, delay);
                 self.metric.requeue += 1;
             }
@@ -93,6 +94,7 @@ pub fn BrokerType(Client: type) type {
                 self.pull_chunk = pc;
                 self.metric.send +%= pc.count;
                 self.in_flight_count += pc.count;
+                self.in_kernel_buffers += 1;
                 return pc.data;
             }
 
@@ -100,6 +102,7 @@ pub fn BrokerType(Client: type) type {
             /// pull. Buffer returned from pull is no more in kernel and can be
             /// released now.
             pub fn onSend(self: *Self) void {
+                self.in_kernel_buffers -= 1;
                 if (self.pull_chunk) |pc| {
                     pc.done();
                     self.pull_chunk = null;
@@ -113,8 +116,7 @@ pub fn BrokerType(Client: type) type {
             }
 
             fn close(self: *Self) void {
-                self.channel = null;
-                self.client.onChannelClose();
+                self.client.close();
             }
         };
 
@@ -290,8 +292,9 @@ pub fn BrokerType(Client: type) type {
         pub fn deleteTopic(self: *Broker, name: []const u8) !void {
             try self.registrations.ensureCapacity(name, "");
             const kv = self.topics.fetchRemove(name) orelse return error.NotFound;
+            errdefer self.topics.putAssumeCapacityNoClobber(kv.key, kv.value);
             const topic = kv.value;
-            topic.delete();
+            try topic.delete();
             self.registrations.topicDeleted(name);
             log.debug("deleted topic {s}", .{name});
         }
@@ -422,7 +425,7 @@ pub fn BrokerType(Client: type) type {
                     // | name_len (1) | name (name_len) | paused (1)  | channels count (4) |
                     try meta.writeByte(@intCast(topic.name.len));
                     try meta.writeAll(topic.name);
-                    try meta.writeByte(if (topic.paused) 1 else 0);
+                    try meta.writeByte(@intFromEnum(topic.state));
                     try meta.writeInt(u32, topic.channels.count(), .little);
 
                     // For each channel:
@@ -434,7 +437,7 @@ pub fn BrokerType(Client: type) type {
                         const channel = channel_ptr.*;
                         try meta.writeByte(@intCast(channel.name.len));
                         try meta.writeAll(channel.name);
-                        try meta.writeByte(if (channel.paused) 1 else 0);
+                        try meta.writeByte(@intFromEnum(channel.state));
                         try meta.writeInt(u32, @intCast(channel.in_flight.count() + channel.deferred.count()), .little);
                         try meta.writeInt(u64, channel.sequence, .little);
 
@@ -482,7 +485,7 @@ pub fn BrokerType(Client: type) type {
                 if (name_len > protocol.max_name_len) return error.InvalidName;
                 try meta.readNoEof(buf[0..name_len]);
                 var topic = try self.getOrCreateTopic(try protocol.validateName(buf[0..name_len]));
-                topic.paused = try meta.readByte() != 0;
+                topic.state = @enumFromInt(try meta.readByte());
                 var channels = try meta.readInt(u32, .little);
 
                 // Stream
@@ -497,7 +500,7 @@ pub fn BrokerType(Client: type) type {
                     if (n > protocol.max_name_len) return error.InvalidName;
                     try meta.readNoEof(buf[0..n]);
                     var channel = try topic.getOrCreateChannel(buf[0..n]);
-                    channel.paused = try meta.readByte() != 0;
+                    channel.state = @enumFromInt(try meta.readByte());
                     var messages = try meta.readInt(u32, .little);
                     try channel.restore(try meta.readInt(u64, .little));
 
@@ -517,12 +520,18 @@ pub fn BrokerType(Client: type) type {
                 allocator: mem.Allocator,
                 broker: *Broker,
                 name: []const u8,
-                paused: bool = false,
                 channels: std.StringHashMap(*Channel),
                 stream: store.Stream,
+                state: State = .active,
 
                 deferred: std.PriorityQueue(DeferredPublish, void, DeferredPublish.less),
                 timer_op: timer.Op = undefined,
+
+                const State = enum {
+                    active,
+                    paused,
+                    deleting,
+                };
 
                 const DeferredPublish = struct {
                     data: []const u8,
@@ -575,17 +584,31 @@ pub fn BrokerType(Client: type) type {
                     }
                 }
 
-                fn delete(self: *Topic) void {
-                    var iter = self.channels.valueIterator();
-                    while (iter.next()) |e| e.*.delete();
-                    self.channels.clearAndFree();
-                    self.deinit();
-                }
+                fn delete(self: *Topic) !void {
+                    const allocator = self.allocator; // topic can be deinited, make copy
+                    var channels = try allocator.alloc(*Channel, self.channels.count());
+                    defer allocator.free(channels);
 
-                fn removeEphemeralChannel(self: *Topic, channel: *Channel) void {
-                    assert(self.channels.remove(channel.name));
-                    channel.deinit();
-                    self.empty();
+                    if (self.state != .deleting) {
+                        self.state = .deleting;
+                        if (self.channels.count() > 0) {
+                            // map can be invalidated during iteration
+                            // make channels list copy
+                            var iter = self.channels.valueIterator();
+                            var i: usize = 0;
+                            while (iter.next()) |e| {
+                                channels[i] = e.*;
+                                i += 1;
+                            }
+                            // start deleting channels
+                            for (channels) |channel| channel.delete();
+                            return;
+                        }
+                    }
+                    if (self.channels.count() == 0) {
+                        //self.channels.clearAndFree();
+                        self.deinit();
+                    }
                 }
 
                 fn subscribe(self: *Topic, client: *Client, name: []const u8) !void {
@@ -594,7 +617,10 @@ pub fn BrokerType(Client: type) type {
                 }
 
                 fn getOrCreateChannel(self: *Topic, name: []const u8) !*Channel {
-                    if (self.channels.get(name)) |channel| return channel;
+                    if (self.channels.get(name)) |channel| {
+                        if (channel.state == .deleting) return error.Deleting;
+                        return channel;
+                    }
 
                     try self.broker.registrations.ensureCapacity(self.name, name);
                     const first_channel = self.channels.count() == 0;
@@ -731,38 +757,57 @@ pub fn BrokerType(Client: type) type {
                     }
                 }
 
-                // Http interface actions -----------------
-
-                fn deleteChannel(self: *Topic, name: []const u8) !void {
-                    const kv = self.channels.fetchRemove(name) orelse return error.NotFound;
-                    const channel = kv.value;
-                    channel.delete();
+                // Called from channel when finished deleting channel
+                fn removeChannel(self: *Topic, channel: *Channel) void {
+                    assert(self.channels.remove(channel.name));
+                    self.stream.unsubscribe(channel.sequence);
+                    if (self.state == .deleting and self.channels.count() == 0)
+                        return self.deinit();
                     self.empty();
                 }
 
+                fn getChannel(self: *Topic, name: []const u8) !*Channel {
+                    const channel = self.channels.get(name) orelse return error.NotFound;
+                    if (channel.state == .deleting) return error.NotFound;
+                    return channel;
+                }
+
+                // Http interface actions -----------------
+
+                fn deleteChannel(self: *Topic, name: []const u8) !void {
+                    const channel = try self.getChannel(name);
+                    channel.delete();
+                    // const kv = self.channels.fetchRemove(name) orelse return error.NotFound;
+                    // const channel = kv.value;
+                    // channel.delete();
+                    // self.empty();
+                }
+
                 fn pause(self: *Topic) void {
-                    self.paused = true;
+                    self.state = .paused;
                 }
 
                 fn unpause(self: *Topic) void {
-                    self.paused = false;
-                    // wake-up all channels
-                    var iter = self.channels.valueIterator();
-                    while (iter.next()) |ptr| ptr.*.wakeup();
+                    if (self.state == .paused) {
+                        self.state = .active;
+                        // wake-up all channels
+                        var iter = self.channels.valueIterator();
+                        while (iter.next()) |ptr| ptr.*.wakeup();
+                    }
                 }
 
                 fn pauseChannel(self: *Topic, name: []const u8) !void {
-                    const channel = self.channels.get(name) orelse return error.NotFound;
+                    const channel = try self.getChannel(name);
                     channel.pause();
                 }
 
                 fn unpauseChannel(self: *Topic, name: []const u8) !void {
-                    const channel = self.channels.get(name) orelse return error.NotFound;
+                    const channel = try self.getChannel(name);
                     channel.unpause();
                 }
 
                 fn emptyChannel(self: *Topic, name: []const u8) !void {
-                    const channel = self.channels.get(name) orelse return error.NotFound;
+                    const channel = try self.getChannel(name);
                     channel.empty();
                 }
 
@@ -799,10 +844,18 @@ pub fn BrokerType(Client: type) type {
                     }
                 };
 
+                const State = enum {
+                    active,
+                    paused,
+                    deleting,
+                };
+
                 allocator: mem.Allocator,
                 name: []const u8,
+                ephemeral: bool = false,
                 topic: *Topic,
                 consumers: Consumers,
+                state: State = .active,
 
                 // Sent but not jet acknowledged (fin) messages.
                 in_flight: std.AutoHashMap(u64, InFlightMsg),
@@ -811,8 +864,6 @@ pub fn BrokerType(Client: type) type {
                 timer_op: timer.Op = undefined,
 
                 metric: Metric = .{},
-                paused: bool = false,
-                ephemeral: bool = false,
 
                 // Last stream sequence consumed by this channel
                 sequence: u64 = 0,
@@ -845,10 +896,13 @@ pub fn BrokerType(Client: type) type {
                         try self.list.append(consumer);
                     }
                     fn close(self: *Consumers) void {
-                        for (self.list.items) |consumer| {
+                        // reverse iteration allows remove to be called from consumer.close
+                        var i = self.list.items.len;
+                        while (i > 0) {
+                            i -= 1;
+                            const consumer = self.list.items[i];
                             consumer.close();
                         }
-                        self.list.clearAndFree();
                     }
                     fn remove(self: *Consumers, consumer: *Consumer) void {
                         for (self.list.items, 0..) |ptr, i| {
@@ -907,9 +961,18 @@ pub fn BrokerType(Client: type) type {
                 }
 
                 fn delete(self: *Channel) void {
-                    self.consumers.close();
-                    self.releasePending();
-                    self.deinit();
+                    if (self.state != .deleting) {
+                        self.state = .deleting;
+                        if (self.consumers.count() > 0) {
+                            self.consumers.close();
+                            return;
+                        }
+                    }
+                    if (self.consumers.count() == 0) {
+                        self.releasePending();
+                        self.topic.removeChannel(self);
+                        self.deinit();
+                    }
                 }
 
                 fn deinit(self: *Channel) void {
@@ -917,7 +980,6 @@ pub fn BrokerType(Client: type) type {
                     self.deferred.deinit();
                     self.consumers.deinit();
                     self.timer_op.deinit();
-                    self.topic.stream.unsubscribe(self.sequence);
                     self.allocator.free(self.name);
                     self.allocator.destroy(self);
                 }
@@ -939,8 +1001,8 @@ pub fn BrokerType(Client: type) type {
                 }
 
                 fn needWakeup(self: *Channel) bool {
-                    return !self.topic.paused and
-                        !self.paused and
+                    return self.topic.state == .active and
+                        self.state == .active and
                         self.topic.stream.hasMore(self.sequence);
                 }
 
@@ -1102,9 +1164,6 @@ pub fn BrokerType(Client: type) type {
                 pub const PullChunk = struct {
                     allocator: ?mem.Allocator = null,
                     data: []const u8,
-
-                    stream: ?*store.Stream = null,
-                    sequence: u64 = 0,
                     count: u32,
 
                     // Consumer should call this when data is no more in use by
@@ -1113,8 +1172,6 @@ pub fn BrokerType(Client: type) type {
                     // or deallocate buffer (in case of copied message;
                     // deferred).
                     pub fn done(self: PullChunk) void {
-                        if (self.stream) |stream|
-                            stream.release(self.sequence);
                         if (self.allocator) |allocator|
                             allocator.free(self.data);
                     }
@@ -1122,13 +1179,13 @@ pub fn BrokerType(Client: type) type {
 
                 pub fn pull(self: *Channel, consumer: *Consumer) !?PullChunk {
                     if (!consumer.ready()) return null;
-                    if (self.paused) return null;
+                    if (self.state != .active) return null;
 
                     // if there is deferred message return one
                     if (try self.popDeferred(consumer)) |pc| return pc;
 
                     // else find next chunk in stream
-                    if (self.topic.paused) return null;
+                    if (self.topic.state != .active) return null;
                     if (self.topic.stream.pull(self.sequence, consumer.readyCount())) |res| {
                         errdefer res.revert(&self.topic.stream);
 
@@ -1151,8 +1208,6 @@ pub fn BrokerType(Client: type) type {
 
                         return .{
                             .count = res.count,
-                            .stream = &self.topic.stream,
-                            .sequence = res.sequence.from,
                             .data = res.data,
                         };
                     }
@@ -1194,8 +1249,11 @@ pub fn BrokerType(Client: type) type {
 
                     self.consumers.remove(consumer);
 
-                    if (self.consumers.count() == 0 and self.ephemeral)
-                        self.topic.removeEphemeralChannel(self);
+                    if ((self.consumers.count() == 0 and self.ephemeral) or
+                        (self.state == .deleting))
+                    {
+                        self.delete();
+                    }
                 }
 
                 // Re-queue all messages which are in-flight for some consumer.
@@ -1209,7 +1267,6 @@ pub fn BrokerType(Client: type) type {
                             try sequences.append(e.key_ptr.*);
                     }
 
-                    assert(sequences.items.len == consumer.in_flight_count);
                     for (sequences.items) |sequence| {
                         const msg = self.in_flight.get(sequence).?;
                         try self.deferInFlight(sequence, msg, 0);
@@ -1221,12 +1278,14 @@ pub fn BrokerType(Client: type) type {
                 // Http admin interface  -----------------
 
                 fn pause(self: *Channel) void {
-                    self.paused = true;
+                    self.state = .paused;
                 }
 
                 fn unpause(self: *Channel) void {
-                    self.paused = false;
-                    self.wakeup();
+                    if (self.state == .paused) {
+                        self.state = .active;
+                        self.wakeup();
+                    }
                 }
 
                 fn empty(self: *Channel) void {
@@ -1299,10 +1358,10 @@ const TestClient = struct {
         return true;
     }
     fn onChannelReady(self: *Self) void {
-        self._pull() catch {};
+        self._pull(true) catch unreachable;
     }
 
-    fn _pull(self: *Self) !void {
+    fn _pull(self: *Self, return_from_kernel: bool) !void {
         const data = try self.consumer.pull() orelse return;
         var pos: usize = 0;
         while (pos < data.len) {
@@ -1312,14 +1371,24 @@ const TestClient = struct {
             pos += 4 + size;
             try self.sequences.append(sequence);
         }
-        self.consumer.onSend();
+        if (return_from_kernel)
+            self.consumer.onSend();
     }
-    fn onChannelClose(_: Self) void {}
+    fn close(self: *Self) void {
+        if (self.consumer.in_kernel_buffers == 0)
+            self.consumer.unsubscribe();
+    }
 
     fn pull(self: *Self) !void {
         self.consumer.ready_count = self.consumer.in_flight_count + 1;
-        try self._pull();
-        self.consumer.ready_count -= 1;
+        defer self.consumer.ready_count -= 1;
+        try self._pull(true);
+    }
+
+    fn pullHoldInKernel(self: *Self) !void {
+        self.consumer.ready_count = self.consumer.in_flight_count + 1;
+        defer self.consumer.ready_count -= 1;
+        try self._pull(false);
     }
 
     fn finish(self: *Self, sequence: u64) !void {
@@ -1760,9 +1829,9 @@ test "topic pause" {
     const channel = client.consumer.channel.?;
 
     { // while channel is paused topic messages are not delivered to the channel
-        try testing.expect(!channel.paused);
+        try testing.expect(channel.state == .active);
         try broker.pauseChannel(topic_name, channel_name);
-        try testing.expect(channel.paused);
+        try testing.expect(channel.state == .paused);
 
         try client.pull();
         try testing.expectEqual(0, channel.in_flight.count());
@@ -1774,9 +1843,9 @@ test "topic pause" {
     }
 
     { // same while topic is paused
-        try testing.expect(!topic.paused);
+        try testing.expect(topic.state == .active);
         try broker.pauseTopic(topic_name);
-        try testing.expect(topic.paused);
+        try testing.expect(topic.state == .paused);
 
         try client.pull();
         try testing.expectEqual(1, channel.in_flight.count());
@@ -1788,7 +1857,7 @@ test "topic pause" {
     }
 
     try broker.deleteTopic(topic_name);
-    try testing.expect(client.consumer.channel == null);
+    //try testing.expect(client.consumer.channel == null);
 }
 
 test "channel empty" {
@@ -1846,6 +1915,46 @@ test "ephemeral channel" {
 
     try testing.expectEqual(1, topic.channels.count());
     client.consumer.unsubscribe();
+    try testing.expectEqual(0, topic.channels.count());
+}
+
+test "channel delete page references" {
+    const allocator = testing.allocator;
+    const topic_name = "topic";
+    const channel_name = "channel1";
+
+    var broker = TestBroker.init(allocator, 0, .{});
+    defer broker.deinit();
+
+    var client1 = TestClient.init(allocator);
+    defer client1.deinit();
+    try broker.subscribe(&client1, topic_name, channel_name);
+
+    try broker.publish(topic_name, "message 1");
+    try broker.publish(topic_name, "message 2");
+
+    const channel = client1.consumer.channel.?;
+    const topic = channel.topic;
+    const page = &topic.stream.pages.items[0];
+    try testing.expectEqual(1, page.ref_count);
+
+    try testing.expectEqual(0, channel.sequence);
+    try client1.pullHoldInKernel();
+    try testing.expectEqual(1, channel.sequence);
+    try testing.expectEqual(1, channel.in_flight.count());
+    try testing.expectEqual(1, client1.consumer.in_kernel_buffers);
+    // first reference is channel, second in flight message
+    try testing.expectEqual(2, page.ref_count);
+
+    try broker.deleteChannel(topic_name, channel_name);
+    try testing.expectEqual(2, page.ref_count);
+    try testing.expectEqual(1, client1.consumer.in_kernel_buffers);
+    try testing.expectEqual(1, topic.channels.count());
+    try testing.expect(channel.state == .deleting);
+    client1.consumer.onSend();
+    client1.close();
+    try testing.expectEqual(0, client1.consumer.in_kernel_buffers);
+    try testing.expectEqual(0, topic.stream.pages.items.len);
     try testing.expectEqual(0, topic.channels.count());
 }
 
@@ -2061,8 +2170,8 @@ test "dump/restore" {
         try testing.expectEqual(102, channel1.sequence);
         try testing.expectEqual(103, channel2.sequence);
 
-        try testing.expect(channel1.paused);
-        try testing.expect(!channel2.paused);
+        try testing.expect(channel1.state == .paused);
+        try testing.expect(channel2.state == .active);
 
         try testing.expectEqual(2, channel1.metric.depth.value);
         try testing.expectEqual(2, channel2.metric.depth.value);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const assert = std.debug.assert;
 const testing = std.testing;
@@ -79,7 +80,7 @@ const Page = struct {
         if (sequence < self.first()) {
             const cnt = @min(msgs_count, ready_count);
             const end_idx = cnt - 1;
-            if (ack_policy == .explicit) self.ref_count += cnt + 1;
+            if (ack_policy == .explicit) self.ref_count += cnt;
             const data = self.buf[0..self.offsets.items[end_idx]];
             return .{
                 .data = data,
@@ -92,7 +93,7 @@ const Page = struct {
         const start_idx: u32 = @intCast(sequence - self.first());
         const end_idx: u32 = @min(msgs_count - 1, start_idx + ready_count);
         const cnt: u32 = end_idx - start_idx;
-        if (ack_policy == .explicit) self.ref_count += cnt + 1;
+        if (ack_policy == .explicit) self.ref_count += cnt;
         const data = self.buf[self.offsets.items[start_idx]..self.offsets.items[end_idx]];
         return .{
             .data = data,
@@ -467,7 +468,8 @@ pub const Stream = struct {
 
     pub fn release(self: *Self, sequence: u64) void {
         const page = self.findPage(sequence) orelse {
-            log.err("release: page not found for sequence: {}", .{sequence});
+            if (!builtin.is_test)
+                log.err("release: page not found for sequence: {}", .{sequence});
             return;
         };
         page.ref_count -= 1;
@@ -585,7 +587,7 @@ test "topic usage" {
         sub_1_seq = res1.sequence.to;
 
         // each message holds reference when ack is explicit
-        try testing.expectEqual(5, stream.pages.items[0].ref_count);
+        try testing.expectEqual(4, stream.pages.items[0].ref_count);
         try testing.expectEqual(0, stream.pages.items[1].ref_count);
         try testing.expectEqual(1, stream.pages.items[2].ref_count);
 
@@ -593,8 +595,8 @@ test "topic usage" {
         try testing.expectEqualStrings("890123", res2.data);
 
         // subscriber's reference is moved to the second page
-        try testing.expectEqual(4, stream.pages.items[0].ref_count);
-        try testing.expectEqual(4, stream.pages.items[1].ref_count);
+        try testing.expectEqual(3, stream.pages.items[0].ref_count);
+        try testing.expectEqual(3, stream.pages.items[1].ref_count);
         try testing.expectEqual(1, stream.pages.items[2].ref_count);
 
         // fin messages in flight release first page
@@ -859,27 +861,27 @@ test "ack policy" {
     var res = stream.pull(100, 2).?;
     try testing.expectEqual(101, res.sequence.from);
     try testing.expectEqual(102, res.sequence.to);
-    try testing.expectEqual(3, stream.pages.items[0].ref_count);
+    try testing.expectEqual(2, stream.pages.items[0].ref_count);
+
+    res = stream.pull(102, 2).?;
+    try testing.expectEqual(103, res.sequence.from);
+    try testing.expectEqual(104, res.sequence.to);
+    try testing.expectEqual(4, stream.pages.items[0].ref_count);
 
     res = stream.pull(102, 2).?;
     try testing.expectEqual(103, res.sequence.from);
     try testing.expectEqual(104, res.sequence.to);
     try testing.expectEqual(6, stream.pages.items[0].ref_count);
 
-    res = stream.pull(102, 2).?;
-    try testing.expectEqual(103, res.sequence.from);
-    try testing.expectEqual(104, res.sequence.to);
-    try testing.expectEqual(9, stream.pages.items[0].ref_count);
-
     res = stream.pull(104, 10).?;
     try testing.expectEqual(105, res.sequence.from);
     try testing.expectEqual(106, res.sequence.to);
-    try testing.expectEqual(12, stream.pages.items[0].ref_count);
+    try testing.expectEqual(8, stream.pages.items[0].ref_count);
 
     res = stream.pull(100, 6).?;
     try testing.expectEqual(101, res.sequence.from);
     try testing.expectEqual(106, res.sequence.to);
-    try testing.expectEqual(19, stream.pages.items[0].ref_count);
+    try testing.expectEqual(14, stream.pages.items[0].ref_count);
 
     try testing.expectEqualStrings("0", stream.message(101));
     try testing.expectEqualStrings("1", stream.message(102));

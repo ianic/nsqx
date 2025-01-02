@@ -344,7 +344,7 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
                 .requeue_count = channel.metric.requeue.value,
                 .timeout_count = channel.metric.timeout.value,
                 .client_count = client_count,
-                .paused = channel.paused,
+                .paused = !(channel.state == .active),
                 .clients = clients,
             });
         }
@@ -354,7 +354,7 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
             .depth = if (topic.channels.count() == 0) topic.stream.metric.msgs.value else 0,
             .message_count = topic.stream.metric.total_msgs.value,
             .message_bytes = topic.stream.metric.total_bytes.value,
-            .paused = topic.paused,
+            .paused = !(topic.state == .active),
             .channels = channels.items,
         });
     }

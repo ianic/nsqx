@@ -165,6 +165,10 @@ pub const Conn = struct {
         self.shutdown();
     }
 
+    pub fn close(self: *Conn) void {
+        self.shutdown();
+    }
+
     fn send(self: *Conn) void {
         if (self.send_op.active() or self.state != .connected) return;
 
