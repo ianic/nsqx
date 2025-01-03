@@ -114,7 +114,7 @@ cd ~/Code/go/nsq/bench/bench_writer/
 go build
 ~/Code/go/nsq/bench/bench_writer/bench_writer --size 200 --runfor 1s
 
-~/Code/go/nsq/bench/bench_reader/bench_reader --size 200 --runfor 10s
+~/Code/go/nsq/bench/bench_reader/bench_reader --runfor 1s
 
 for i in $(seq 1 32); do
     echo running $i writer workers

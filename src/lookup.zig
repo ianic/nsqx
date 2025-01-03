@@ -9,7 +9,6 @@ const testing = std.testing;
 const Io = @import("io/io.zig").Io;
 const Op = @import("io/io.zig").Op;
 const Error = @import("io/io.zig").Error;
-const RecvBuf = @import("tcp.zig").RecvBuf;
 const Options = @import("Options.zig");
 const Stream = @import("store.zig").Stream;
 
@@ -331,3 +330,36 @@ test "identify message" {
     const expected = "  V1IDENTIFY\n\x00\x00\x00\x63{\"broadcast_address\":\"hydra\",\"hostname\":\"hydra\",\"http_port\":4151,\"tcp_port\":4150,\"version\":\"1.3.0\"}";
     try testing.expectEqualStrings(expected, im);
 }
+
+pub const RecvBuf = struct {
+    allocator: mem.Allocator,
+    buf: []u8 = &.{},
+
+    const Self = @This();
+
+    pub fn init(allocator: mem.Allocator) Self {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn free(self: *Self) void {
+        self.allocator.free(self.buf);
+        self.buf = &.{};
+    }
+
+    pub fn append(self: *Self, bytes: []const u8) ![]const u8 {
+        if (self.buf.len == 0) return bytes;
+        const old_len = self.buf.len;
+        self.buf = try self.allocator.realloc(self.buf, old_len + bytes.len);
+        @memcpy(self.buf[old_len..], bytes);
+        return self.buf;
+    }
+
+    pub fn set(self: *Self, bytes: []const u8) !void {
+        if (bytes.len == 0) return self.free();
+        if (self.buf.len == bytes.len and self.buf.ptr == bytes.ptr) return;
+
+        const new_buf = try self.allocator.dupe(u8, bytes);
+        self.free();
+        self.buf = new_buf;
+    }
+};
