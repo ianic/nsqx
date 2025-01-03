@@ -24,7 +24,8 @@ pub fn Tcp(comptime ClientType: type) type {
         recv_buf: RecvBuf,
         send_op: io.Op = .{},
         send_list: std.ArrayList(posix.iovec_const),
-        send_iov: []posix.iovec_const = &.{},
+        send_iov: []posix.iovec_const = &.{}, // because msghdr.iov is pointer
+        send_iovlen: u32 = 0, // because msghdr.iovlen gets reset in op.send
         send_msghdr: posix.msghdr_const = .{ .iov = undefined, .iovlen = 0, .name = null, .namelen = 0, .control = null, .controllen = 0, .flags = 0 },
 
         const State = enum {
@@ -94,6 +95,17 @@ pub fn Tcp(comptime ClientType: type) type {
             if (self.state == .closed)
                 return self.client.onSend(buf);
 
+            if (!self.send_op.active() and self.send_iov.len > 0 and self.send_list.items.len == 0) {
+                self.send_iov[0] = .{ .base = buf.ptr, .len = buf.len };
+                self.send_iovlen = 1;
+                self.send_msghdr.iovlen = 1;
+                self.send_msghdr.iov = self.send_iov.ptr;
+
+                self.send_op = io.Op.sendv(self.socket, &self.send_msghdr, self, onSend, onSendFail);
+                self.io_loop.submit(&self.send_op);
+                return;
+            }
+
             try self.send_list.append(.{ .base = buf.ptr, .len = buf.len });
             try self.sendPending();
         }
@@ -104,39 +116,56 @@ pub fn Tcp(comptime ClientType: type) type {
 
             // Move send_list buffers to send_iov, and prepare msghdr. send_list
             // can accumulate new buffers while send_iov is in the kernel.
-            self.send_iov = try self.send_list.toOwnedSlice();
-            self.send_msghdr.iov = self.send_iov.ptr;
-            self.send_msghdr.iovlen = @intCast(self.send_iov.len);
+            try self.prepareIov();
             // Start send operation
             self.send_op = io.Op.sendv(self.socket, &self.send_msghdr, self, onSend, onSendFail);
             self.io_loop.submit(&self.send_op);
         }
 
+        // iovlen in msghdr is limited by IOV_MAX in <limits.h>. On modern Linux
+        // systems, the limit is 1024. Each message has header and body: 2 iovecs that
+        // limits number of messages in a batch to 512.
+        // ref: https://man7.org/linux/man-pages/man2/readv.2.html
+        const max_iov = 1024;
+
+        fn prepareIov(self: *Self) !void {
+            const iovlen: u32 = @min(max_iov, self.send_list.items.len);
+
+            if (self.send_iov.len < iovlen) {
+                // resize self.send_iov
+                const iov = try self.allocator.alloc(posix.iovec_const, iovlen);
+                errdefer self.allocator.free(iov);
+                self.allocator.free(self.send_iov);
+                self.send_iov = iov;
+                self.send_msghdr.iov = self.send_iov.ptr;
+            }
+            // copy from send_list to send_iov
+            @memcpy(self.send_iov[0..iovlen], self.send_list.items[0..iovlen]);
+            // shrink self.send_list
+            mem.copyForwards(posix.iovec_const, self.send_list.items[0..], self.send_list.items[iovlen..]);
+            self.send_list.items.len -= iovlen;
+
+            self.send_msghdr.iov = self.send_iov.ptr;
+            self.send_msghdr.iovlen = @intCast(iovlen);
+            self.send_iovlen = iovlen;
+        }
+
         /// Send operation is completed, release pending resources and notify
         /// client that we are done with sending their buffers.
-        fn sendRelease(self: *Self) void {
-            if (self.send_iov.len == 0) return;
-
-            const send_iov = self.send_iov;
-            { // Reset pending send state
-                self.send_iov = &.{};
-                self.send_msghdr.iov = self.send_iov.ptr;
-                self.send_msghdr.iovlen = 0;
+        fn sendCompleted(self: *Self) void {
+            // Call client callback for each sent buffer
+            for (self.send_iov[0..self.send_iovlen]) |vec| {
+                var buf: []const u8 = undefined;
+                buf.ptr = vec.base;
+                buf.len = vec.len;
+                self.client.onSend(buf);
             }
-            { // Call client callback for each sent buffer
-                for (send_iov) |vec| {
-                    var buf: []const u8 = undefined;
-                    buf.ptr = vec.base;
-                    buf.len = vec.len;
-                    self.client.onSend(buf);
-                }
-                self.allocator.free(send_iov);
-            }
+            self.send_iovlen = 0;
         }
 
         fn onSend(self: *Self) io.Error!void {
             // log.debug("{} onSend", .{self.address});
-            self.sendRelease();
+            self.sendCompleted();
             try self.sendPending();
         }
 
@@ -145,7 +174,7 @@ pub fn Tcp(comptime ClientType: type) type {
                 error.BrokenPipe, error.ConnectionResetByPeer => {},
                 else => log.err("{} send failed {}", .{ self.address, err }),
             }
-            self.sendRelease();
+            self.sendCompleted();
             self.close();
         }
 
@@ -196,9 +225,9 @@ pub fn Tcp(comptime ClientType: type) type {
                 return;
 
             self.state = .closed;
-            self.sendRelease();
-            self.client.onClose();
+            self.sendCompleted();
             log.debug("{} closed", .{self.address});
+            self.client.onClose();
         }
     };
 }

@@ -90,19 +90,22 @@ pub const Conn = struct {
     allocator: mem.Allocator,
     listener: *Listener,
     io_loop: *io.Loop,
+
+    // TODO: remove this two, we have that in tcp
     socket: posix.socket_t = 0,
     addr: net.Address,
 
-    recv_op: io.Op = .{},
-    send_op: io.SendOp = .{},
+    tcp: io.Tcp(*Conn),
+    // recv_op: io.Op = .{},
+    // send_op: io.SendOp = .{},
     timer_op: timer.Op = undefined,
-    shutdown_op: io.Op = .{},
-    pending_responses: std.ArrayList(protocol.Response),
+    // shutdown_op: io.Op = .{},
+    // pending_responses: std.ArrayList(protocol.Response),
+    // recv_buf: RecvBuf, // Unprocessed bytes from previous receive
 
     timer_ts: u64,
     heartbeat_interval: u32 = initial_heartbeat,
     outstanding_heartbeats: u8 = 0,
-    recv_buf: RecvBuf, // Unprocessed bytes from previous receive
 
     consumer: ?Broker.Consumer = null,
     identify: protocol.Identify = .{},
@@ -124,69 +127,95 @@ pub const Conn = struct {
             .io_loop = listener.io_loop,
             .socket = socket,
             .addr = addr,
-            .recv_buf = RecvBuf.init(listener.allocator),
+            //.recv_buf = RecvBuf.init(listener.allocator),
             .timer_ts = listener.io_loop.tsFromDelay(initial_heartbeat),
-            .pending_responses = std.ArrayList(protocol.Response).init(allocator),
+            //.pending_responses = std.ArrayList(protocol.Response).init(allocator),
+            .tcp = io.Tcp(*Conn).init(allocator, listener.io_loop, self),
         };
 
-        try self.send_op.init(allocator, socket, self, onSend, onSendFail);
-        errdefer self.send_op.deinit(allocator);
+        self.tcp.address = addr; // TODO: fix this
+        self.tcp.connected(socket);
+
+        // try self.send_op.init(allocator, socket, self, onSend, onSendFail);
+        // errdefer self.send_op.deinit(allocator);
 
         self.timer_op.init(&listener.broker.timer_queue, self, Conn.onTimer);
         try self.timer_op.update(initial_heartbeat);
 
-        self.recv_op = io.Op.recv(socket, self, onRecv, onRecvFail);
-        self.io_loop.submit(&self.recv_op);
+        // self.recv_op = io.Op.recv(socket, self, onRecv, onRecvFail);
+        // self.io_loop.submit(&self.recv_op);
         log.debug("{} connected {}", .{ socket, addr });
     }
 
     fn deinit(self: *Conn) void {
-        self.recv_buf.free();
+        //self.recv_buf.free();
         self.identify.deinit(self.allocator);
-        self.send_op.deinit(self.allocator);
-        self.pending_responses.deinit();
+        //self.send_op.deinit(self.allocator);
+        //self.pending_responses.deinit();
         self.timer_op.deinit();
+        self.tcp.deinit();
     }
 
     // Channel api -----------------
 
     pub fn onChannelReady(self: *Conn) void {
-        self.send();
+        if (self.consumer) |*consumer| {
+            if (consumer.pull() catch |err| brk: {
+                log.err("{} failed to pull from channel {}", .{ self.socket, err });
+                break :brk null;
+            }) |data| {
+                self.tcp.send(data) catch |err| {
+                    log.err("{} on channel ready {}", .{ self.socket, err });
+                    self.tcp.close();
+                };
+            }
+        }
+
+        // self.send();
     }
 
-    pub fn onChannelClose(self: *Conn) void {
-        self.shutdown();
-    }
+    // pub fn onChannelClose(self: *Conn) void {
+    //     self.shutdown();
+    // }
 
     pub fn close(self: *Conn) void {
         self.shutdown();
     }
 
-    fn send(self: *Conn) void {
-        if (self.send_op.active() or self.state != .connected) return;
+    // fn send(self: *Conn) void {
+    //     if (self.send_op.active() or self.state != .connected) return;
 
-        { // Prepare pending responses
-            while (self.send_op.free() > 0) {
-                const rsp = self.pending_responses.popOrNull() orelse break;
-                self.send_op.prep(rsp.body());
-            }
+    //     { // Prepare pending responses
+    //         while (self.send_op.free() > 0) {
+    //             const rsp = self.pending_responses.popOrNull() orelse break;
+    //             self.send_op.prep(rsp.body());
+    //         }
+    //     }
+
+    //     { // Pull messages from channel
+    //         if (self.send_op.free() > 0) {
+    //             if (self.consumer) |*consumer| {
+    //                 if (consumer.pull() catch |err| brk: {
+    //                     log.err("{} failed to pull from channel {}", .{ self.socket, err });
+    //                     break :brk null;
+    //                 }) |data| {
+    //                     self.send_op.prep(data);
+    //                 }
+    //             }
+    //         }
+    //     }
+
+    //     if (self.send_op.count() > 0)
+    //         self.send_op.send(self.io_loop);
+    // }
+
+    pub fn onSend(self: *Conn, buf: []const u8) void {
+        _, const frame_type = protocol.parseFrame(buf) catch unreachable;
+        if (frame_type != .message) return;
+        if (self.consumer) |*consumer| {
+            consumer.onSend(buf);
+            self.onChannelReady();
         }
-
-        { // Pull messages from channel
-            if (self.send_op.free() > 0) {
-                if (self.consumer) |*consumer| {
-                    if (consumer.pull() catch |err| brk: {
-                        log.err("{} failed to pull from channel {}", .{ self.socket, err });
-                        break :brk null;
-                    }) |data| {
-                        self.send_op.prep(data);
-                    }
-                }
-            }
-        }
-
-        if (self.send_op.count() > 0)
-            self.send_op.send(self.io_loop);
     }
 
     // IO callbacks -----------------
@@ -206,41 +235,43 @@ pub const Conn = struct {
         return self.io_loop.tsFromDelay(self.heartbeat_interval);
     }
 
-    fn onRecv(self: *Conn, bytes: []const u8) io.Error!void {
+    pub fn onRecv(self: *Conn, bytes: []const u8) io.Error!usize {
         // Any error is lack of resources, shutdown this connection in the case
         // of error.
-        self.receivedData(bytes) catch return self.shutdown();
-        if (!self.recv_op.hasMore()) self.shutdown();
+        return self.receivedData(bytes) catch brk: {
+            self.shutdown();
+            break :brk 0;
+        };
     }
 
-    fn onRecvFail(self: *Conn, err: anyerror) io.Error!void {
-        switch (err) {
-            error.EndOfFile, error.OperationCanceled, error.ConnectionResetByPeer => {},
-            else => log.err("{} recv failed {}", .{ self.socket, err }),
-        }
-        self.shutdown();
-    }
+    // fn onRecvFail(self: *Conn, err: anyerror) io.Error!void {
+    //     switch (err) {
+    //         error.EndOfFile, error.OperationCanceled, error.ConnectionResetByPeer => {},
+    //         else => log.err("{} recv failed {}", .{ self.socket, err }),
+    //     }
+    //     self.shutdown();
+    // }
 
-    fn onSend(self: *Conn) io.Error!void {
-        if (self.consumer) |*consumer|
-            consumer.onSend();
-        self.send();
-    }
+    // fn onSend(self: *Conn) io.Error!void {
+    //     if (self.consumer) |*consumer|
+    //         consumer.onSend();
+    //     self.send();
+    // }
 
-    fn onSendFail(self: *Conn, err: anyerror) io.Error!void {
-        if (self.consumer) |*consumer|
-            consumer.onSend();
-        switch (err) {
-            error.BrokenPipe, error.ConnectionResetByPeer => {},
-            else => log.err("{} send failed {}", .{ self.socket, err }),
-        }
-        self.shutdown();
-    }
+    // fn onSendFail(self: *Conn, err: anyerror) io.Error!void {
+    //     if (self.consumer) |*consumer|
+    //         consumer.onSend();
+    //     switch (err) {
+    //         error.BrokenPipe, error.ConnectionResetByPeer => {},
+    //         else => log.err("{} send failed {}", .{ self.socket, err }),
+    //     }
+    //     self.shutdown();
+    // }
 
     // ------------------------------
 
-    fn receivedData(self: *Conn, bytes: []const u8) !void {
-        var parser = protocol.Parser{ .buf = try self.recv_buf.append(bytes) };
+    fn receivedData(self: *Conn, bytes: []const u8) !usize {
+        var parser = protocol.Parser{ .buf = bytes };
         while (parser.next() catch |err| {
             log.err(
                 "{} protocol parser failed with: {s}, un-parsed: '{d}'",
@@ -279,8 +310,8 @@ pub const Conn = struct {
             };
         }
 
-        try self.recv_buf.set(parser.unparsed());
-        self.send();
+        //self.onChannelReady();
+        return parser.pos;
     }
 
     fn receivedMsg(self: *Conn, msg: protocol.Message) !void {
@@ -363,66 +394,80 @@ pub const Conn = struct {
     }
 
     fn respond(self: *Conn, rsp: protocol.Response) !void {
-        if (self.send_op.active())
-            return try self.pending_responses.insert(0, rsp);
+        // if (self.send_op.active())
+        //     return try self.pending_responses.insert(0, rsp);
 
-        self.send_op.prep(rsp.body());
-        self.send_op.send(self.io_loop);
+        // self.send_op.prep(rsp.body());
+        // self.send_op.send(self.io_loop);
+        self.tcp.send(rsp.body()) catch |err| {
+            log.err("{} respond {}", .{ self.socket, err });
+            self.shutdown();
+        };
     }
 
-    fn onClose(self: *Conn, _: ?anyerror) void {
-        self.shutdown();
-    }
+    // fn onClose(self: *Conn, _: ?anyerror) void {
+    //     self.shutdown();
+    // }
 
     pub fn shutdown(self: *Conn) void {
-        switch (self.state) {
-            .connected => {
-                // Start shutdown.
-                if (self.consumer) |*consumer|
-                    consumer.ready_count = 0; // stop sending
-                self.state = .closing;
-                self.shutdown_op = io.Op.shutdown(self.socket, self, onClose);
-                self.io_loop.submit(&self.shutdown_op);
-            },
-            .closing => {
-                // Close recv if not closed by shutdown
-                if (self.recv_op.active() and !self.shutdown_op.active()) {
-                    self.shutdown_op = io.Op.cancel(&self.recv_op, self, onClose);
-                    self.io_loop.submit(&self.shutdown_op);
-                    return;
-                }
-                // Wait for all operation to finish.
-                if (self.recv_op.active() or
-                    self.send_op.active() or
-                    self.shutdown_op.active())
-                    return;
+        self.tcp.close();
+        // switch (self.state) {
+        //     .connected => {
+        //         // Start shutdown.
+        //         if (self.consumer) |*consumer|
+        //             consumer.ready_count = 0; // stop sending
+        //         self.state = .closing;
+        //         self.shutdown_op = io.Op.shutdown(self.socket, self, onClose);
+        //         self.io_loop.submit(&self.shutdown_op);
+        //     },
+        //     .closing => {
+        //         // Close recv if not closed by shutdown
+        //         if (self.recv_op.active() and !self.shutdown_op.active()) {
+        //             self.shutdown_op = io.Op.cancel(&self.recv_op, self, onClose);
+        //             self.io_loop.submit(&self.shutdown_op);
+        //             return;
+        //         }
+        //         // Wait for all operation to finish.
+        //         if (self.recv_op.active() or
+        //             self.send_op.active() or
+        //             self.shutdown_op.active())
+        //             return;
 
-                if (self.consumer) |*consumer| {
-                    consumer.unsubscribe();
-                    self.consumer = null;
-                }
+        //         if (self.consumer) |*consumer| {
+        //             consumer.unsubscribe();
+        //             self.consumer = null;
+        //         }
 
-                log.debug("{} closed", .{self.socket});
-                self.deinit();
-                self.listener.remove(self);
-            },
+        //         log.debug("{} closed", .{self.socket});
+        //         self.deinit();
+        //         self.listener.remove(self);
+        //     },
+        // }
+    }
+
+    pub fn onClose(self: *Conn) void {
+        if (self.consumer) |*consumer| {
+            consumer.unsubscribe();
+            self.consumer = null;
         }
+        self.deinit();
+        self.listener.remove(self);
     }
 
-    pub fn printStatus(self: *Conn) void {
-        std.debug.print("  socket {:>3} {s} state: {s}, capacity: {} {}  active:{s}{s}{s}\n", .{
-            @as(u32, @intCast(self.socket)),
-            if (self.channel != null) "sub" else "pub",
-            @tagName(self.state),
+    // pub fn printStatus(self: *Conn) void {
+    //     std.debug.print("  socket {:>3} {s} state: {s}, capacity: {} {}  active:{s}{s}{s}\n", .{
+    //         @as(u32, @intCast(self.socket)),
+    //         if (self.channel != null) "sub" else "pub",
+    //         @tagName(self.state),
 
-            self.send_op.capacity(),
-            self.pending_responses.capacity,
+    //         self.send_op.capacity(),
+    //         self.pending_responses.capacity,
 
-            if (self.recv_op.active()) " recv" else "",
-            if (self.send_op.active()) " send" else "",
-            if (self.shutdown_op.active()) " shutdown" else "",
-        });
-    }
+    //         if (self.recv_op.active()) " recv" else "",
+    //         if (self.send_op.active()) " send" else "",
+    //         if (self.shutdown_op.active()) " shutdown" else "",
+    //     });
+    // }
 };
 
 pub const RecvBuf = struct {

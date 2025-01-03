@@ -558,6 +558,30 @@ pub fn frame(comptime data: []const u8, comptime typ: FrameType) [data.len + 8]u
     return hdr ++ data[0..].*;
 }
 
+pub fn parseFrame(data: []const u8) !struct { usize, FrameType } {
+    if (data.len < 8) return error.InvalidFrame;
+    var hdr = data[0..8];
+    const size = mem.readInt(u32, hdr[0..4], .big);
+    const typ = mem.readInt(u32, hdr[4..8], .big);
+    if (typ > 2) return error.InvalidFrame;
+    return .{ size, @as(FrameType, @enumFromInt(typ)) };
+}
+
+test parseFrame {
+    {
+        const size, const frame_type = try parseFrame(&.{ 0, 0, 0, 1, 0, 0, 0, 0, 255 });
+        try testing.expectEqual(1, size);
+        try testing.expectEqual(FrameType.response, frame_type);
+    }
+    {
+        const size, const frame_type = try parseFrame(&.{ 0, 0, 0, 3, 0, 0, 0, 2, 1, 2, 3 });
+        try testing.expectEqual(3, size);
+        try testing.expectEqual(FrameType.message, frame_type);
+    }
+    try testing.expectError(error.InvalidFrame, parseFrame(&.{ 0, 0, 0, 0, 0, 0, 0, 3 }));
+    try testing.expectError(error.InvalidFrame, parseFrame(&.{ 0, 0, 0, 0, 0, 0, 0 }));
+}
+
 pub const Response = enum {
     ok,
     close,
@@ -663,4 +687,25 @@ test "fuzz parser" {
             other_msgs,
         },
     });
+}
+
+pub const Msg = struct {
+    timestamp: u64,
+    attempts: u16,
+    sequence: u64,
+};
+
+// Parses first message from data !!!
+pub fn parseMessageFrame(data: []const u8) !Msg {
+    if (data.len < header_len) return error.InvalidFrame;
+    const size, const frame_type = try parseFrame(data);
+    if (frame_type != .message) return error.InvalidFrame;
+    if (data.len < size + 4) return error.InvalidFrame;
+
+    const hdr = data[0..header_len];
+    return .{
+        .timestamp = mem.readInt(u64, hdr[8..16], .big),
+        .attempts = mem.readInt(u16, hdr[16..18], .big),
+        .sequence = msg_id.decode(hdr[18..34].*),
+    };
 }

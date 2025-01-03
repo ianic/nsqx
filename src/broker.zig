@@ -41,7 +41,7 @@ pub fn BrokerType(Client: type) type {
             //
             in_flight_count: u32 = 0,
             in_kernel_buffers: u32 = 0,
-            pull_chunk: ?Channel.PullChunk = null,
+            // pull_chunk: ?Channel.PullChunk = null,
             metric: struct {
                 connected_at: u64 = 0,
                 // Total number of
@@ -54,8 +54,8 @@ pub fn BrokerType(Client: type) type {
 
             /// Is client ready to send
             fn ready(self: Self) bool {
-                return self.pull_chunk == null and
-                    self.in_flight_count < self.ready_count;
+                //return self.pull_chunk == null and
+                return self.in_flight_count < self.ready_count;
             }
 
             fn readyCount(self: Self) u32 {
@@ -86,8 +86,12 @@ pub fn BrokerType(Client: type) type {
 
             /// Client pulls data to send.
             pub fn pull(self: *Self) !?[]const u8 {
-                const pc = try self.channel.pull(self) orelse return null;
-                self.pull_chunk = pc;
+                const pc = try self.channel.pull(self) orelse {
+                    //std.debug.print("pull nothing {} {}\n", .{ self.in_flight_count, self.ready_count });
+                    return null;
+                };
+                //std.debug.print("pull count: {} {} {}\n", .{ pc.count, self.in_flight_count, self.ready_count });
+                // self.pull_chunk = pc;
                 self.metric.send +%= pc.count;
                 self.in_flight_count += pc.count;
                 self.in_kernel_buffers += 1;
@@ -97,12 +101,17 @@ pub fn BrokerType(Client: type) type {
             /// Notification that client has finished sending data from last
             /// pull. Buffer returned from pull is no more in kernel and can be
             /// released now.
-            pub fn onSend(self: *Self) void {
+            pub fn onSend(self: *Self, buf: []const u8) void {
                 self.in_kernel_buffers -= 1;
-                if (self.pull_chunk) |pc| {
-                    pc.done();
-                    self.pull_chunk = null;
-                }
+                // self.pull_chunk = null;
+                const msg = protocol.parseMessageFrame(buf) catch unreachable;
+                if (msg.attempts == 1) return;
+                self.channel.allocator.free(buf);
+
+                // if (self.pull_chunk) |pc| {
+                //     pc.done();
+                // self.pull_chunk = null;
+                //}
             }
 
             // Client api -----------------
@@ -1244,9 +1253,7 @@ pub fn BrokerType(Client: type) type {
                     self.requeueAll(consumer) catch |err| {
                         log.warn("failed to remove in flight messages {}", .{err});
                     };
-
                     self.consumers.remove(consumer);
-
                     if ((self.consumers.count() == 0 and self.ephemeral) or
                         (self.state == .deleting))
                     {
