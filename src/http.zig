@@ -1,16 +1,12 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
+const net = std.net;
 const posix = std.posix;
-const socket_t = std.posix.socket_t;
-const fd_t = std.posix.fd_t;
 
 const validateName = @import("protocol.zig").validateName;
 const Options = @import("Options.zig");
-const Io = @import("io/io.zig").Io;
-const Op = @import("io/io.zig").Op;
-const SendOp = @import("io/io.zig").SendOp;
-const Error = @import("io/io.zig").Error;
+const io = @import("io/io.zig");
 const Broker = @import("main.zig").Broker;
 const store = @import("store.zig");
 pub const Listener = @import("tcp.zig").ListenerType(Conn);
@@ -20,13 +16,13 @@ const log = std.log.scoped(.http);
 pub const Conn = struct {
     gpa: mem.Allocator,
     listener: *Listener,
-    io: *Io,
-    socket: socket_t = 0,
-    addr: std.net.Address,
+    io_loop: *io.Loop,
+    socket: posix.socket_t = 0,
+    addr: net.Address,
 
-    recv_op: Op = .{},
-    send_op: SendOp = .{},
-    close_op: Op = .{},
+    recv_op: io.Op = .{},
+    send_op: io.SendOp = .{},
+    close_op: io.Op = .{},
 
     rsp_arena: ?std.heap.ArenaAllocator = null, // arena allocator for response
     timer_ts: u64 = 0, // not used here but required by listener
@@ -37,20 +33,20 @@ pub const Conn = struct {
         closing,
     };
 
-    pub fn init(self: *Conn, listener: *Listener, socket: socket_t, addr: std.net.Address) !void {
+    pub fn init(self: *Conn, listener: *Listener, socket: posix.socket_t, addr: net.Address) !void {
         const allocator = listener.allocator;
         self.* = .{
             .gpa = allocator,
             .listener = listener,
-            .io = listener.io,
+            .io_loop = listener.io_loop,
             .socket = socket,
             .addr = addr,
         };
         errdefer self.deinit();
         try self.send_op.init(allocator, socket, self, onSend, onSendFail);
 
-        self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
-        self.io.submit(&self.recv_op);
+        self.recv_op = io.Op.recv(self.socket, self, onRecv, onRecvFail);
+        self.io_loop.submit(&self.recv_op);
     }
 
     pub fn deinit(self: *Conn) void {
@@ -58,7 +54,7 @@ pub const Conn = struct {
         self.send_op.deinit(self.gpa);
     }
 
-    fn onRecv(self: *Conn, bytes: []const u8) Error!void {
+    fn onRecv(self: *Conn, bytes: []const u8) io.Error!void {
         if (self.send_op.active()) return self.shutdown();
         assert(self.rsp_arena == null);
 
@@ -84,7 +80,7 @@ pub const Conn = struct {
             };
             self.send_op.prep(header);
         }
-        self.send_op.send(self.io);
+        self.send_op.send(self.io_loop);
         if (self.recv_op.active()) self.shutdown();
     }
 
@@ -123,7 +119,7 @@ pub const Conn = struct {
                 defer arena.deinit();
                 const allocator = arena.allocator();
                 switch (args) {
-                    .io => try metricIo(writer, self.io),
+                    .io => try metricIo(writer, self.io_loop),
                     .mem => try metricMem(writer),
                     .broker => try metricBroker(allocator, broker, writer),
                 }
@@ -149,11 +145,11 @@ pub const Conn = struct {
             self.rsp_arena = null;
         }
     }
-    fn onSend(self: *Conn) Error!void {
+    fn onSend(self: *Conn) io.Error!void {
         self.deinitResponse();
     }
 
-    fn onSendFail(self: *Conn, err: anyerror) Error!void {
+    fn onSendFail(self: *Conn, err: anyerror) io.Error!void {
         self.deinitResponse();
         switch (err) {
             error.BrokenPipe, error.ConnectionResetByPeer => {},
@@ -162,7 +158,7 @@ pub const Conn = struct {
         self.shutdown();
     }
 
-    fn onRecvFail(self: *Conn, err: anyerror) Error!void {
+    fn onRecvFail(self: *Conn, err: anyerror) io.Error!void {
         switch (err) {
             error.EndOfFile, error.OperationCanceled, error.ConnectionResetByPeer => {},
             else => log.err("{} recv failed {}", .{ self.socket, err }),
@@ -178,8 +174,8 @@ pub const Conn = struct {
         // log.debug("{} shutdown state: {s}", .{ self.socket, @tagName(self.state) });
         switch (self.state) {
             .connected => {
-                self.close_op = Op.shutdown(self.socket, self, onClose);
-                self.io.submit(&self.close_op);
+                self.close_op = io.Op.shutdown(self.socket, self, onClose);
+                self.io_loop.submit(&self.close_op);
                 self.state = .closing;
             },
             .closing => {
@@ -369,8 +365,8 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
     return;
 }
 
-fn metricIo(writer: anytype, io: *Io) !void {
-    try std.json.stringify(io.metric, .{}, writer);
+fn metricIo(writer: anytype, io_loop: *io.Loop) !void {
+    try std.json.stringify(io_loop.metric, .{}, writer);
 }
 
 fn metricMem(writer: anytype) !void {

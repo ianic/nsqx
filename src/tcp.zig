@@ -1,18 +1,12 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
+const net = std.net;
 const posix = std.posix;
-const socket_t = std.posix.socket_t;
-const fd_t = std.posix.fd_t;
 
+const io = @import("io/io.zig");
 const protocol = @import("protocol.zig");
 const Options = @import("Options.zig");
-
-const Io = @import("io/io.zig").Io;
-const Op = @import("io/io.zig").Op;
-const SendOp = @import("io/io.zig").SendOp;
-const Error = @import("io/io.zig").Error;
-
 const Broker = @import("main.zig").Broker;
 const Channel = Broker.Channel;
 const timer = @import("timer.zig");
@@ -24,9 +18,9 @@ pub fn ListenerType(comptime ConnType: type) type {
         allocator: mem.Allocator,
         broker: *Broker,
         options: Options,
-        socket: socket_t,
-        io: *Io,
-        op: Op = .{},
+        socket: posix.socket_t,
+        io_loop: *io.Loop,
+        op: io.Op = .{},
         conns: std.AutoHashMap(*ConnType, void),
         metric: struct {
             // Total number of
@@ -39,22 +33,22 @@ pub fn ListenerType(comptime ConnType: type) type {
         pub fn init(
             self: *Self,
             allocator: mem.Allocator,
-            io: *Io,
+            io_loop: *io.Loop,
             broker: *Broker,
             options: Options,
-            socket: socket_t,
+            socket: posix.socket_t,
         ) !void {
             self.* = .{
                 .allocator = allocator,
                 .broker = broker,
                 .options = options,
-                .io = io,
+                .io_loop = io_loop,
                 .socket = socket,
                 .conns = std.AutoHashMap(*ConnType, void).init(allocator),
             };
             errdefer self.deinit();
-            self.op = Op.accept(socket, self, onAccept, onAcceptFail);
-            self.io.submit(&self.op);
+            self.op = io.Op.accept(socket, self, onAccept, onAcceptFail);
+            self.io_loop.submit(&self.op);
         }
 
         pub fn deinit(self: *Self) void {
@@ -67,7 +61,7 @@ pub fn ListenerType(comptime ConnType: type) type {
             self.conns.deinit();
         }
 
-        fn onAccept(self: *Self, socket: socket_t, addr: std.net.Address) Error!void {
+        fn onAccept(self: *Self, socket: posix.socket_t, addr: net.Address) io.Error!void {
             var conn = try self.allocator.create(ConnType);
             errdefer self.allocator.destroy(conn);
             try self.conns.ensureUnusedCapacity(1);
@@ -77,9 +71,9 @@ pub fn ListenerType(comptime ConnType: type) type {
             self.metric.accept +%= 1;
         }
 
-        fn onAcceptFail(self: *Self, err: anyerror) Error!void {
+        fn onAcceptFail(self: *Self, err: anyerror) io.Error!void {
             log.err("accept failed {}", .{err});
-            self.io.submit(&self.op);
+            self.io_loop.submit(&self.op);
         }
 
         pub fn remove(self: *Self, conn: *ConnType) void {
@@ -95,14 +89,14 @@ pub const Listener = ListenerType(Conn);
 pub const Conn = struct {
     allocator: mem.Allocator,
     listener: *Listener,
-    io: *Io,
-    socket: socket_t = 0,
-    addr: std.net.Address,
+    io_loop: *io.Loop,
+    socket: posix.socket_t = 0,
+    addr: net.Address,
 
-    recv_op: Op = .{},
-    send_op: SendOp = .{},
+    recv_op: io.Op = .{},
+    send_op: io.SendOp = .{},
     timer_op: timer.Op = undefined,
-    shutdown_op: Op = .{},
+    shutdown_op: io.Op = .{},
     pending_responses: std.ArrayList(protocol.Response),
 
     timer_ts: u64,
@@ -122,16 +116,16 @@ pub const Conn = struct {
     // Until client set's connection heartbeat interval in identify message.
     const initial_heartbeat = 2000;
 
-    fn init(self: *Conn, listener: *Listener, socket: socket_t, addr: std.net.Address) !void {
+    fn init(self: *Conn, listener: *Listener, socket: posix.socket_t, addr: net.Address) !void {
         const allocator = listener.allocator;
         self.* = .{
             .allocator = allocator,
             .listener = listener,
-            .io = listener.io,
+            .io_loop = listener.io_loop,
             .socket = socket,
             .addr = addr,
             .recv_buf = RecvBuf.init(listener.allocator),
-            .timer_ts = listener.io.tsFromDelay(initial_heartbeat),
+            .timer_ts = listener.io_loop.tsFromDelay(initial_heartbeat),
             .pending_responses = std.ArrayList(protocol.Response).init(allocator),
         };
 
@@ -141,8 +135,8 @@ pub const Conn = struct {
         self.timer_op.init(&listener.broker.timer_queue, self, Conn.onTimer);
         try self.timer_op.update(initial_heartbeat);
 
-        self.recv_op = Op.recv(socket, self, onRecv, onRecvFail);
-        self.io.submit(&self.recv_op);
+        self.recv_op = io.Op.recv(socket, self, onRecv, onRecvFail);
+        self.io_loop.submit(&self.recv_op);
         log.debug("{} connected {}", .{ socket, addr });
     }
 
@@ -192,7 +186,7 @@ pub const Conn = struct {
         }
 
         if (self.send_op.count() > 0)
-            self.send_op.send(self.io);
+            self.send_op.send(self.io_loop);
     }
 
     // IO callbacks -----------------
@@ -209,17 +203,17 @@ pub const Conn = struct {
             self.respond(.heartbeat) catch self.shutdown();
         }
         self.outstanding_heartbeats += 1;
-        return self.io.tsFromDelay(self.heartbeat_interval);
+        return self.io_loop.tsFromDelay(self.heartbeat_interval);
     }
 
-    fn onRecv(self: *Conn, bytes: []const u8) Error!void {
+    fn onRecv(self: *Conn, bytes: []const u8) io.Error!void {
         // Any error is lack of resources, shutdown this connection in the case
         // of error.
         self.receivedData(bytes) catch return self.shutdown();
         if (!self.recv_op.hasMore()) self.shutdown();
     }
 
-    fn onRecvFail(self: *Conn, err: anyerror) Error!void {
+    fn onRecvFail(self: *Conn, err: anyerror) io.Error!void {
         switch (err) {
             error.EndOfFile, error.OperationCanceled, error.ConnectionResetByPeer => {},
             else => log.err("{} recv failed {}", .{ self.socket, err }),
@@ -227,13 +221,13 @@ pub const Conn = struct {
         self.shutdown();
     }
 
-    fn onSend(self: *Conn) Error!void {
+    fn onSend(self: *Conn) io.Error!void {
         if (self.consumer) |*consumer|
             consumer.onSend();
         self.send();
     }
 
-    fn onSendFail(self: *Conn, err: anyerror) Error!void {
+    fn onSendFail(self: *Conn, err: anyerror) io.Error!void {
         if (self.consumer) |*consumer|
             consumer.onSend();
         switch (err) {
@@ -373,7 +367,7 @@ pub const Conn = struct {
             return try self.pending_responses.insert(0, rsp);
 
         self.send_op.prep(rsp.body());
-        self.send_op.send(self.io);
+        self.send_op.send(self.io_loop);
     }
 
     fn onClose(self: *Conn, _: ?anyerror) void {
@@ -387,14 +381,14 @@ pub const Conn = struct {
                 if (self.consumer) |*consumer|
                     consumer.ready_count = 0; // stop sending
                 self.state = .closing;
-                self.shutdown_op = Op.shutdown(self.socket, self, onClose);
-                self.io.submit(&self.shutdown_op);
+                self.shutdown_op = io.Op.shutdown(self.socket, self, onClose);
+                self.io_loop.submit(&self.shutdown_op);
             },
             .closing => {
                 // Close recv if not closed by shutdown
                 if (self.recv_op.active() and !self.shutdown_op.active()) {
-                    self.shutdown_op = Op.cancel(&self.recv_op, self, onClose);
-                    self.io.submit(&self.shutdown_op);
+                    self.shutdown_op = io.Op.cancel(&self.recv_op, self, onClose);
+                    self.io_loop.submit(&self.shutdown_op);
                     return;
                 }
                 // Wait for all operation to finish.
