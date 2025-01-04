@@ -143,24 +143,15 @@ pub const Conn = struct {
 
     // Channel api -----------------
 
-    pub fn onChannelReady(self: *Conn) void {
-        var consumer = &(self.consumer orelse return);
-
-        if (consumer.pull() catch |err| {
-            log.err("{} consumer pull {}", .{ self.socket, err });
-            return;
-        }) |data| {
-            self.tcp.send(data) catch |err| {
-                log.err("{} tcp send {}", .{ self.socket, err });
-                consumer.onSend(data);
-                self.close();
-            };
-        }
+    pub fn send(self: *Conn, buf: []const u8) !void {
+        return self.tcp.send(buf);
     }
 
     pub fn close(self: *Conn) void {
         self.tcp.close();
     }
+
+    // IO callbacks -----------------
 
     pub fn onSend(self: *Conn, buf: []const u8) void {
         _, const frame_type = protocol.parseFrame(buf) catch unreachable;
@@ -168,8 +159,6 @@ pub const Conn = struct {
         if (self.consumer) |*consumer|
             consumer.onSend(buf);
     }
-
-    // IO callbacks -----------------
 
     pub fn onClose(self: *Conn) void {
         if (self.consumer) |*consumer| {
@@ -245,7 +234,7 @@ pub const Conn = struct {
                 }
             };
         }
-        self.onChannelReady();
+        if (self.consumer) |*consumer| consumer.pull();
         return parser.pos;
     }
 

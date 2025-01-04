@@ -83,30 +83,34 @@ pub fn BrokerType(Client: type) type {
                 self.channel.unsubscribe(self);
             }
 
-            /// Client pulls data to send.
-            pub fn pull(self: *Self) !?[]const u8 {
-                const count, const data = try self.channel.pull(self) orelse return null;
-                self.metric.send +%= count;
-                self.in_flight_count += count;
-                self.in_kernel_buffers += 1;
-                return data;
+            /// Pull data from channel and send to client
+            pub fn pull(self: *Self) void {
+                while (self.ready()) {
+                    const count, const data = self.channel.pull(self) catch |err| {
+                        log.err("consumer channel pull {}", .{err});
+                        return;
+                    } orelse return;
+                    self.metric.send +%= count;
+                    self.in_flight_count += count;
+                    self.in_kernel_buffers += 1;
+                    self.client.send(data) catch |err| {
+                        log.err("consumer client send {}", .{err});
+                        self.onSend(data);
+                    };
+                }
             }
 
-            /// Notification that client has finished sending data from last
-            /// pull. Buffer returned from pull is no more in kernel and can be
-            /// released now.
-            pub fn onSend(self: *Self, buf: []const u8) void {
+            /// Notification that client has finished sending data is no more in
+            /// kernel and can be released now.
+            pub fn onSend(self: *Self, data: []const u8) void {
                 self.in_kernel_buffers -= 1;
-                const msg = protocol.parseMessageFrame(buf) catch unreachable;
+                const msg = protocol.parseMessageFrame(data) catch unreachable;
                 if (msg.attempts == 1) return;
-                self.channel.allocator.free(buf);
+                // release data allocated in channel
+                self.channel.allocator.free(data);
             }
 
             // Client api -----------------
-
-            fn onChannelReady(self: *Self) void {
-                self.client.onChannelReady();
-            }
 
             fn close(self: *Self) void {
                 self.client.close();
@@ -1005,7 +1009,7 @@ pub fn BrokerType(Client: type) type {
                 fn wakeup(self: *Channel) void {
                     var iter = self.consumers.iter();
                     while (iter.next()) |consumer| {
-                        consumer.onChannelReady();
+                        consumer.pull();
                         if (!self.needWakeup()) break;
                     }
                 }
