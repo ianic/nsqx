@@ -6,9 +6,7 @@ const posix = std.posix;
 const socket_t = std.posix.socket_t;
 const testing = std.testing;
 
-const Io = @import("io/io.zig").Io;
-const Op = @import("io/io.zig").Op;
-const Error = @import("io/io.zig").Error;
+const io = @import("io/io.zig");
 const Options = @import("Options.zig");
 const Stream = @import("store.zig").Stream;
 
@@ -18,10 +16,10 @@ pub const Connector = struct {
     const Self = @This();
 
     allocator: mem.Allocator,
-    io: *Io,
+    io_loop: *io.Loop,
     connections: std.ArrayList(*Conn),
     identify: []const u8,
-    ticker_op: Op = .{},
+    ticker_op: io.Op = .{},
     stream: *Stream = undefined,
     state: State,
     const State = enum {
@@ -33,7 +31,7 @@ pub const Connector = struct {
     pub fn init(
         self: *Self,
         allocator: mem.Allocator,
-        io: *Io,
+        io_loop: *io.Loop,
         stream: *Stream,
         lookup_tcp_addresses: []net.Address,
         options: Options,
@@ -49,7 +47,7 @@ pub const Connector = struct {
 
         self.* = .{
             .allocator = allocator,
-            .io = io,
+            .io_loop = io_loop,
             .connections = std.ArrayList(*Conn).init(allocator),
             .identify = identify,
             .state = .connected,
@@ -60,15 +58,15 @@ pub const Connector = struct {
         for (lookup_tcp_addresses) |addr| try self.addLookupd(addr);
 
         // Start endless ticker
-        self.ticker_op = Op.ticker(ping_interval, self, onTick);
-        self.io.submit(&self.ticker_op);
+        self.ticker_op = io.Op.ticker(ping_interval, self, onTick);
+        self.io_loop.submit(&self.ticker_op);
     }
 
     fn addLookupd(self: *Self, address: std.net.Address) !void {
         const conn = try self.allocator.create(Conn);
         errdefer self.allocator.destroy(conn);
         try self.connections.ensureUnusedCapacity(1);
-        try conn.init(self, address);
+        conn.init(self, address);
         self.connections.appendAssumeCapacity(conn);
     }
 
@@ -99,139 +97,76 @@ pub const Connector = struct {
 };
 
 const Conn = struct {
-    connector: *Connector,
-    recv_buf: RecvBuf,
-    io: *Io,
-    address: std.net.Address,
-    socket: socket_t = 0,
-    connect_op: Op = .{},
-    send_op: Op = .{},
-    recv_op: Op = .{},
-    close_op: Op = .{},
-    state: State = .closed,
-    sequence: u64 = 0,
-
+    const Self = @This();
     const ping_msg = "PING\n";
 
-    const State = enum {
-        closed,
-        connecting,
-        connected,
-        closing,
-    };
+    connector: *Connector,
+    tcp: io.Tcp(*Conn),
+    // null if not subscribed jet
+    sequence: ?u64 = null,
 
-    const Self = @This();
-
-    fn init(self: *Self, connector: *Connector, address: std.net.Address) !void {
+    fn init(self: *Self, connector: *Connector, address: std.net.Address) void {
         const allocator = connector.allocator;
         self.* = .{
             .connector = connector,
-            .io = connector.io,
-            .address = address,
-            .recv_buf = RecvBuf.init(allocator),
+            .tcp = io.Tcp(*Conn).init(allocator, connector.io_loop, self),
         };
-        errdefer self.deinit();
-        try self.reconnect();
+        self.tcp.connect(address);
     }
 
     fn deinit(self: *Self) void {
-        self.recv_buf.free();
+        self.tcp.deinit();
     }
 
     fn onTick(self: *Self) void {
-        switch (self.state) {
-            .closed => self.reconnect() catch {},
-            .connected => self.ping() catch {},
+        switch (self.tcp.state) {
+            .closed => self.tcp.connect(self.tcp.address),
+            .connected => self.ping(),
             else => {},
         }
     }
 
-    fn ping(self: *Self) Error!void {
-        if (!self.send_op.active()) self.send(ping_msg);
-    }
-
-    fn reconnect(self: *Self) Error!void {
-        assert(self.state == .closed);
-        assert(!self.connect_op.active());
-        assert(!self.send_op.active());
-        assert(!self.recv_op.active());
-        assert(self.socket == 0);
-
-        self.connect_op = Op.connect(.{ .addr = &self.address }, self, onConnect, onConnectFail);
-        self.io.submit(&self.connect_op);
-        self.state = .connecting;
-    }
-
-    fn onConnect(self: *Self, socket: socket_t) Error!void {
-        self.socket = socket;
-        self.setup() catch |err| {
-            log.warn("{} setup failed {}", .{ self.address, err });
-            self.shutdown();
+    fn ping(self: *Self) void {
+        self.tcp.send(ping_msg) catch {
+            self.tcp.close();
         };
     }
 
-    fn setup(self: *Self) !void {
-        self.send(self.connector.identify);
-        self.recv_op = Op.recv(self.socket, self, onRecv, onRecvFail);
-        self.io.submit(&self.recv_op);
-        self.state = .connected;
+    pub fn onConnect(self: *Self) io.Error!void {
+        log.debug("{} connected", .{self.tcp.address});
+        try self.tcp.send(self.connector.identify);
         self.sequence = self.connector.stream.subscribe(.all);
-        log.debug("{} connected", .{self.address});
-    }
-
-    fn onConnectFail(self: *Self, err: ?anyerror) void {
-        if (err) |e|
-            log.info("{} connect failed {}", .{ self.address, e });
-        self.shutdown();
-    }
-
-    fn send(self: *Self, buf: []const u8) void {
-        assert(!self.send_op.active());
-        assert(buf.len > 0);
-        self.send_op = Op.send(self.socket, buf, self, onSend, onSendFail);
-        self.io.submit(&self.send_op);
-    }
-
-    fn onSend(self: *Self) Error!void {
         self.pull();
     }
 
     fn pull(self: *Self) void {
-        if (self.send_op.active()) return;
-        if (self.state != .connected) return;
-
-        if (self.connector.stream.pull(self.sequence, 1024)) |res| {
-            self.send(res.data);
+        const sequence = self.sequence orelse return;
+        if (self.connector.stream.pull(sequence, 1024)) |res| {
+            self.tcp.send(res.data) catch return;
             self.sequence = res.sequence.to;
         }
     }
 
-    fn onSendFail(self: *Self, err: anyerror) Error!void {
-        switch (err) {
-            error.BrokenPipe, error.ConnectionResetByPeer => {},
-            else => log.err("{} send failed {}", .{ self.address, err }),
-        }
-        self.shutdown();
-    }
+    pub fn onSend(_: *Self, _: []const u8) void {}
 
-    fn onRecv(self: *Self, bytes: []const u8) Error!void {
-        if (self.state != .connected) return;
-        self.handleResponse(bytes) catch |err| {
-            log.err("{} handle reponse failed {}", .{ self.address, err });
-            self.shutdown();
+    pub fn onRecv(self: *Self, bytes: []const u8) io.Error!usize {
+        return self.handleResponse(bytes) catch |err| {
+            log.err("{} handle reponse failed {}", .{ self.tcp.address, err });
+            self.tcp.close();
+            return 0;
         };
     }
 
-    fn handleResponse(self: *Self, bytes: []const u8) Error!void {
-        var buf = try self.recv_buf.append(bytes);
-
+    fn handleResponse(self: *Self, bytes: []const u8) io.Error!usize {
+        var pos: usize = 0;
         while (true) {
+            var buf = bytes[pos..];
             if (buf.len < 4) break;
             const n = mem.readInt(u32, buf[0..4], .big);
             const msg_buf = buf[4..];
             if (msg_buf.len < n) break;
             const msg = msg_buf[0..n];
-            buf = buf[4 + msg.len ..];
+            pos += 4 + msg.len;
 
             if (msg.len == 2 and msg[0] == 'O' and msg[1] == 'K') {
                 // OK most common case
@@ -239,63 +174,19 @@ const Conn = struct {
             }
             if (msg[0] == '{' and msg[msg.len - 1] == '}') {
                 // identify response
-                log.debug("{} identify: {s}", .{ self.address, msg });
+                log.debug("{} identify: {s}", .{ self.tcp.address, msg });
                 continue;
             }
             // error
-            log.warn("{} {s}", .{ self.socket, msg });
+            log.warn("{} {s}", .{ self.tcp.address, msg });
         }
-
-        if (buf.len > 0)
-            try self.recv_buf.set(buf)
-        else
-            self.recv_buf.free();
+        return pos;
     }
 
-    fn onRecvFail(self: *Self, err: anyerror) Error!void {
-        switch (err) {
-            error.EndOfFile, error.ConnectionResetByPeer => {},
-            else => log.err("{} recv failed {}", .{ self.address, err }),
-        }
-        self.shutdown();
-    }
-
-    fn onClose(self: *Self, _: ?anyerror) void {
-        self.shutdown();
-    }
-
-    fn shutdown(self: *Self) void {
-        // log.debug("{} shutdown state: {s}", .{ self.address, @tagName(self.state) });
-        switch (self.state) {
-            .connecting, .connected => {
-                if (self.state == .connected)
-                    self.connector.stream.unsubscribe(self.sequence);
-                self.recv_buf.free();
-                self.state = .closing;
-                self.shutdown();
-            },
-            .closing => {
-                if (self.connect_op.active()) {
-                    self.close_op = Op.cancel(&self.connect_op, self, onClose);
-                    return self.io.submit(&self.close_op);
-                }
-                if (self.socket != 0) {
-                    self.close_op = Op.shutdown(self.socket, self, onClose);
-                    self.socket = 0;
-                    return self.io.submit(&self.close_op);
-                }
-
-                if (self.connect_op.active() or
-                    self.recv_op.active() or
-                    self.send_op.active() or
-                    self.close_op.active())
-                    return;
-
-                self.state = .closed;
-                log.debug("{} closed", .{self.address});
-            },
-            .closed => {},
-        }
+    pub fn onClose(self: *Self) void {
+        if (self.sequence) |sequence|
+            self.connector.stream.unsubscribe(sequence);
+        self.sequence = null;
     }
 };
 

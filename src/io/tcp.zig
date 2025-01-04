@@ -5,7 +5,7 @@ const assert = std.debug.assert;
 const posix = std.posix;
 const io = @import("io.zig");
 
-const log = std.log.scoped(.tcp);
+const log = std.log.scoped(.io_tcp);
 
 /// ClientType has to implement callback methods
 ///
