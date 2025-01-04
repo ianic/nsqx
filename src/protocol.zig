@@ -558,7 +558,7 @@ pub fn frame(comptime data: []const u8, comptime typ: FrameType) [data.len + 8]u
     return hdr ++ data[0..].*;
 }
 
-pub fn parseFrame(data: []const u8) !struct { usize, FrameType } {
+pub fn parseFrame(data: []const u8) !struct { u32, FrameType } {
     if (data.len < 8) return error.InvalidFrame;
     var hdr = data[0..8];
     const size = mem.readInt(u32, hdr[0..4], .big);
@@ -690,6 +690,7 @@ test "fuzz parser" {
 }
 
 pub const Msg = struct {
+    size: u32,
     timestamp: u64,
     attempts: u16,
     sequence: u64,
@@ -704,6 +705,7 @@ pub fn parseMessageFrame(data: []const u8) !Msg {
 
     const hdr = data[0..header_len];
     return .{
+        .size = size + 4,
         .timestamp = mem.readInt(u64, hdr[8..16], .big),
         .attempts = mem.readInt(u16, hdr[16..18], .big),
         .sequence = msg_id.decode(hdr[18..34].*),
