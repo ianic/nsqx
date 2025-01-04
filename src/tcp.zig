@@ -73,7 +73,7 @@ pub fn ListenerType(comptime ConnType: type) type {
 
         fn onAcceptFail(self: *Self, err: anyerror) io.Error!void {
             log.err("accept failed {}", .{err});
-            self.io_loop.submit(&self.op);
+            self.io_loop.submit(&self.op); // restart operation
         }
 
         pub fn remove(self: *Self, conn: *ConnType) void {
@@ -98,7 +98,7 @@ pub const Conn = struct {
     consumer: ?Broker.Consumer = null,
     identify: protocol.Identify = .{},
 
-    // Until client set's connection heartbeat interval in identify message.
+    // Until client set's connection heartbeat interval from identify message.
     const initial_heartbeat = 2000;
 
     fn init(self: *Conn, listener: *Listener, socket: posix.socket_t, addr: net.Address) !void {
@@ -122,7 +122,7 @@ pub const Conn = struct {
         self.tcp.deinit();
     }
 
-    // Channel api -----------------
+    // Consumer api -----------------
 
     pub fn send(self: *Conn, buf: []const u8) !void {
         return self.tcp.send(buf);
@@ -132,7 +132,7 @@ pub const Conn = struct {
         self.tcp.close();
     }
 
-    // IO callbacks -----------------
+    // tcp callbacks -----------------
 
     pub fn onSend(self: *Conn, buf: []const u8) void {
         _, const frame_type = protocol.parseFrame(buf) catch unreachable;
@@ -150,24 +150,8 @@ pub const Conn = struct {
         self.listener.remove(self);
     }
 
-    pub fn onTimer(self: *Conn, _: u64) !u64 {
-        if (self.tcp.state != .connected) return timer.infinite;
-        if (self.outstanding_heartbeats > 4) {
-            log.debug("{} no heartbeat, closing", .{self.tcp.socket});
-            self.close();
-            return timer.infinite;
-        }
-        if (self.outstanding_heartbeats > 0) {
-            log.debug("{} heartbeat", .{self.tcp.socket});
-            self.respond(.heartbeat) catch self.close();
-        }
-        self.outstanding_heartbeats += 1;
-        return self.listener.io_loop.tsFromDelay(self.heartbeat_interval);
-    }
-
     pub fn onRecv(self: *Conn, bytes: []const u8) io.Error!usize {
-        // Any error is lack of resources, close this connection in the case
-        // of error.
+        // Any error is lack of resources, close connection in that case
         return self.receivedData(bytes) catch brk: {
             self.close();
             break :brk 0;
@@ -303,5 +287,21 @@ pub const Conn = struct {
             log.err("{} respond {}", .{ self.tcp.socket, err });
             self.close();
         };
+    }
+
+    /// Timer callback
+    pub fn onTimer(self: *Conn, _: u64) !u64 {
+        if (self.tcp.state != .connected) return timer.infinite;
+        if (self.outstanding_heartbeats > 4) {
+            log.debug("{} no heartbeat, closing", .{self.tcp.socket});
+            self.close();
+            return timer.infinite;
+        }
+        if (self.outstanding_heartbeats > 0) {
+            log.debug("{} heartbeat", .{self.tcp.socket});
+            self.respond(.heartbeat) catch self.close();
+        }
+        self.outstanding_heartbeats += 1;
+        return self.listener.io_loop.tsFromDelay(self.heartbeat_interval);
     }
 };
