@@ -89,7 +89,6 @@ pub const Listener = ListenerType(Conn);
 pub const Conn = struct {
     allocator: mem.Allocator,
     listener: *Listener,
-    io_loop: *io.Loop,
 
     // TODO: remove this two, we have that in tcp
     socket: posix.socket_t = 0,
@@ -98,18 +97,11 @@ pub const Conn = struct {
     tcp: io.Tcp(*Conn),
     timer_op: timer.Op = undefined,
 
-    timer_ts: u64,
     heartbeat_interval: u32 = initial_heartbeat,
     outstanding_heartbeats: u8 = 0,
 
     consumer: ?Broker.Consumer = null,
     identify: protocol.Identify = .{},
-    state: State = .connected,
-
-    const State = enum {
-        connected,
-        closing,
-    };
 
     // Until client set's connection heartbeat interval in identify message.
     const initial_heartbeat = 2000;
@@ -119,10 +111,8 @@ pub const Conn = struct {
         self.* = .{
             .allocator = allocator,
             .listener = listener,
-            .io_loop = listener.io_loop,
             .socket = socket,
             .addr = addr,
-            .timer_ts = listener.io_loop.tsFromDelay(initial_heartbeat),
             .tcp = io.Tcp(*Conn).init(allocator, listener.io_loop, self),
         };
 
@@ -170,7 +160,7 @@ pub const Conn = struct {
     }
 
     pub fn onTimer(self: *Conn, _: u64) !u64 {
-        if (self.state == .closing) return timer.infinite;
+        if (self.tcp.state != .connected) return timer.infinite;
         if (self.outstanding_heartbeats > 4) {
             log.debug("{} no heartbeat, closing", .{self.socket});
             self.close();
@@ -181,7 +171,7 @@ pub const Conn = struct {
             self.respond(.heartbeat) catch self.close();
         }
         self.outstanding_heartbeats += 1;
-        return self.io_loop.tsFromDelay(self.heartbeat_interval);
+        return self.listener.io_loop.tsFromDelay(self.heartbeat_interval);
     }
 
     pub fn onRecv(self: *Conn, bytes: []const u8) io.Error!usize {

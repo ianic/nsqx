@@ -94,6 +94,8 @@ pub fn Tcp(comptime ClientType: type) type {
         pub fn send(self: *Self, buf: []const u8) io.Error!void {
             if (self.state == .closed)
                 return self.client.onSend(buf);
+            if (buf.len == 0)
+                return try self.sendPending();
 
             if (!self.send_op.active() and self.send_iov.len > 0 and self.send_list.items.len == 0) {
                 self.send_iov[0] = .{ .base = buf.ptr, .len = buf.len };
@@ -108,6 +110,10 @@ pub fn Tcp(comptime ClientType: type) type {
 
             try self.send_list.append(.{ .base = buf.ptr, .len = buf.len });
             try self.sendPending();
+        }
+
+        pub fn prepSend(self: *Self, buf: []const u8) io.Error!void {
+            try self.send_list.append(.{ .base = buf.ptr, .len = buf.len });
         }
 
         /// Start send operation for buffers accumulated in send_list.

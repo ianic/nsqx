@@ -14,51 +14,35 @@ pub const Listener = @import("tcp.zig").ListenerType(Conn);
 const log = std.log.scoped(.http);
 
 pub const Conn = struct {
-    gpa: mem.Allocator,
+    allocator: mem.Allocator,
     listener: *Listener,
-    io_loop: *io.Loop,
-    socket: posix.socket_t = 0,
-    addr: net.Address,
-
-    recv_op: io.Op = .{},
-    send_op: io.SendOp = .{},
-    close_op: io.Op = .{},
-
+    tcp: io.Tcp(*Conn),
     rsp_arena: ?std.heap.ArenaAllocator = null, // arena allocator for response
-    timer_ts: u64 = 0, // not used here but required by listener
-
-    state: State = .connected,
-    const State = enum {
-        connected,
-        closing,
-    };
 
     pub fn init(self: *Conn, listener: *Listener, socket: posix.socket_t, addr: net.Address) !void {
         const allocator = listener.allocator;
         self.* = .{
-            .gpa = allocator,
+            .allocator = allocator,
             .listener = listener,
-            .io_loop = listener.io_loop,
-            .socket = socket,
-            .addr = addr,
+            .tcp = io.Tcp(*Conn).init(allocator, listener.io_loop, self),
         };
-        errdefer self.deinit();
-        try self.send_op.init(allocator, socket, self, onSend, onSendFail);
 
-        self.recv_op = io.Op.recv(self.socket, self, onRecv, onRecvFail);
-        self.io_loop.submit(&self.recv_op);
+        self.tcp.address = addr; // TODO: fix this
+        self.tcp.connected(socket);
     }
 
     pub fn deinit(self: *Conn) void {
         self.deinitResponse();
-        self.send_op.deinit(self.gpa);
+        self.tcp.deinit();
     }
 
-    fn onRecv(self: *Conn, bytes: []const u8) io.Error!void {
-        if (self.send_op.active()) return self.shutdown();
-        assert(self.rsp_arena == null);
+    pub fn onRecv(self: *Conn, bytes: []const u8) io.Error!usize {
+        if (self.rsp_arena != null) {
+            self.tcp.close();
+            return 0;
+        }
 
-        self.rsp_arena = std.heap.ArenaAllocator.init(self.gpa);
+        self.rsp_arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer self.deinitResponse();
         const allocator = self.rsp_arena.?.allocator();
 
@@ -69,38 +53,36 @@ pub const Conn = struct {
         if (self.handle(writer, bytes)) {
             const body = try body_bytes.toOwnedSlice();
             const header = try std.fmt.allocPrint(allocator, header_template, .{ body.len, "application/json" });
-            self.send_op.prep(header);
-            if (body.len > 0) self.send_op.prep(body);
+            try self.tcp.prepSend(header);
+            try self.tcp.send(body);
         } else |err| {
             log.warn("request failed {}", .{err});
             const header = switch (err) {
+                error.SplitBuffer => {
+                    self.deinitResponse();
+                    return 0;
+                },
                 error.NotFound => not_found,
                 error.InternalServerError => internal_server_error,
                 else => bad_request,
             };
-            self.send_op.prep(header);
+            try self.tcp.send(header);
         }
-        self.send_op.send(self.io_loop);
-        if (self.recv_op.active()) self.shutdown();
+        return bytes.len;
     }
 
     fn handle(self: *Conn, writer: std.io.AnyWriter, bytes: []const u8) !void {
         var hp: std.http.HeadParser = .{};
         const head_end = hp.feed(bytes);
-        if (hp.state != .finished) return error.BadRequest;
+        if (hp.state != .finished) return error.SplitBuffer;
         const head = try std.http.Server.Request.Head.parse(bytes[0..head_end]);
         const content_length = if (head.content_length) |l| l else 0;
-        if (content_length != bytes[head_end..].len) {
-            log.err(
-                "{} receive buffer overflow method: {}, target: {s}, content length: {}",
-                .{ self.socket, head.method, head.target, content_length },
-            );
-            return error.BadRequest;
-        }
+        if (content_length != bytes[head_end..].len)
+            return error.SplitBuffer;
 
         log.debug(
             "{} method: {}, target: {s}, content length: {}",
-            .{ self.socket, head.method, head.target, content_length },
+            .{ self.tcp.address, head.method, head.target, content_length },
         );
 
         var target_buf: [256]u8 = undefined;
@@ -112,14 +94,14 @@ pub const Conn = struct {
             .ping => {
                 if (broker.pub_err != null) return error.InternalServerError;
             },
-            .stats => |args| try jsonStat(self.gpa, args, writer, broker),
+            .stats => |args| try jsonStat(self.allocator, args, writer, broker),
             .info => try jsonInfo(writer, broker, self.listener.options),
             .metric => |args| {
-                var arena = std.heap.ArenaAllocator.init(self.gpa);
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
                 const allocator = arena.allocator();
                 switch (args) {
-                    .io => try metricIo(writer, self.io_loop),
+                    .io => try metricIo(writer, self.listener.io_loop),
                     .mem => try metricMem(writer),
                     .broker => try metricBroker(allocator, broker, writer),
                 }
@@ -145,50 +127,14 @@ pub const Conn = struct {
             self.rsp_arena = null;
         }
     }
-    fn onSend(self: *Conn) io.Error!void {
+
+    pub fn onSend(self: *Conn, _: []const u8) void {
         self.deinitResponse();
     }
 
-    fn onSendFail(self: *Conn, err: anyerror) io.Error!void {
-        self.deinitResponse();
-        switch (err) {
-            error.BrokenPipe, error.ConnectionResetByPeer => {},
-            else => log.err("{} send failed {}", .{ self.socket, err }),
-        }
-        self.shutdown();
-    }
-
-    fn onRecvFail(self: *Conn, err: anyerror) io.Error!void {
-        switch (err) {
-            error.EndOfFile, error.OperationCanceled, error.ConnectionResetByPeer => {},
-            else => log.err("{} recv failed {}", .{ self.socket, err }),
-        }
-        self.shutdown();
-    }
-
-    fn onClose(self: *Conn, _: ?anyerror) void {
-        self.shutdown();
-    }
-
-    pub fn shutdown(self: *Conn) void {
-        // log.debug("{} shutdown state: {s}", .{ self.socket, @tagName(self.state) });
-        switch (self.state) {
-            .connected => {
-                self.close_op = io.Op.shutdown(self.socket, self, onClose);
-                self.io_loop.submit(&self.close_op);
-                self.state = .closing;
-            },
-            .closing => {
-                if (self.recv_op.active() or
-                    self.send_op.active() or
-                    self.close_op.active())
-                    return;
-
-                log.debug("{} closed", .{self.socket});
-                self.deinit();
-                self.listener.remove(self);
-            },
-        }
+    pub fn onClose(self: *Conn) void {
+        self.deinit();
+        self.listener.remove(self);
     }
 };
 
