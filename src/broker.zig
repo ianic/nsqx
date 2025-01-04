@@ -183,6 +183,20 @@ pub fn BrokerType(Client: type) type {
 
         timer_queue: timer.Queue,
 
+        const TopicsIterator = struct {
+            iter: std.StringHashMap(*Topic).ValueIterator,
+
+            pub fn next(self: *TopicsIterator) ?*Topic {
+                const ptr = self.iter.next() orelse return null;
+                return ptr.*;
+            }
+        };
+
+        // iterator which skips deleted channels
+        pub fn topicsIterator(self: *Broker) TopicsIterator {
+            return .{ .iter = self.topics.valueIterator() };
+        }
+
         // Init/deinit -----------------
 
         pub fn init(
@@ -202,8 +216,8 @@ pub fn BrokerType(Client: type) type {
         }
 
         pub fn deinit(self: *Broker) void {
-            var iter = self.topics.valueIterator();
-            while (iter.next()) |e| e.*.deinit();
+            var iter = self.topicsIterator();
+            while (iter.next()) |topic| topic.deinit();
             self.topics.deinit();
             self.timer_queue.deinit();
             self.registrations.deinit();
@@ -347,9 +361,8 @@ pub fn BrokerType(Client: type) type {
 
         pub fn writeMetrics(self: *Broker, writer: anytype) !void {
             var buf: [6 + protocol.max_name_len + 9 + protocol.max_name_len]u8 = undefined; // to fit: "topic.{s}.channel.{s}"
-            var ti = self.topics.valueIterator();
-            while (ti.next()) |topic_ptr| {
-                const topic = topic_ptr.*;
+            var ti = self.topicsIterator();
+            while (ti.next()) |topic| {
                 { // Topic metrics
                     var m = &topic.stream.metric;
                     const prefix = try std.fmt.bufPrint(&buf, "topic.{s}", .{topic.name});
@@ -363,10 +376,9 @@ pub fn BrokerType(Client: type) type {
                     try writer.add(prefix, "bytes", m.bytes);
                     try writer.add(prefix, "capacity", m.capacity);
                 }
-                var ci = topic.channels.valueIterator();
-                while (ci.next()) |channel_ptr| {
+                var ci = topic.channelsIterator();
+                while (ci.next()) |channel| {
                     // Channel metrics
-                    const channel = channel_ptr.*;
                     var m = &channel.metric;
                     const prefix = try std.fmt.bufPrint(&buf, "topic.{s}.channel.{s}", .{ topic.name, channel.name });
                     try writer.gauge(prefix, "clients", channel.consumers.count());
@@ -403,9 +415,8 @@ pub fn BrokerType(Client: type) type {
             try meta.writeByte(0); // version placeholder
             try meta.writeInt(u32, self.topics.count(), .little);
 
-            var ti = self.topics.valueIterator();
-            while (ti.next()) |topic_ptr| {
-                const topic = topic_ptr.*;
+            var ti = self.topicsIterator();
+            while (ti.next()) |topic| {
                 try topic.publishDeferred();
 
                 var topic_file = try dir.createFile(topic.name, .{});
@@ -423,9 +434,8 @@ pub fn BrokerType(Client: type) type {
                     // | name_len (1) | name (name_len) | paused (1) | messages count (4) | sequence (8) |
                     // then for each message in channel:
                     // | sequence (8) | timestamp (8) | attempts (2)
-                    var ci = topic.channels.valueIterator();
-                    while (ci.next()) |channel_ptr| {
-                        const channel = channel_ptr.*;
+                    var ci = topic.channelsIterator();
+                    while (ci.next()) |channel| {
                         try meta.writeByte(@intCast(channel.name.len));
                         try meta.writeAll(channel.name);
                         try meta.writeByte(@intFromEnum(channel.state));
@@ -576,30 +586,52 @@ pub fn BrokerType(Client: type) type {
                 }
 
                 fn delete(self: *Topic) !void {
-                    const allocator = self.allocator; // topic can be deinited, make copy
-                    var channels = try allocator.alloc(*Channel, self.channels.count());
-                    defer allocator.free(channels);
+                    // self can be deinited until defer, make copy
+                    const allocator = self.allocator;
 
                     if (self.state != .deleting) {
+                        // make list before changing state, if fails state is not changed
+                        const channels = try self.channelsList();
+                        defer allocator.free(channels);
                         self.state = .deleting;
-                        if (self.channels.count() > 0) {
-                            // map can be invalidated during iteration
-                            // make channels list copy
-                            var iter = self.channels.valueIterator();
-                            var i: usize = 0;
-                            while (iter.next()) |e| {
-                                channels[i] = e.*;
-                                i += 1;
-                            }
-                            // start deleting channels
+                        if (channels.len > 0) {
+                            // can't use iterator because it can be invalidated during iteration
                             for (channels) |channel| channel.delete();
                             return;
                         }
                     }
                     if (self.channels.count() == 0) {
-                        //self.channels.clearAndFree();
                         self.deinit();
                     }
+                }
+
+                fn channelsList(self: *Topic) ![]*Channel {
+                    var channels = try self.allocator.alloc(*Channel, self.channels.count());
+                    var iter = self.channels.valueIterator();
+                    var i: usize = 0;
+                    while (iter.next()) |e| {
+                        channels[i] = e.*;
+                        i += 1;
+                    }
+                    return channels;
+                }
+
+                const ChannelsIterator = struct {
+                    iter: std.StringHashMap(*Channel).ValueIterator,
+
+                    pub fn next(self: *ChannelsIterator) ?*Channel {
+                        while (self.iter.next()) |ptr| {
+                            const channel = ptr.*;
+                            if (!channel.deleted())
+                                return channel;
+                        }
+                        return null;
+                    }
+                };
+
+                // iterator which skips deleted channels
+                pub fn channelsIterator(self: *Topic) ChannelsIterator {
+                    return .{ .iter = self.channels.valueIterator() };
                 }
 
                 fn subscribe(self: *Topic, client: *Client, name: []const u8) !void {
@@ -658,9 +690,8 @@ pub fn BrokerType(Client: type) type {
                     const last_channel = brk: {
                         var last_channel: ?*Channel = null;
                         var min_sequence: u64 = math.maxInt(u64);
-                        var iter = self.channels.valueIterator();
-                        while (iter.next()) |e| {
-                            const channel = e.*;
+                        var iter = self.channelsIterator();
+                        while (iter.next()) |channel| {
                             if (channel.minSequence() < min_sequence) {
                                 min_sequence = channel.minSequence();
                                 last_channel = channel;
@@ -741,11 +772,9 @@ pub fn BrokerType(Client: type) type {
 
                 // Notify all channels that there are pending messages
                 fn onPublish(self: *Topic, msgs: u32) void {
-                    var iter = self.channels.valueIterator();
-                    while (iter.next()) |e| {
-                        const channel = e.*;
+                    var iter = self.channelsIterator();
+                    while (iter.next()) |channel|
                         channel.onPublish(msgs);
-                    }
                 }
 
                 // Called from channel when finished deleting channel
@@ -778,8 +807,9 @@ pub fn BrokerType(Client: type) type {
                     if (self.state == .paused) {
                         self.state = .active;
                         // wake-up all channels
-                        var iter = self.channels.valueIterator();
-                        while (iter.next()) |ptr| ptr.*.wakeup();
+                        var iter = self.channelsIterator();
+                        while (iter.next()) |channel|
+                            channel.wakeup();
                     }
                 }
 
@@ -960,6 +990,10 @@ pub fn BrokerType(Client: type) type {
                         self.topic.channelDeleted(self);
                         self.deinit();
                     }
+                }
+
+                fn deleted(self: *Channel) bool {
+                    return self.state == .deleting;
                 }
 
                 fn deinit(self: *Channel) void {

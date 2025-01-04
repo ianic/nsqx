@@ -237,19 +237,15 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
 
     const topics_capacity = if (args.topic.len == 0) broker.topics.count() else 1;
     var topics = try std.ArrayList(Stat.Topic).initCapacity(allocator, topics_capacity);
-    var topics_iter = broker.topics.valueIterator();
-    while (topics_iter.next()) |topic_elem| {
-        const topic = topic_elem.*;
-
+    var topics_iter = broker.topicsIterator();
+    while (topics_iter.next()) |topic| {
         if (args.topic.len > 0 and !mem.eql(u8, topic.name, args.topic))
             continue;
 
         const channels_capacity = if (args.channel.len == 0) topic.channels.count() else 1;
         var channels = try std.ArrayList(Stat.Channel).initCapacity(allocator, channels_capacity);
-        var channels_iter = topic.channels.valueIterator();
-        while (channels_iter.next()) |channel_elem| {
-            const channel = channel_elem.*;
-
+        var channels_iter = topic.channelsIterator();
+        while (channels_iter.next()) |channel| {
             if (args.channel.len > 0 and !mem.eql(u8, channel.name, args.channel))
                 continue;
 
@@ -351,16 +347,13 @@ fn metricBroker(allocator: mem.Allocator, broker: *Broker, writer: anytype) !voi
     };
 
     var topics = try std.ArrayList(Topic).initCapacity(allocator, broker.topics.count());
-
-    var iter = broker.topics.valueIterator();
-    while (iter.next()) |e| {
-        const topic = e.*;
-
+    defer topics.deinit();
+    var ti = broker.topicsIterator();
+    while (ti.next()) |topic| {
         var channels = try std.ArrayList(Channel).initCapacity(allocator, topic.channels.count());
-
-        var ci = topic.channels.valueIterator();
-        while (ci.next()) |ce| {
-            const channel = ce.*;
+        defer channels.deinit();
+        var ci = topic.channelsIterator();
+        while (ci.next()) |channel| {
             try channels.append(.{
                 .name = channel.name,
                 .depth = channel.metric.depth.value,
