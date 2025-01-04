@@ -26,9 +26,7 @@ pub const Conn = struct {
             .listener = listener,
             .tcp = io.Tcp(*Conn).init(allocator, listener.io_loop, self),
         };
-
-        self.tcp.address = addr; // TODO: fix this
-        self.tcp.connected(socket);
+        self.tcp.connected(socket, addr);
     }
 
     pub fn deinit(self: *Conn) void {
@@ -260,7 +258,7 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
                 var clients = try allocator.alloc(Stat.Client, client_count);
                 for (channel.consumers.list.items, 0..) |consumer, i| {
                     const client = consumer.client;
-                    const remote_address = try std.fmt.allocPrint(allocator, "{}", .{client.addr});
+                    const remote_address = try std.fmt.allocPrint(allocator, "{}", .{client.tcp.address});
                     clients[i] = Stat.Client{
                         .client_id = client.identify.client_id,
                         .hostname = client.identify.hostname,

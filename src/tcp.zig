@@ -89,11 +89,6 @@ pub const Listener = ListenerType(Conn);
 pub const Conn = struct {
     allocator: mem.Allocator,
     listener: *Listener,
-
-    // TODO: remove this two, we have that in tcp
-    socket: posix.socket_t = 0,
-    addr: net.Address,
-
     tcp: io.Tcp(*Conn),
     timer_op: timer.Op = undefined,
 
@@ -111,13 +106,9 @@ pub const Conn = struct {
         self.* = .{
             .allocator = allocator,
             .listener = listener,
-            .socket = socket,
-            .addr = addr,
             .tcp = io.Tcp(*Conn).init(allocator, listener.io_loop, self),
         };
-
-        self.tcp.address = addr; // TODO: fix this
-        self.tcp.connected(socket);
+        self.tcp.connected(socket, addr);
 
         self.timer_op.init(&listener.broker.timer_queue, self, Conn.onTimer);
         try self.timer_op.update(initial_heartbeat);
@@ -162,12 +153,12 @@ pub const Conn = struct {
     pub fn onTimer(self: *Conn, _: u64) !u64 {
         if (self.tcp.state != .connected) return timer.infinite;
         if (self.outstanding_heartbeats > 4) {
-            log.debug("{} no heartbeat, closing", .{self.socket});
+            log.debug("{} no heartbeat, closing", .{self.tcp.socket});
             self.close();
             return timer.infinite;
         }
         if (self.outstanding_heartbeats > 0) {
-            log.debug("{} heartbeat", .{self.socket});
+            log.debug("{} heartbeat", .{self.tcp.socket});
             self.respond(.heartbeat) catch self.close();
         }
         self.outstanding_heartbeats += 1;
@@ -190,7 +181,7 @@ pub const Conn = struct {
         while (parser.next() catch |err| {
             log.err(
                 "{} protocol parser failed with: {s}, un-parsed: '{d}'",
-                .{ self.socket, @errorName(err), parser.unparsed()[0..@min(128, parser.unparsed().len)] },
+                .{ self.tcp.socket, @errorName(err), parser.unparsed()[0..@min(128, parser.unparsed().len)] },
             );
             switch (err) {
                 error.Invalid => try self.respond(.invalid),
@@ -202,7 +193,7 @@ pub const Conn = struct {
             self.receivedMsg(msg) catch |err| {
                 log.err(
                     "{} message error: {s}, operation: {s} ",
-                    .{ self.socket, @errorName(err), @tagName(msg) },
+                    .{ self.tcp.socket, @errorName(err), @tagName(msg) },
                 );
                 switch (err) {
                     error.Invalid,
@@ -224,7 +215,7 @@ pub const Conn = struct {
                 }
             };
         }
-        if (self.consumer) |*consumer| consumer.pull();
+        if (self.consumer) |*consumer| consumer.pull() catch {};
         return parser.pos;
     }
 
@@ -240,41 +231,41 @@ pub const Conn = struct {
                 try self.respond(.ok);
                 self.identify = identify;
                 self.heartbeat_interval = identify.heartbeat_interval / 2;
-                log.debug("{} identify {}", .{ self.socket, identify });
+                log.debug("{} identify {}", .{ self.tcp.socket, identify });
             },
             .subscribe => |arg| {
                 try broker.subscribe(self, arg.topic, arg.channel);
                 if (self.consumer) |*consumer|
                     consumer.msg_timeout = self.identify.msg_timeout;
                 try self.respond(.ok);
-                log.debug("{} subscribe: {s} {s}", .{ self.socket, arg.topic, arg.channel });
+                log.debug("{} subscribe: {s} {s}", .{ self.tcp.socket, arg.topic, arg.channel });
             },
             .publish => |arg| {
                 try broker.publish(arg.topic, arg.data);
                 try self.respond(.ok);
-                log.debug("{} publish: {s}", .{ self.socket, arg.topic });
+                log.debug("{} publish: {s}", .{ self.tcp.socket, arg.topic });
             },
             .multi_publish => |arg| {
                 if (arg.msgs == 0) return error.BadMessage;
                 try broker.multiPublish(arg.topic, arg.msgs, arg.data);
                 try self.respond(.ok);
-                log.debug("{} multi publish: {s} messages: {}", .{ self.socket, arg.topic, arg.msgs });
+                log.debug("{} multi publish: {s} messages: {}", .{ self.tcp.socket, arg.topic, arg.msgs });
             },
             .deferred_publish => |arg| {
                 if (arg.delay > options.max_req_timeout) return error.Invalid;
                 try broker.deferredPublish(arg.topic, arg.data, arg.delay);
                 try self.respond(.ok);
-                log.debug("{} deferred publish: {s} delay: {}", .{ self.socket, arg.topic, arg.delay });
+                log.debug("{} deferred publish: {s} delay: {}", .{ self.tcp.socket, arg.topic, arg.delay });
             },
             .ready => |count| {
                 var consumer = &(self.consumer orelse return error.NotSubscribed);
                 consumer.ready_count = if (count > options.max_rdy_count) options.max_rdy_count else count;
-                log.debug("{} ready: {}", .{ self.socket, count });
+                log.debug("{} ready: {}", .{ self.tcp.socket, count });
             },
             .finish => |msg_id| {
                 var consumer = &(self.consumer orelse return error.NotSubscribed);
                 try consumer.finish(msg_id);
-                log.debug("{} finish {}", .{ self.socket, protocol.msg_id.decode(msg_id) });
+                log.debug("{} finish {}", .{ self.tcp.socket, protocol.msg_id.decode(msg_id) });
             },
             .requeue => |arg| {
                 const delay = if (arg.delay > options.max_req_timeout)
@@ -283,24 +274,24 @@ pub const Conn = struct {
                     arg.delay;
                 var consumer = &(self.consumer orelse return error.NotSubscribed);
                 try consumer.requeue(arg.msg_id, delay);
-                log.debug("{} requeue {}", .{ self.socket, protocol.msg_id.decode(arg.msg_id) });
+                log.debug("{} requeue {}", .{ self.tcp.socket, protocol.msg_id.decode(arg.msg_id) });
             },
             .touch => |msg_id| {
                 var consumer = &(self.consumer orelse return error.NotSubscribed);
                 try consumer.touch(msg_id);
-                log.debug("{} touch {}", .{ self.socket, protocol.msg_id.decode(msg_id) });
+                log.debug("{} touch {}", .{ self.tcp.socket, protocol.msg_id.decode(msg_id) });
             },
             .close => {
                 if (self.consumer) |*consumer|
                     consumer.ready_count = 0;
                 try self.respond(.close);
-                log.debug("{} close", .{self.socket});
+                log.debug("{} close", .{self.tcp.socket});
             },
             .nop => {
-                log.debug("{} nop", .{self.socket});
+                log.debug("{} nop", .{self.tcp.socket});
             },
             .auth => {
-                log.err("{} `auth` is not supported operation", .{self.socket});
+                log.err("{} `auth` is not supported operation", .{self.tcp.socket});
                 return error.UnsupportedOperation;
             },
             .version => unreachable, // handled in the parser
@@ -309,7 +300,7 @@ pub const Conn = struct {
 
     fn respond(self: *Conn, rsp: protocol.Response) !void {
         self.tcp.send(rsp.body()) catch |err| {
-            log.err("{} respond {}", .{ self.socket, err });
+            log.err("{} respond {}", .{ self.tcp.socket, err });
             self.close();
         };
     }

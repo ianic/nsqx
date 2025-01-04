@@ -70,8 +70,8 @@ pub fn Tcp(comptime ClientType: type) type {
         }
 
         fn onConnect(self: *Self, socket: posix.socket_t) io.Error!void {
-            log.debug("{} connected", .{self.address});
-            self.connected(socket);
+            log.debug("{} connected socket {}", .{ self.address, socket });
+            self.connected(socket, self.address);
             try self.client.onConnect();
         }
 
@@ -82,8 +82,9 @@ pub fn Tcp(comptime ClientType: type) type {
 
         /// Set connected tcp socket. After successful client connect operation
         /// or after server listener accepts client socket.
-        pub fn connected(self: *Self, socket: posix.socket_t) void {
+        pub fn connected(self: *Self, socket: posix.socket_t, address: net.Address) void {
             self.socket = socket;
+            self.address = address;
             self.state = .connected;
             self.recv_op = io.Op.recv(self.socket, self, onRecv, onRecvFail);
             self.io_loop.submit(&self.recv_op);
@@ -94,9 +95,12 @@ pub fn Tcp(comptime ClientType: type) type {
         pub fn send(self: *Self, buf: []const u8) io.Error!void {
             if (self.state == .closed)
                 return self.client.onSend(buf);
+            errdefer self.client.onSend(buf);
+
             if (buf.len == 0)
                 return try self.sendPending();
 
+            // optimization
             if (!self.send_op.active() and self.send_iov.len > 0 and self.send_list.items.len == 0) {
                 self.send_iov[0] = .{ .base = buf.ptr, .len = buf.len };
                 self.send_iovlen = 1;
