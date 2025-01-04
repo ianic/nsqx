@@ -458,40 +458,26 @@ pub const Op = struct {
 
                         if (op.args.sendv.zero_copy) {
                             if (cqe.flags & linux.IORING_CQE_F_NOTIF > 0) {
-                                op.args.sendv.msghdr.iovlen = 0;
                                 return try success(ctx);
                             } else if (cqe.flags & linux.IORING_CQE_F_MORE > 0) {
-                                op.args.sendv.msghdr.iovlen = 0;
                                 if (sent_bytes < data_len) {
-                                    log.err("{} unexpected short send len: {} sent: {}", .{ op.args.sendv.socket, data_len, sent_bytes });
+                                    log.err("{} unexpected short send data: {} sent: {}", .{ op.args.sendv.socket, data_len, sent_bytes });
                                     return fail(ctx, error.ShortSend);
                                 }
-                                return;
+                                return; // wait for second call with f_notif flag set
                             }
                             unreachable;
                         }
 
                         // While sending with MSG_WAITALL we don't expect to get short send
                         if (sent_bytes < data_len) {
-                            log.warn("{} unexpected short send len: {} sent: {}", .{ op.args.sendv.socket, data_len, sent_bytes });
-                            var v: []posix.iovec_const = undefined;
-                            v.ptr = @constCast(op.args.sendv.msghdr.iov);
-                            v.len = @intCast(op.args.sendv.msghdr.iovlen);
-                            v = resizeIovec(v, sent_bytes);
-                            if (v.len > 0) { // restart on short send
-                                op.args.sendv.msghdr.iov = v.ptr;
-                                op.args.sendv.msghdr.iovlen = @intCast(v.len);
-                                return io.restart(op);
-                            }
+                            log.warn("{} unexpected short send data: {} sent: {}", .{ op.args.sendv.socket, data_len, sent_bytes });
+                            return fail(ctx, error.ShortSend);
                         }
 
-                        op.args.sendv.msghdr.iovlen = 0;
                         try success(ctx);
                     },
-                    else => |errno| {
-                        op.args.sendv.msghdr.iovlen = 0;
-                        try fail(ctx, errFromErrno(errno));
-                    },
+                    else => |errno| try fail(ctx, errFromErrno(errno)),
                 }
             }
         };
@@ -719,44 +705,6 @@ pub const Op = struct {
 };
 
 const testing = std.testing;
-
-// Remove prefix len from iovecs
-fn resizeIovec(iovecs: []posix.iovec_const, prefix_len: usize) []posix.iovec_const {
-    if (iovecs.len == 0) return iovecs[0..0];
-    var i: usize = 0;
-    var n: usize = prefix_len;
-    while (n >= iovecs[i].len) {
-        n -= iovecs[i].len;
-        i += 1;
-        if (i >= iovecs.len) return iovecs[0..0];
-    }
-    iovecs[i].base += n;
-    iovecs[i].len -= n;
-    return iovecs[i..];
-}
-
-test "resize iovec" {
-    const data = "iso medo u ducan";
-    var iovecs = [_]posix.iovec_const{
-        .{ .base = data.ptr, .len = 4 },
-        .{ .base = data[4..].ptr, .len = 5 },
-        .{ .base = data[9..].ptr, .len = 7 },
-    };
-
-    var ret = resizeIovec(iovecs[0..], 6);
-    try testing.expectEqual(2, ret.len);
-    try testing.expectEqual(3, ret[0].len);
-    try testing.expectEqual(7, ret[1].len);
-    try testing.expectEqualStrings("do ", ret[0].base[0..ret[0].len]);
-    try testing.expectEqualStrings("u ducan", ret[1].base[0..ret[1].len]);
-
-    ret = resizeIovec(ret, 5);
-    try testing.expectEqual(1, ret.len);
-    try testing.expectEqualStrings("ducan", ret[0].base[0..ret[0].len]);
-
-    ret = resizeIovec(ret, 5);
-    try testing.expectEqual(0, ret.len);
-}
 
 test "loop timer" {
     if (true) return error.SkipZigTest;
