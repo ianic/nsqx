@@ -1,13 +1,10 @@
 const std = @import("std");
-const assert = std.debug.assert;
 const mem = std.mem;
 const posix = std.posix;
-const socket_t = std.posix.socket_t;
+const socket_t = posix.socket_t;
 const testing = std.testing;
 
-const Io = @import("io/io.zig").Io;
-const Op = @import("io/io.zig").Op;
-const Error = @import("io/io.zig").Error;
+const io = @import("io/io.zig");
 const Options = @import("Options.zig");
 const Broker = @import("main.zig").Broker;
 
@@ -15,24 +12,24 @@ const log = std.log.scoped(.statsd);
 
 pub const Connector = struct {
     allocator: mem.Allocator,
-    io: *Io,
+    io_loop: *io.Loop,
     broker: *Broker,
     options: Options.Statsd,
     address: std.net.Address,
     socket: socket_t = 0,
-    connect_op: Op = .{},
-    send_op: Op = .{},
-    ticker_op: Op = .{},
+    connect_op: io.Op = .{},
+    send_op: io.Op = .{},
+    ticker_op: io.Op = .{},
 
     iter: BufferSizeIterator = .{},
     prefix: []const u8,
 
     const Self = @This();
 
-    pub fn init(self: *Self, allocator: mem.Allocator, io: *Io, broker: *Broker, options: Options) !void {
+    pub fn init(self: *Self, allocator: mem.Allocator, io_loop: *io.Loop, broker: *Broker, options: Options) !void {
         self.* = .{
             .allocator = allocator,
-            .io = io,
+            .io_loop = io_loop,
             .broker = broker,
             .options = options.statsd,
             .address = options.statsd.address.?,
@@ -40,8 +37,8 @@ pub const Connector = struct {
         };
         errdefer self.deinit();
         // Start endless ticker
-        self.ticker_op = Op.ticker(self.options.interval, self, onTick);
-        self.io.submit(&self.ticker_op);
+        self.ticker_op = io.Op.ticker(self.options.interval, self, onTick);
+        self.io_loop.submit(&self.ticker_op);
     }
 
     pub fn deinit(self: *Self) void {
@@ -65,7 +62,7 @@ pub const Connector = struct {
 
     fn connect(self: *Self) !void {
         if (self.connect_op.active()) return;
-        self.connect_op = Op.connect(
+        self.connect_op = io.Op.connect(
             .{
                 .socket_type = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
                 .addr = &self.address,
@@ -74,10 +71,10 @@ pub const Connector = struct {
             onConnect,
             onConnectFail,
         );
-        self.io.submit(&self.connect_op);
+        self.io_loop.submit(&self.connect_op);
     }
 
-    fn onConnect(self: *Self, socket: socket_t) Error!void {
+    fn onConnect(self: *Self, socket: socket_t) io.Error!void {
         self.socket = socket;
     }
 
@@ -85,14 +82,14 @@ pub const Connector = struct {
         if (err) |e| log.err("connect failed {}", .{e});
     }
 
-    fn generate(self: *Self) Error!void {
+    fn generate(self: *Self) io.Error!void {
         var writer = MetricWriter.init(self.allocator, self.prefix);
         errdefer writer.deinit();
         self.broker.writeMetrics(&writer) catch |err| {
             log.err("broker write metrics {}", .{err});
             return;
         };
-        self.io.metric.write(&writer) catch |err| {
+        self.io_loop.metric.write(&writer) catch |err| {
             log.err("io write metrics {}", .{err});
             return;
         };
@@ -110,12 +107,12 @@ pub const Connector = struct {
 
     fn send(self: *Self) void {
         if (self.iter.next()) |buf| {
-            self.send_op = Op.send(self.socket, buf, self, onSend, onSendFail);
-            self.io.submit(&self.send_op);
+            self.send_op = io.Op.send(self.socket, buf, self, onSend, onSendFail);
+            self.io_loop.submit(&self.send_op);
         }
     }
 
-    fn onSend(self: *Self) Error!void {
+    fn onSend(self: *Self) io.Error!void {
         if (self.iter.done()) {
             log.debug("sent {} bytes", .{self.iter.buf.len});
             self.allocator.free(self.iter.buf);
@@ -125,7 +122,7 @@ pub const Connector = struct {
         }
     }
 
-    fn onSendFail(self: *Self, err: anyerror) Error!void {
+    fn onSendFail(self: *Self, err: anyerror) io.Error!void {
         self.allocator.free(self.iter.buf);
         self.iter = .{};
         log.err("send failed {}", .{err});
