@@ -39,13 +39,10 @@ pub const Connector = struct {
     }
 
     fn onTick(self: *Self) void {
-        self.tick() catch |err| {
-            log.err("tick failed {}", .{err});
-        };
-    }
-
-    fn tick(self: *Self) !void {
-        if (try self.generate()) |buf| {
+        if (self.generate() catch |err| {
+            log.err("generate failed {}", .{err});
+            return;
+        }) |buf| {
             self.udp.send(buf) catch |err| {
                 log.err("send failed {}", .{err});
             };
