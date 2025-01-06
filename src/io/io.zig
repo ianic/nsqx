@@ -10,6 +10,7 @@ const socket_t = std.posix.socket_t;
 const errFromErrno = @import("errno.zig").toError;
 const Fifo = @import("fifo.zig").Fifo;
 pub const Tcp = @import("tcp.zig").Tcp;
+pub const Udp = @import("udp.zig").Udp;
 
 const ns_per_ms = std.time.ns_per_ms;
 const ns_per_s = std.time.ns_per_s;

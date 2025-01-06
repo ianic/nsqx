@@ -11,39 +11,31 @@ const Broker = @import("main.zig").Broker;
 const log = std.log.scoped(.statsd);
 
 pub const Connector = struct {
+    const Self = @This();
+
     allocator: mem.Allocator,
     io_loop: *io.Loop,
     broker: *Broker,
-    options: Options.Statsd,
-    address: std.net.Address,
-    socket: socket_t = 0,
-    connect_op: io.Op = .{},
-    send_op: io.Op = .{},
     ticker_op: io.Op = .{},
-
-    iter: BufferSizeIterator = .{},
     prefix: []const u8,
-
-    const Self = @This();
+    udp: io.Udp(*Self),
 
     pub fn init(self: *Self, allocator: mem.Allocator, io_loop: *io.Loop, broker: *Broker, options: Options) !void {
         self.* = .{
             .allocator = allocator,
             .io_loop = io_loop,
             .broker = broker,
-            .options = options.statsd,
-            .address = options.statsd.address.?,
             .prefix = try fmtPrefix(allocator, options.statsd.prefix, options.broadcastAddress(), options.broadcast_tcp_port),
+            .udp = io.Udp(*Self).init(allocator, io_loop, self, options.statsd.address.?),
         };
-        errdefer self.deinit();
+
         // Start endless ticker
-        self.ticker_op = io.Op.ticker(self.options.interval, self, onTick);
-        self.io_loop.submit(&self.ticker_op);
+        self.ticker_op = io.Op.ticker(options.statsd.interval, self, onTick);
+        io_loop.submit(&self.ticker_op);
     }
 
     pub fn deinit(self: *Self) void {
-        self.allocator.free(self.prefix);
-        self.allocator.free(self.iter.buf);
+        self.udp.deinit();
     }
 
     fn onTick(self: *Self) void {
@@ -53,103 +45,40 @@ pub const Connector = struct {
     }
 
     fn tick(self: *Self) !void {
-        if (self.socket == 0) return try self.connect();
-        if (self.send_op.active()) return;
-
-        if (self.iter.done()) try self.generate();
-        self.send();
+        if (try self.generate()) |buf| {
+            self.udp.send(buf) catch |err| {
+                log.err("send failed {}", .{err});
+            };
+        }
     }
 
-    fn connect(self: *Self) !void {
-        if (self.connect_op.active()) return;
-        self.connect_op = io.Op.connect(
-            .{
-                .socket_type = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
-                .addr = &self.address,
-            },
-            self,
-            onConnect,
-            onConnectFail,
-        );
-        self.io_loop.submit(&self.connect_op);
+    pub fn onSend(self: *Self, buf: []const u8, err: ?anyerror) void {
+        self.allocator.free(buf);
+        if (err) |e| log.err("send failed {}", .{e});
     }
 
-    fn onConnect(self: *Self, socket: socket_t) io.Error!void {
-        self.socket = socket;
-    }
+    pub fn onClose(_: *Self) void {}
 
-    fn onConnectFail(_: *Self, err: ?anyerror) void {
-        if (err) |e| log.err("connect failed {}", .{e});
-    }
-
-    fn generate(self: *Self) io.Error!void {
+    fn generate(self: *Self) !?[]const u8 {
         var writer = MetricWriter.init(self.allocator, self.prefix);
         errdefer writer.deinit();
         self.broker.writeMetrics(&writer) catch |err| {
             log.err("broker write metrics {}", .{err});
-            return;
+            return null;
         };
         self.io_loop.metric.write(&writer) catch |err| {
             log.err("io write metrics {}", .{err});
-            return;
+            return null;
         };
         writeMalloc(&writer) catch |err| {
             log.err("mem write metrics {}", .{err});
-            return;
+            return null;
         };
         writeStatm(&writer) catch |err| {
             log.err("statm write metrics {}", .{err});
-            return;
+            return null;
         };
-        const buf = try writer.toOwned();
-        self.iter = BufferSizeIterator{ .buf = buf, .size = self.options.udp_packet_size };
-    }
-
-    fn send(self: *Self) void {
-        if (self.iter.next()) |buf| {
-            self.send_op = io.Op.send(self.socket, buf, self, onSend, onSendFail);
-            self.io_loop.submit(&self.send_op);
-        }
-    }
-
-    fn onSend(self: *Self) io.Error!void {
-        if (self.iter.done()) {
-            log.debug("sent {} bytes", .{self.iter.buf.len});
-            self.allocator.free(self.iter.buf);
-            self.iter = .{};
-        } else {
-            self.send();
-        }
-    }
-
-    fn onSendFail(self: *Self, err: anyerror) io.Error!void {
-        self.allocator.free(self.iter.buf);
-        self.iter = .{};
-        log.err("send failed {}", .{err});
-    }
-};
-
-const BufferSizeIterator = struct {
-    buf: []const u8 = &.{},
-    pos: usize = 0,
-    size: usize = 0,
-
-    const Self = @This();
-
-    pub fn next(self: *Self) ?[]const u8 {
-        const end = @min(self.pos + self.size, self.buf.len);
-
-        if (std.mem.lastIndexOfScalar(u8, self.buf[self.pos..end], '\n')) |sep| {
-            const split = self.buf[self.pos..][0 .. sep + 1];
-            self.pos += split.len;
-            return split;
-        }
-        self.pos = self.buf.len;
-        return null;
-    }
-
-    pub fn done(self: Self) bool {
-        return self.pos == self.buf.len;
+        return try writer.toOwned();
     }
 };
 
