@@ -15,20 +15,14 @@ const log = std.log.scoped(.tcp);
 
 pub fn ListenerType(comptime ConnType: type) type {
     return struct {
+        const Self = @This();
+
         allocator: mem.Allocator,
         broker: *Broker,
         options: Options,
         socket: posix.socket_t,
         io_loop: *io.Loop,
-        op: io.Op = .{},
-        conns: std.AutoHashMap(*ConnType, void),
-        metric: struct {
-            // Total number of
-            accept: usize = 0, // accepted connections
-            close: usize = 0, // closed (completed) connections
-        } = .{},
-
-        const Self = @This();
+        tcp_listener: io.TcpListener(*Self, ConnType),
 
         pub fn init(
             self: *Self,
@@ -42,44 +36,25 @@ pub fn ListenerType(comptime ConnType: type) type {
                 .allocator = allocator,
                 .broker = broker,
                 .options = options,
-                .io_loop = io_loop,
                 .socket = socket,
-                .conns = std.AutoHashMap(*ConnType, void).init(allocator),
+                .io_loop = io_loop,
+                .tcp_listener = undefined,
             };
-            errdefer self.deinit();
-            self.op = io.Op.accept(socket, self, onAccept, onAcceptFail);
-            self.io_loop.submit(&self.op);
+            self.tcp_listener.init(allocator, io_loop, socket, self);
         }
 
         pub fn deinit(self: *Self) void {
-            var iter = self.conns.keyIterator();
-            while (iter.next()) |e| {
-                const conn = e.*;
-                conn.deinit();
-                self.allocator.destroy(conn);
-            }
-            self.conns.deinit();
+            self.tcp_listener.deinit();
         }
 
-        fn onAccept(self: *Self, socket: posix.socket_t, addr: net.Address) io.Error!void {
-            var conn = try self.allocator.create(ConnType);
-            errdefer self.allocator.destroy(conn);
-            try self.conns.ensureUnusedCapacity(1);
+        pub fn onAccept(self: *Self, conn: *ConnType, socket: posix.socket_t, addr: net.Address) !void {
             try conn.init(self, socket, addr);
-            errdefer conn.deinit();
-            self.conns.putAssumeCapacityNoClobber(conn, {});
-            self.metric.accept +%= 1;
         }
 
-        fn onAcceptFail(self: *Self, err: anyerror) io.Error!void {
-            log.err("accept failed {}", .{err});
-            self.io_loop.submit(&self.op); // restart operation
-        }
+        pub fn onClose(_: *Self) void {}
 
-        pub fn remove(self: *Self, conn: *ConnType) void {
-            assert(self.conns.remove(conn));
-            self.allocator.destroy(conn);
-            self.metric.close +%= 1;
+        pub fn destroy(self: *Self, conn: *ConnType) void {
+            self.tcp_listener.destroy(conn);
         }
     };
 }
@@ -116,7 +91,7 @@ pub const Conn = struct {
         log.debug("{} connected {}", .{ socket, addr });
     }
 
-    fn deinit(self: *Conn) void {
+    pub fn deinit(self: *Conn) void {
         self.identify.deinit(self.allocator);
         self.timer_op.deinit();
         self.tcp.deinit();
@@ -147,10 +122,10 @@ pub const Conn = struct {
             self.consumer = null;
         }
         self.deinit();
-        self.listener.remove(self);
+        self.listener.destroy(self);
     }
 
-    pub fn onRecv(self: *Conn, bytes: []const u8) io.Error!usize {
+    pub fn onRecv(self: *Conn, bytes: []const u8) !usize {
         // Any error is lack of resources, close connection in that case
         return self.receivedData(bytes) catch brk: {
             self.close();

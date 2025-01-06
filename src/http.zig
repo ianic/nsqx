@@ -132,7 +132,7 @@ pub const Conn = struct {
 
     pub fn onClose(self: *Conn) void {
         self.deinit();
-        self.listener.remove(self);
+        self.listener.destroy(self);
     }
 };
 

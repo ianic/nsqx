@@ -303,3 +303,93 @@ test "recv_buf remove" {
     try testing.expectEqual(16, recv_buf.buf.len);
     try testing.expectEqualStrings("iso medo u ducan", recv_buf.buf);
 }
+
+pub fn Listener(comptime ClientType: type, comptime ConnType: type) type {
+    return struct {
+        const Self = @This();
+
+        allocator: mem.Allocator,
+        socket: posix.socket_t,
+        io_loop: *io.Loop,
+        accept_op: io.Op = .{},
+        close_op: io.Op = .{},
+        conns: std.AutoHashMap(*ConnType, void),
+        client: ClientType,
+        metric: struct {
+            // Total number of
+            accept: usize = 0, // accepted connections
+            close: usize = 0, // closed (completed) connections
+        } = .{},
+
+        pub fn init(
+            self: *Self,
+            allocator: mem.Allocator,
+            io_loop: *io.Loop,
+            socket: posix.socket_t,
+            client: ClientType,
+        ) void {
+            self.* = .{
+                .allocator = allocator,
+                .io_loop = io_loop,
+                .socket = socket,
+                .conns = std.AutoHashMap(*ConnType, void).init(allocator),
+                .client = client,
+            };
+            self.accept_op = io.Op.accept(socket, self, onAccept, onAcceptFail);
+            self.io_loop.submit(&self.accept_op);
+        }
+
+        pub fn deinit(self: *Self) void {
+            // destroy all connections
+            var iter = self.conns.keyIterator();
+            while (iter.next()) |e| {
+                const conn = e.*;
+                conn.deinit();
+                self.allocator.destroy(conn);
+            }
+            self.conns.deinit();
+        }
+
+        fn onAccept(self: *Self, socket: posix.socket_t, addr: net.Address) io.Error!void {
+            // Create new collection
+            try self.conns.ensureUnusedCapacity(1);
+            const conn = try self.allocator.create(ConnType);
+            errdefer self.allocator.destroy(conn);
+            // call client to init connection
+            try self.client.onAccept(conn, socket, addr);
+            // add to live connections list
+            self.conns.putAssumeCapacityNoClobber(conn, {});
+            self.metric.accept +%= 1;
+        }
+
+        fn onAcceptFail(self: *Self, err: anyerror) io.Error!void {
+            log.err("accept failed {}", .{err});
+            self.io_loop.submit(&self.accept_op); // restart operation
+        }
+
+        /// Destroy closed connection
+        pub fn destroy(self: *Self, conn: *ConnType) void {
+            assert(self.conns.remove(conn));
+            self.allocator.destroy(conn);
+            self.metric.close +%= 1;
+        }
+
+        fn onCancel(self: *Self, _: ?anyerror) void {
+            self.close();
+        }
+
+        pub fn close(self: *Self) void {
+            if (self.close_op.active()) return;
+            if (self.accept_op.active()) {
+                self.close_op = io.Op.cancel(&self.accept_op, self, onCancel);
+                return self.io_loop.submit(&self.close_op);
+            }
+            if (self.socket != 0) {
+                self.close_op = io.Op.shutdown(self.socket, self, onCancel);
+                self.socket = 0;
+                return self.io_loop.submit(&self.close_op);
+            }
+            self.client.onClose();
+        }
+    };
+}
