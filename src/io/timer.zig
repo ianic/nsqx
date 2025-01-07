@@ -6,7 +6,6 @@ const testing = std.testing;
 const log = std.log.scoped(.timer);
 
 pub const infinite: u64 = math.maxInt(u64);
-pub const Error = error{OutOfMemory};
 
 pub const Op = struct {
     const Self = @This();

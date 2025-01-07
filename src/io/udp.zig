@@ -7,7 +7,7 @@ const io = @import("io.zig");
 
 const log = std.log.scoped(.io_tcp);
 
-pub fn Udp(comptime ClientType: type) type {
+pub fn Sender(comptime ClientType: type) type {
     return struct {
         const Self = @This();
 
@@ -175,13 +175,13 @@ pub fn Udp(comptime ClientType: type) type {
     };
 }
 
-const Client = struct {
+const TestClient = struct {
     const Self = @This();
-    udp: Udp(*Self),
+    udp: Sender(*Self),
 
     fn init(self: *Self, allocator: mem.Allocator, io_loop: *io.Loop, address: net.Address) void {
         self.* = .{
-            .udp = Udp(*Self).init(allocator, io_loop, self, address),
+            .udp = Sender(*Self).init(allocator, io_loop, self, address),
         };
     }
 
@@ -212,7 +212,7 @@ test {
 
     const address = try net.Address.resolveIp("127.0.0.1", 9000);
 
-    var client: Client = undefined;
+    var client: TestClient = undefined;
     client.init(allocator, &io_loop, address);
 
     try client.udp.send("iso medo u ducan\n");

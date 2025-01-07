@@ -2,17 +2,14 @@ const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
 const net = std.net;
-
 const posix = std.posix;
 const linux = std.os.linux;
 const IoUring = linux.IoUring;
 const socket_t = std.posix.socket_t;
+
 const errFromErrno = @import("errno.zig").toError;
 const Fifo = @import("fifo.zig").Fifo;
-pub const Tcp = @import("tcp.zig").Tcp;
-pub const Udp = @import("udp.zig").Udp;
-pub const TcpListener = @import("tcp.zig").Listener;
-pub const timer = @import("timer.zig");
+const timer = @import("timer.zig");
 
 const ns_per_ms = std.time.ns_per_ms;
 const ns_per_s = std.time.ns_per_s;
@@ -33,9 +30,7 @@ pub const Options = struct {
     connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
 };
 
-pub const Loop = Io;
-
-pub const Io = struct {
+pub const Loop = struct {
     allocator: mem.Allocator,
     ring: IoUring = undefined,
     timestamp: u64 = 0,
@@ -49,7 +44,7 @@ pub const Io = struct {
     timer_queue: timer.Queue,
     options: Options,
 
-    pub fn init(self: *Io, allocator: mem.Allocator, options: Options) !void {
+    pub fn init(self: *Loop, allocator: mem.Allocator, options: Options) !void {
         // Flags reference: https://nick-black.com/dankwiki/index.php/Io_uring
         const flags =
             // Create a kernel thread to poll on the submission queue. If the
@@ -65,7 +60,7 @@ pub const Io = struct {
             .allocator = allocator,
             .ring = ring,
             .timestamp = timestamp(),
-            .loop_timer = .{ .io = self },
+            .loop_timer = .{ .loop = self },
             .timer_queue = timer.Queue.init(allocator),
             .options = options,
         };
@@ -77,13 +72,13 @@ pub const Io = struct {
         self.setTimestamp();
     }
 
-    fn initBufferGroup(self: *Io, id: u16, count: u16, size: u32) !IoUring.BufferGroup {
+    fn initBufferGroup(self: *Loop, id: u16, count: u16, size: u32) !IoUring.BufferGroup {
         const buffers = try self.allocator.alloc(u8, count * size);
         errdefer self.allocator.free(buffers);
         return try IoUring.BufferGroup.init(&self.ring, id, buffers, size, count);
     }
 
-    pub fn deinit(self: *Io) void {
+    pub fn deinit(self: *Loop) void {
         if (self.recv_buf_grp.buffers_count > 0) {
             self.allocator.free(self.recv_buf_grp.buffers);
             self.recv_buf_grp.deinit();
@@ -92,19 +87,19 @@ pub const Io = struct {
         self.ring.deinit();
     }
 
-    pub fn drain(self: *Io) !void {
+    pub fn drain(self: *Loop) !void {
         while (self.metric.all.active() > 0) {
             log.debug("draining active operations: {}", .{self.metric.all.active()});
             try self.tick();
         }
     }
 
-    pub fn tickTs(self: *Io, ts: u64) !void {
+    pub fn tickTs(self: *Loop, ts: u64) !void {
         self.loop_timer.set(ts);
         try self.tick();
     }
 
-    pub fn tick(self: *Io) !void {
+    pub fn tick(self: *Loop) !void {
         self.metric.loops.inc(1);
         // Submit prepared sqe-s to the kernel.
         _ = try self.ring.submit();
@@ -133,12 +128,12 @@ pub const Io = struct {
             try self.flushCompletions();
     }
 
-    fn setTimestamp(self: *Io) void {
+    fn setTimestamp(self: *Loop) void {
         const new_timestamp = timestamp();
         self.timestamp = if (new_timestamp <= self.timestamp) self.timestamp + 1 else new_timestamp;
     }
 
-    fn flushCompletions(self: *Io) Error!void {
+    fn flushCompletions(self: *Loop) Error!void {
         while (self.cqe_buf_head < self.cqe_buf_tail) : (self.cqe_buf_head += 1) {
             const cqe = self.cqe_buf[self.cqe_buf_head];
             if (cqe.user_data == 0) continue;
@@ -155,12 +150,12 @@ pub const Io = struct {
         }
     }
 
-    fn restart(self: *Io, op: *Op) void {
+    fn restart(self: *Loop, op: *Op) void {
         self.metric.restart(op.args);
         self.submit(op);
     }
 
-    pub fn submit(self: *Io, op: *Op) void {
+    pub fn submit(self: *Loop, op: *Op) void {
         assert(op.flags & Op.flag_submitted == 0);
         op.flags |= Op.flag_submitted;
         op.prep(self) catch |err| {
@@ -169,16 +164,16 @@ pub const Io = struct {
         };
     }
 
-    pub fn now(self: *Io) u64 {
+    pub fn now(self: *Loop) u64 {
         return self.timestamp;
     }
 
-    pub fn tsFromDelay(self: *Io, delay_ms: u32) u64 {
+    pub fn tsFromDelay(self: *Loop, delay_ms: u32) u64 {
         return self.timestamp + @as(u64, @intCast(delay_ms)) * std.time.ns_per_ms;
     }
 
     const LoopTimer = struct {
-        io: *Io,
+        loop: *Loop,
         timer_op: Op = .{},
         cancel_op: Op = .{},
         args: Op.TimerArgs = .{},
@@ -192,14 +187,14 @@ pub const Io = struct {
             }
             self.args.abs(ts);
             self.timer_op = Op.timer(self.args, self, onTimer, onTimerFail);
-            self.io.submit(&self.timer_op);
+            self.loop.submit(&self.timer_op);
         }
 
         fn cancel(self: *Self) void {
             if (!self.timer_op.active()) return;
             if (self.cancel_op.active()) return;
             self.cancel_op = Op.cancel(&self.timer_op, self, onCancel);
-            self.io.submit(&self.cancel_op);
+            self.loop.submit(&self.cancel_op);
         }
 
         fn onCancel(_: *Self, _: ?anyerror) void {}
@@ -214,7 +209,7 @@ fn flagMore(cqe: linux.io_uring_cqe) bool {
 
 pub const Op = struct {
     context: u64 = 0,
-    callback: *const fn (*Op, *Io, linux.io_uring_cqe) Error!void = undefined,
+    callback: *const fn (*Op, *Loop, linux.io_uring_cqe) Error!void = undefined,
     args: Args = undefined,
     next: ?*Op = null,
     flags: u8 = 0,
@@ -314,38 +309,38 @@ pub const Op = struct {
         return op.flags & flag_has_more > 0;
     }
 
-    fn prep(op: *Op, io: *Io) !void {
+    fn prep(op: *Op, loop: *Loop) !void {
         switch (op.args) {
-            .accept => |*arg| _ = try io.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),
+            .accept => |*arg| _ = try loop.ring.accept_multishot(@intFromPtr(op), arg.socket, &arg.addr, &arg.addr_size, 0),
             .connect => |*arg| {
                 // connect and linked timeout operation
                 // if timeout is reached connect will get error.OperationCanceled
-                var sqe = try io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen());
+                var sqe = try loop.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen());
                 sqe.flags |= linux.IOSQE_IO_LINK;
-                _ = try io.ring.link_timeout(0, &io.options.connect_timeout, 0);
+                _ = try loop.ring.link_timeout(0, &loop.options.connect_timeout, 0);
             },
-            .close => |*arg| _ = try io.ring.close(@intFromPtr(op), arg.socket),
-            .recv => |socket| _ = try io.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
+            .close => |*arg| _ = try loop.ring.close(@intFromPtr(op), arg.socket),
+            .recv => |socket| _ = try loop.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
             .sendv => |*arg| _ = if (arg.zero_copy)
-                try io.ring.sendmsg_zc(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL)
+                try loop.ring.sendmsg_zc(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL)
             else
-                try io.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
-            .send => |*arg| _ = try io.ring.send(@intFromPtr(op), arg.socket, arg.buf, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
-            .timer => |*arg| _ = try io.ring.timeout(@intFromPtr(op), &arg.ts, arg.count, arg.flags),
-            .socket => |*arg| _ = try io.ring.socket(
+                try loop.ring.sendmsg(@intFromPtr(op), arg.socket, arg.msghdr, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
+            .send => |*arg| _ = try loop.ring.send(@intFromPtr(op), arg.socket, arg.buf, linux.MSG.WAITALL | linux.MSG.NOSIGNAL),
+            .timer => |*arg| _ = try loop.ring.timeout(@intFromPtr(op), &arg.ts, arg.count, arg.flags),
+            .socket => |*arg| _ = try loop.ring.socket(
                 @intFromPtr(op),
                 if (arg.domain == 0) arg.addr.any.family else arg.domain,
                 arg.socket_type,
                 arg.protocol,
                 0,
             ),
-            .shutdown => |socket| _ = try io.ring.shutdown(@intFromPtr(op), socket, posix.SHUT.RDWR),
+            .shutdown => |socket| _ = try loop.ring.shutdown(@intFromPtr(op), socket, posix.SHUT.RDWR),
             .cancel => |op_to_cancel| switch (op_to_cancel.args) {
-                .timer => _ = try io.ring.timeout_remove(@intFromPtr(op), @intFromPtr(op_to_cancel), 0),
-                else => _ = try io.ring.cancel(@intFromPtr(op), @intFromPtr(op_to_cancel), 0),
+                .timer => _ = try loop.ring.timeout_remove(@intFromPtr(op), @intFromPtr(op_to_cancel), 0),
+                else => _ = try loop.ring.cancel(@intFromPtr(op), @intFromPtr(op_to_cancel), 0),
             },
         }
-        io.metric.submit(op.args);
+        loop.metric.submit(op.args);
     }
 
     // Multishot operations -----------------
@@ -358,7 +353,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
+            fn complete(op: *Op, loop: *Loop, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
@@ -376,7 +371,7 @@ pub const Op = struct {
                     .CONNABORTED, .INTR => {}, // continue
                     else => |errno| return try fail(ctx, errFromErrno(errno)),
                 }
-                if (!flagMore(cqe)) io.restart(op);
+                if (!flagMore(cqe)) loop.restart(op);
             }
         };
         return .{
@@ -394,7 +389,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
+            fn complete(op: *Op, loop: *Loop, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
@@ -403,11 +398,11 @@ pub const Op = struct {
                             return try fail(ctx, error.EndOfFile);
 
                         const buffer_id = cqe.buffer_id() catch unreachable;
-                        const bytes = io.recv_buf_grp.get(buffer_id)[0..n];
+                        const bytes = loop.recv_buf_grp.get(buffer_id)[0..n];
                         try success(ctx, bytes);
-                        io.recv_buf_grp.put(buffer_id);
-                        io.metric.recv_bytes.inc(n);
-                        io.metric.recv_buf_grp.success.inc(1);
+                        loop.recv_buf_grp.put(buffer_id);
+                        loop.metric.recv_bytes.inc(n);
+                        loop.metric.recv_buf_grp.success.inc(1);
 
                         // NOTE: recv is not restarted if there is no more
                         // multishot cqe's (like accept). Check op.hasMore
@@ -415,12 +410,12 @@ pub const Op = struct {
                         return;
                     },
                     .NOBUFS => {
-                        io.metric.recv_buf_grp.no_bufs.inc(1);
+                        loop.metric.recv_buf_grp.no_bufs.inc(1);
                     },
                     .INTR => {},
                     else => |errno| return try fail(ctx, errFromErrno(errno)),
                 }
-                if (!flagMore(cqe)) return io.restart(op);
+                if (!flagMore(cqe)) return loop.restart(op);
             }
         };
         return .{
@@ -462,12 +457,12 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
+            fn complete(op: *Op, loop: *Loop, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
                         const sent_bytes: usize = @intCast(cqe.res);
-                        io.metric.send_bytes.inc(sent_bytes);
+                        loop.metric.send_bytes.inc(sent_bytes);
 
                         var data_len: usize = 0;
                         const mh = op.args.sendv.msghdr;
@@ -516,16 +511,16 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
+            fn complete(op: *Op, loop: *Loop, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
                         const n: usize = @intCast(cqe.res);
-                        io.metric.send_bytes.inc(n);
+                        loop.metric.send_bytes.inc(n);
                         const send_buf = op.args.send.buf;
                         if (n < send_buf.len) {
                             op.args.send.buf = send_buf[n..];
-                            return io.restart(op);
+                            return loop.restart(op);
                         }
                         try success(ctx);
                     },
@@ -550,7 +545,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) Error!void {
+            fn complete(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS, .TIME => try success(ctx),
@@ -572,14 +567,14 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
+            fn complete(op: *Op, loop: *Loop, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS, .TIME => success(ctx),
                     .CANCELED => return, // don't restart
                     else => {},
                 }
-                if (!flagMore(cqe)) return io.restart(op);
+                if (!flagMore(cqe)) return loop.restart(op);
             }
         };
         var args: TimerArgs = .{};
@@ -600,7 +595,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
+            fn complete(op: *Op, loop: *Loop, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => {
@@ -608,7 +603,7 @@ pub const Op = struct {
                         var a = op.args.socket;
                         a.socket = socket;
                         op.* = Op.connectSocket(a, ctx, success, fail);
-                        io.submit(op);
+                        loop.submit(op);
                     },
                     else => |errno| {
                         log.err("socket create failed {}", .{errFromErrno(errno)});
@@ -632,14 +627,14 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
+            fn complete(op: *Op, loop: *Loop, cqe: linux.io_uring_cqe) Error!void {
                 const ctx: Context = @ptrFromInt(op.context);
                 switch (cqe.err()) {
                     .SUCCESS => return try success(ctx, op.args.connect.socket),
                     else => |errno| {
                         const err = errFromErrno(errno);
                         op.* = Op.close(op.args.connect.socket, err, ctx, fail);
-                        io.submit(op);
+                        loop.submit(op);
                     },
                 }
             }
@@ -659,14 +654,14 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, io: *Io, cqe: linux.io_uring_cqe) Error!void {
+            fn complete(op: *Op, loop: *Loop, cqe: linux.io_uring_cqe) Error!void {
                 const err: ?anyerror = switch (cqe.err()) {
                     .SUCCESS => null,
                     else => |errno| errFromErrno(errno),
                 };
                 const ctx: Context = @ptrFromInt(op.context);
                 op.* = Op.close(op.args.shutdown, err, ctx, done);
-                io.submit(op);
+                loop.submit(op);
             }
         };
         return .{
@@ -684,7 +679,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) Error!void {
+            fn complete(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) Error!void {
                 _ = cqe;
                 const ctx: Context = @ptrFromInt(op.context);
                 done(ctx, op.args.close.err);
@@ -704,7 +699,7 @@ pub const Op = struct {
     ) Op {
         const Context = @TypeOf(context);
         const wrapper = struct {
-            fn complete(op: *Op, _: *Io, cqe: linux.io_uring_cqe) Error!void {
+            fn complete(op: *Op, _: *Loop, cqe: linux.io_uring_cqe) Error!void {
                 const err: ?anyerror = switch (cqe.err()) {
                     .SUCCESS => null,
                     else => |errno| errFromErrno(errno),
@@ -727,20 +722,20 @@ test "loop timer" {
     if (true) return error.SkipZigTest;
 
     const allocator = testing.allocator;
-    var io: Io = undefined;
-    try io.init(allocator, .{ .entries = 4, .recv_buffers = 0, .recv_buffer_len = 0 });
-    defer io.deinit();
+    var loop: Loop = undefined;
+    try loop.init(allocator, .{ .entries = 4, .recv_buffers = 0, .recv_buffer_len = 0 });
+    defer loop.deinit();
 
-    const start = io.timestamp;
-    try io.tickTs(io.timestamp + 100 * std.time.ns_per_ms);
-    std.debug.print("1: {}\n", .{(io.timestamp - start) / std.time.ns_per_ms});
-    try io.tickTs(io.timestamp + 200 * std.time.ns_per_ms);
-    std.debug.print("2: {}\n", .{(io.timestamp - start) / std.time.ns_per_ms});
-    io.loop_timer.set(io.timestamp + 200 * std.time.ns_per_ms);
-    try io.tickTs(io.timestamp + 199 * std.time.ns_per_ms);
-    std.debug.print("3: {}\n", .{(io.timestamp - start) / std.time.ns_per_ms});
-    try io.tickTs(io.timestamp + 100 * std.time.ns_per_ms);
-    std.debug.print("4: {}\n", .{(io.timestamp - start) / std.time.ns_per_ms});
+    const start = loop.timestamp;
+    try loop.tickTs(loop.timestamp + 100 * std.time.ns_per_ms);
+    std.debug.print("1: {}\n", .{(loop.timestamp - start) / std.time.ns_per_ms});
+    try loop.tickTs(loop.timestamp + 200 * std.time.ns_per_ms);
+    std.debug.print("2: {}\n", .{(loop.timestamp - start) / std.time.ns_per_ms});
+    loop.loop_timer.set(loop.timestamp + 200 * std.time.ns_per_ms);
+    try loop.tickTs(loop.timestamp + 199 * std.time.ns_per_ms);
+    std.debug.print("3: {}\n", .{(loop.timestamp - start) / std.time.ns_per_ms});
+    try loop.tickTs(loop.timestamp + 100 * std.time.ns_per_ms);
+    std.debug.print("4: {}\n", .{(loop.timestamp - start) / std.time.ns_per_ms});
 }
 
 fn timestamp() u64 {

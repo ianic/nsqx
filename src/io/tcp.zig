@@ -19,7 +19,7 @@ const log = std.log.scoped(.io_tcp);
 ///                           buffer lifetime has to be until onSend is called
 /// onClose                 - after tcp connection is closed
 ///
-pub fn Tcp(comptime ClientType: type) type {
+pub fn Conn(comptime ClientType: type) type {
     return struct {
         const Self = @This();
 
