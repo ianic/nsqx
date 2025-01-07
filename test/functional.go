@@ -196,11 +196,19 @@ func getStats(topic string) (*Stats, error) {
 
 func deleteTopic(topic string) error {
 	url := fmt.Sprintf("http://localhost:4151/topic/delete?topic=%s", topic)
-	rsp, err := http.Get(url)
-	if rsp.StatusCode == 200 {
-		return nil
+	_, err := http.Get(url)
+	if err != nil {
+		return err
 	}
-	return err
+	// try to delete in lookupd's also
+	for _, lookupd_port := range []int{4161, 4163} {
+		url = fmt.Sprintf("http://localhost:%d/topic/delete?topic=%s", lookupd_port, topic)
+		_, err = http.Post(url, "", nil)
+		if err != nil {
+			log.Printf("lookupd topic delete error %s, url: %s", err, url)
+		}
+	}
+	return nil
 }
 
 type Stats struct {
