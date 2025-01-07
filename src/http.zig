@@ -6,7 +6,7 @@ const posix = std.posix;
 
 const validateName = @import("protocol.zig").validateName;
 const Options = @import("Options.zig");
-const io = @import("io/io.zig");
+const io = @import("io/root.zig");
 const Broker = @import("main.zig").Broker;
 const store = @import("store.zig");
 pub const Listener = @import("tcp.zig").ListenerType(Conn);
@@ -16,7 +16,7 @@ const log = std.log.scoped(.http);
 pub const Conn = struct {
     allocator: mem.Allocator,
     listener: *Listener,
-    tcp: io.Tcp(*Conn),
+    tcp: io.tcp.Conn(*Conn),
     rsp_arena: ?std.heap.ArenaAllocator = null, // arena allocator for response
 
     pub fn init(self: *Conn, listener: *Listener, socket: posix.socket_t, addr: net.Address) !void {
@@ -24,7 +24,7 @@ pub const Conn = struct {
         self.* = .{
             .allocator = allocator,
             .listener = listener,
-            .tcp = io.Tcp(*Conn).init(allocator, listener.io_loop, self),
+            .tcp = io.tcp.Conn(*Conn).init(allocator, listener.io_loop, self),
         };
         self.tcp.connected(socket, addr);
     }

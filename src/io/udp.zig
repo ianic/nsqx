@@ -201,6 +201,7 @@ const Client = struct {
 const testing = std.testing;
 
 test {
+    if (true) return error.SkipZigTest;
     // To run this test first start listening on udp port:
     // $ nc -kluvw 0 localhost 9000
 

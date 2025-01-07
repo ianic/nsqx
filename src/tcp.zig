@@ -4,12 +4,11 @@ const mem = std.mem;
 const net = std.net;
 const posix = std.posix;
 
-const io = @import("io/io.zig");
+const io = @import("io/root.zig");
 const protocol = @import("protocol.zig");
 const Options = @import("Options.zig");
 const Broker = @import("main.zig").Broker;
 const Channel = Broker.Channel;
-const timer = @import("io/io.zig").timer;
 
 const log = std.log.scoped(.tcp);
 
@@ -22,7 +21,7 @@ pub fn ListenerType(comptime ConnType: type) type {
         options: Options,
         socket: posix.socket_t,
         io_loop: *io.Loop,
-        tcp_listener: io.TcpListener(*Self, ConnType),
+        tcp_listener: io.tcp.Listener(*Self, ConnType),
 
         pub fn init(
             self: *Self,
@@ -64,8 +63,8 @@ pub const Listener = ListenerType(Conn);
 pub const Conn = struct {
     allocator: mem.Allocator,
     listener: *Listener,
-    tcp: io.Tcp(*Conn),
-    timer_op: timer.Op = undefined,
+    tcp: io.tcp.Conn(*Conn),
+    timer_op: io.timer.Op = undefined,
 
     heartbeat_interval: u32 = initial_heartbeat,
     outstanding_heartbeats: u8 = 0,
@@ -81,7 +80,7 @@ pub const Conn = struct {
         self.* = .{
             .allocator = allocator,
             .listener = listener,
-            .tcp = io.Tcp(*Conn).init(allocator, listener.io_loop, self),
+            .tcp = io.tcp.Conn(*Conn).init(allocator, listener.io_loop, self),
         };
         self.tcp.connected(socket, addr);
 
@@ -266,11 +265,11 @@ pub const Conn = struct {
 
     /// Timer callback
     pub fn onTimer(self: *Conn, _: u64) !u64 {
-        if (self.tcp.state != .connected) return timer.infinite;
+        if (self.tcp.state != .connected) return io.timer.infinite;
         if (self.outstanding_heartbeats > 4) {
             log.debug("{} no heartbeat, closing", .{self.tcp.socket});
             self.close();
-            return timer.infinite;
+            return io.timer.infinite;
         }
         if (self.outstanding_heartbeats > 0) {
             log.debug("{} heartbeat", .{self.tcp.socket});

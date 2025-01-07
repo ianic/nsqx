@@ -4,7 +4,7 @@ const posix = std.posix;
 const socket_t = posix.socket_t;
 const testing = std.testing;
 
-const io = @import("io/io.zig");
+const io = @import("io/root.zig");
 const Options = @import("Options.zig");
 const Broker = @import("main.zig").Broker;
 
@@ -18,7 +18,7 @@ pub const Connector = struct {
     broker: *Broker,
     ticker_op: io.Op = .{},
     prefix: []const u8,
-    udp: io.Udp(*Self),
+    udp: io.udp.Sender(*Self),
 
     pub fn init(self: *Self, allocator: mem.Allocator, io_loop: *io.Loop, broker: *Broker, options: Options) !void {
         self.* = .{
@@ -26,7 +26,7 @@ pub const Connector = struct {
             .io_loop = io_loop,
             .broker = broker,
             .prefix = try fmtPrefix(allocator, options.statsd.prefix, options.broadcastAddress(), options.broadcast_tcp_port),
-            .udp = io.Udp(*Self).init(allocator, io_loop, self, options.statsd.address.?),
+            .udp = io.udp.Sender(*Self).init(allocator, io_loop, self, options.statsd.address.?),
         };
 
         // Start endless ticker

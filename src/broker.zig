@@ -9,7 +9,7 @@ const log = std.log.scoped(.broker);
 const protocol = @import("protocol.zig");
 const Options = @import("Options.zig").Broker;
 const store = @import("store.zig");
-const timer = @import("io/io.zig").timer;
+const timer = @import("io/root.zig").timer;
 
 const Counter = @import("statsd.zig").Counter;
 const Gauge = @import("statsd.zig").Gauge;

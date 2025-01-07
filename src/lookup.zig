@@ -6,7 +6,7 @@ const posix = std.posix;
 const socket_t = std.posix.socket_t;
 const testing = std.testing;
 
-const io = @import("io/io.zig");
+const io = @import("io/root.zig");
 const Options = @import("Options.zig");
 const Stream = @import("store.zig").Stream;
 
@@ -101,7 +101,7 @@ const Conn = struct {
     const ping_msg = "PING\n";
 
     connector: *Connector,
-    tcp: io.Tcp(*Conn),
+    tcp: io.tcp.Conn(*Conn),
     // null if not subscribed jet
     sequence: ?u64 = null,
 
@@ -109,7 +109,7 @@ const Conn = struct {
         const allocator = connector.allocator;
         self.* = .{
             .connector = connector,
-            .tcp = io.Tcp(*Conn).init(allocator, connector.io_loop, self),
+            .tcp = io.tcp.Conn(*Conn).init(allocator, connector.io_loop, self),
         };
         self.tcp.connect(address);
     }

@@ -28,6 +28,9 @@ pub const Options = struct {
     recv_buffers: u16 = 1024,
     /// Length of each receive buffer in bytes
     recv_buffer_len: u32 = 64 * 1024,
+
+    /// Default timeout for connect operations
+    connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
 };
 
 pub const Loop = Io;
@@ -44,9 +47,7 @@ pub const Io = struct {
     pending: Fifo(Op) = .{},
     loop_timer: LoopTimer,
     timer_queue: timer.Queue,
-
-    // default for connect operations
-    connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
+    options: Options,
 
     pub fn init(self: *Io, allocator: mem.Allocator, options: Options) !void {
         // Flags reference: https://nick-black.com/dankwiki/index.php/Io_uring
@@ -66,6 +67,7 @@ pub const Io = struct {
             .timestamp = timestamp(),
             .loop_timer = .{ .io = self },
             .timer_queue = timer.Queue.init(allocator),
+            .options = options,
         };
         if (options.recv_buffers > 0) {
             self.recv_buf_grp = try self.initBufferGroup(1, options.recv_buffers, options.recv_buffer_len);
@@ -320,7 +322,7 @@ pub const Op = struct {
                 // if timeout is reached connect will get error.OperationCanceled
                 var sqe = try io.ring.connect(@intFromPtr(op), arg.socket, &arg.addr.any, arg.addr.getOsSockLen());
                 sqe.flags |= linux.IOSQE_IO_LINK;
-                _ = try io.ring.link_timeout(0, &io.connect_timeout, 0);
+                _ = try io.ring.link_timeout(0, &io.options.connect_timeout, 0);
             },
             .close => |*arg| _ = try io.ring.close(@intFromPtr(op), arg.socket),
             .recv => |socket| _ = try io.recv_buf_grp.recv_multishot(@intFromPtr(op), socket, 0),
