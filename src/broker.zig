@@ -9,7 +9,7 @@ const log = std.log.scoped(.broker);
 const protocol = @import("protocol.zig");
 const Options = @import("Options.zig").Broker;
 const store = @import("store.zig");
-const timer = @import("timer.zig");
+const timer = @import("io/io.zig").timer;
 
 const Counter = @import("statsd.zig").Counter;
 const Gauge = @import("statsd.zig").Gauge;
@@ -18,10 +18,14 @@ fn nsFromMs(ms: u32) u64 {
     return @as(u64, @intCast(ms)) * std.time.ns_per_ms;
 }
 var time: struct {
-    now: u64 = 0,
+    timestamp: *u64 = undefined,
 
     fn after(self: @This(), delay_ms: u32) u64 {
-        return self.now + nsFromMs(delay_ms);
+        return self.now() + nsFromMs(delay_ms);
+    }
+
+    fn now(self: @This()) u64 {
+        return self.timestamp.*;
     }
 } = .{};
 
@@ -177,11 +181,12 @@ pub fn BrokerType(Client: type) type {
         registrations: Registrations,
         options: Options,
 
+        timestamp: *u64,
         started_at: u64,
         pub_err: ?anyerror = null,
         metric: store.Metric = .{},
 
-        timer_queue: timer.Queue,
+        timer_queue: *timer.Queue,
 
         const TopicsIterator = struct {
             iter: std.StringHashMap(*Topic).ValueIterator,
@@ -201,16 +206,19 @@ pub fn BrokerType(Client: type) type {
 
         pub fn init(
             allocator: mem.Allocator,
-            now: u64,
+            timestamp: *u64,
+            timer_queue: *timer.Queue,
             options: Options,
         ) Broker {
+            time.timestamp = timestamp;
             return .{
                 .allocator = allocator,
                 .topics = std.StringHashMap(*Topic).init(allocator),
-                .started_at = now,
+                .started_at = timestamp.*,
+                .timestamp = timestamp,
                 .options = options,
                 .metric = .{ .max_mem = options.max_mem },
-                .timer_queue = timer.Queue.init(allocator),
+                .timer_queue = timer_queue,
                 .registrations = Registrations.init(allocator),
             };
         }
@@ -219,7 +227,6 @@ pub fn BrokerType(Client: type) type {
             var iter = self.topicsIterator();
             while (iter.next()) |topic| topic.deinit();
             self.topics.deinit();
-            self.timer_queue.deinit();
             self.registrations.deinit();
         }
 
@@ -232,27 +239,19 @@ pub fn BrokerType(Client: type) type {
             self.registrations.onRegister = onRegister;
         }
 
-        pub fn tick(self: *Broker, ts: u64) !u64 {
-            time.now = ts;
-            return try self.timer_queue.tick(ts);
-        }
-
         // Publish/subscribe -----------------
 
         fn getOrCreateTopic(self: *Broker, name: []const u8) !*Topic {
             if (self.topics.get(name)) |t| return t;
-
+            // allocations
             try self.registrations.ensureCapacity(name, "");
             try self.topics.ensureUnusedCapacity(1);
-
             const topic = try self.allocator.create(Topic);
             errdefer self.allocator.destroy(topic);
             const key = try self.allocator.dupe(u8, name);
             errdefer self.allocator.free(key);
-
-            topic.* = Topic.init(self, key);
-            topic.timer_op.init(&self.timer_queue, topic, Topic.onTimer);
-
+            // init
+            topic.init(self, key);
             self.topics.putAssumeCapacityNoClobber(key, topic);
             self.registrations.topicCreated(key);
             log.debug("created topic {s}", .{name});
@@ -356,7 +355,7 @@ pub fn BrokerType(Client: type) type {
         // Metrics, dump, restore -----------------
 
         pub fn timeNow(_: *Broker) u64 {
-            return time.now;
+            return time.now();
         }
 
         pub fn writeMetrics(self: *Broker, writer: anytype) !void {
@@ -545,9 +544,9 @@ pub fn BrokerType(Client: type) type {
                     }
                 };
 
-                pub fn init(broker: *Broker, name: []const u8) Topic {
+                pub fn init(self: *Topic, broker: *Broker, name: []const u8) void {
                     const allocator = broker.allocator;
-                    return .{
+                    self.* = .{
                         .allocator = allocator,
                         .name = name,
                         .channels = std.StringHashMap(*Channel).init(allocator),
@@ -565,6 +564,7 @@ pub fn BrokerType(Client: type) type {
                             &broker.metric,
                         ),
                     };
+                    self.timer_op.init(broker.timer_queue, self, Topic.onTimer);
                 }
 
                 fn deinit(self: *Topic) void {
@@ -644,21 +644,21 @@ pub fn BrokerType(Client: type) type {
                         if (channel.state == .deleting) return error.Deleting;
                         return channel;
                     }
-
+                    // allocations
                     try self.broker.registrations.ensureCapacity(self.name, name);
-                    const first_channel = self.channels.count() == 0;
+                    try self.channels.ensureUnusedCapacity(1);
                     const channel = try self.allocator.create(Channel);
                     errdefer self.allocator.destroy(channel);
                     const key = try self.allocator.dupe(u8, name);
                     errdefer self.allocator.free(key);
-                    try self.channels.ensureUnusedCapacity(1);
-                    try channel.init(self, key);
+                    // channel init
+                    const first_channel = self.channels.count() == 0;
+                    const sequence: u64 = self.stream.subscribe(if (first_channel) .all else .new);
+                    const depth: usize = if (first_channel) self.stream.metric.msgs.value else 0;
+                    try channel.init(self, key, sequence, depth);
                     errdefer channel.deinit();
+                    //
                     self.channels.putAssumeCapacityNoClobber(key, channel);
-
-                    channel.timer_op.init(&self.broker.timer_queue, channel, Channel.onTimer);
-                    channel.sequence = self.stream.subscribe(if (first_channel) .all else .new);
-                    channel.metric.depth.set(if (first_channel) self.stream.metric.msgs.value else 0);
                     self.broker.registrations.channelCreated(self.name, channel.name);
                     log.debug("topic '{s}' channel '{s}' created", .{ self.name, channel.name });
                     return channel;
@@ -680,7 +680,7 @@ pub fn BrokerType(Client: type) type {
                         },
                         else => return err,
                     };
-                    protocol.writeHeader(res.data, @intCast(data.len), time.now, res.sequence);
+                    protocol.writeHeader(res.data, @intCast(data.len), time.now(), res.sequence);
                     const body = res.data[protocol.header_len..];
                     @memcpy(body, data);
                 }
@@ -964,7 +964,7 @@ pub fn BrokerType(Client: type) type {
 
                 // Init/deinit -----------------
 
-                fn init(self: *Channel, topic: *Topic, name: []const u8) !void {
+                fn init(self: *Channel, topic: *Topic, name: []const u8, sequence: u64, depth: usize) !void {
                     const allocator = topic.allocator;
                     self.* = .{
                         .allocator = allocator,
@@ -974,7 +974,10 @@ pub fn BrokerType(Client: type) type {
                         .in_flight = std.AutoHashMap(u64, InFlightMsg).init(allocator),
                         .deferred = std.PriorityQueue(DeferredMsg, void, DeferredMsg.less).init(allocator, {}),
                         .ephemeral = protocol.isEphemeral(name),
+                        .sequence = sequence,
                     };
+                    self.timer_op.init(topic.broker.timer_queue, self, Channel.onTimer);
+                    self.metric.depth.set(depth);
                 }
 
                 fn delete(self: *Channel) void {
@@ -1009,7 +1012,7 @@ pub fn BrokerType(Client: type) type {
                     client.consumer = .{
                         .client = client,
                         .channel = self,
-                        .metric = .{ .connected_at = time.now },
+                        .metric = .{ .connected_at = time.now() },
                     };
                     try self.consumers.append(&client.consumer.?);
                 }
@@ -1048,7 +1051,7 @@ pub fn BrokerType(Client: type) type {
                 fn restoreMsg(self: *Channel, sequence: u64, defer_until: u64, attempts: u16) !void {
                     const dm = DeferredMsg{
                         .sequence = sequence,
-                        .defer_until = if (defer_until > time.now) defer_until else 0,
+                        .defer_until = if (defer_until > time.now()) defer_until else 0,
                         .attempts = attempts + 1,
                     };
                     try self.updateTimer(dm.defer_until);
@@ -1075,7 +1078,7 @@ pub fn BrokerType(Client: type) type {
                 // increased attempts to message payload, put it in-flight and
                 // return payload.
                 fn popDeferred(self: *Channel, consumer: *Consumer) !?[]const u8 {
-                    if (self.deferred.peek()) |dm| if (dm.defer_until <= time.now) {
+                    if (self.deferred.peek()) |dm| if (dm.defer_until <= time.now()) {
                         try self.in_flight.ensureUnusedCapacity(1);
                         const data = try self.allocator.dupe(u8, self.topic.stream.message(dm.sequence));
                         errdefer self.allocator.free(data);
@@ -1336,6 +1339,25 @@ pub fn BrokerType(Client: type) type {
 
 const TestBroker = BrokerType(TestClient);
 
+const TestEnv = struct {
+    broker: TestBroker,
+    timestamp: u64 = 0,
+    timer_queue: timer.Queue,
+
+    pub fn init(self: *TestEnv, allocator: mem.Allocator) void {
+        self.* = .{
+            .broker = undefined,
+            .timestamp = 0,
+            .timer_queue = timer.Queue.init(allocator),
+        };
+        self.broker = TestBroker.init(allocator, &self.timestamp, &self.timer_queue, .{});
+    }
+    fn deinit(self: *TestEnv) void {
+        self.broker.deinit();
+        self.timer_queue.deinit();
+    }
+};
+
 const TestClient = struct {
     const Self = @This();
 
@@ -1497,8 +1519,10 @@ test "channel fin req" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
+    var env: TestEnv = undefined;
+    env.init(allocator);
+    defer env.deinit();
+    var broker = &env.broker;
 
     var client = TestClient.init(allocator);
     defer client.deinit();
@@ -1593,8 +1617,10 @@ test "multiple channels" {
     const channel_name2 = "channel2";
     const no = 1024;
 
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
+    var env: TestEnv = undefined;
+    env.init(allocator);
+    defer env.deinit();
+    var broker = &env.broker;
 
     var c1 = TestClient.init(allocator);
     defer c1.deinit();
@@ -1663,8 +1689,11 @@ test "first channel gets all messages accumulated in topic" {
     const channel_name = "channel1";
     const no = 16;
 
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
+    var env: TestEnv = undefined;
+    env.init(allocator);
+    defer env.deinit();
+    var broker = &env.broker;
+
     // publish messages to the topic which don't have channels created
     for (0..no) |_|
         try broker.publish(topic_name, "message body"); // 1-16
@@ -1712,8 +1741,10 @@ test "timeout messages" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
+    var env: TestEnv = undefined;
+    env.init(allocator);
+    defer env.deinit();
+    var broker = &env.broker;
 
     var client = TestClient.init(allocator);
     defer client.deinit();
@@ -1722,7 +1753,7 @@ test "timeout messages" {
     client.consumer.?.msg_timeout = 60000;
 
     for (0..4) |i| {
-        time.now = i + 1;
+        env.timestamp = i + 1;
         try broker.publish(topic_name, "message body");
         try client.pull();
     }
@@ -1770,7 +1801,6 @@ test "timeout messages" {
             try testing.expectEqual(2, msg.attempts);
         }
     }
-    time.now = 0;
 }
 
 test "deferred messages" {
@@ -1778,8 +1808,10 @@ test "deferred messages" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
+    var env: TestEnv = undefined;
+    env.init(allocator);
+    defer env.deinit();
+    var broker = &env.broker;
 
     var client = TestClient.init(allocator);
     defer client.deinit();
@@ -1800,8 +1832,11 @@ test "deferred messages" {
         try testing.expectEqual(0, topic.stream.last_sequence);
     }
 
-    { // move now, one is in flight after publish from topic.onTimer
-        _ = try broker.tick(nsFromMs(1));
+    { // publish deferred
+        env.timestamp = nsFromMs(1); // move now
+        // force publish from topic.onTimer
+        try testing.expectEqual(nsFromMs(2), env.timer_queue.tick(env.timestamp));
+
         try testing.expectEqual(1, topic.stream.last_sequence);
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
@@ -1814,11 +1849,11 @@ test "deferred messages" {
     }
 
     { // move now to deliver both
-        time.now = nsFromMs(3);
+        env.timestamp = nsFromMs(3);
         channel.wakeup();
         try testing.expectEqual(1, channel.in_flight.count());
         try testing.expectEqual(0, channel.deferred.count());
-        _ = try topic.onTimer(time.now);
+        _ = try topic.onTimer(time.now());
         try testing.expectEqual(2, topic.stream.last_sequence);
         try testing.expectEqual(0, topic.deferred.count());
         try testing.expectEqual(0, channel.deferred.count());
@@ -1832,10 +1867,12 @@ test "topic pause" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
-    const topic = try broker.getOrCreateTopic(topic_name);
+    var env: TestEnv = undefined;
+    env.init(allocator);
+    defer env.deinit();
+    var broker = &env.broker;
 
+    const topic = try broker.getOrCreateTopic(topic_name);
     {
         try broker.publish(topic_name, "message 1");
         try broker.publish(topic_name, "message 2");
@@ -1883,8 +1920,10 @@ test "channel empty" {
     const topic_name = "topic";
     const channel_name = "channel";
 
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
+    var env: TestEnv = undefined;
+    env.init(allocator);
+    defer env.deinit();
+    var broker = &env.broker;
 
     var client = TestClient.init(allocator);
     defer client.deinit();
@@ -1892,13 +1931,13 @@ test "channel empty" {
     try broker.subscribe(&client, topic_name, channel_name);
     const channel = client.consumer.?.channel;
 
-    time.now = 1;
+    env.timestamp = 1;
     try broker.publish(topic_name, "message 1");
     try broker.publish(topic_name, "message 2");
     try broker.publish(topic_name, "message 3");
     try broker.publish(topic_name, "message 4");
 
-    time.now = 2;
+    env.timestamp = 2;
     try client.pull();
     try client.pull();
     try client.pull();
@@ -1911,8 +1950,6 @@ test "channel empty" {
     try testing.expectEqual(0, channel.in_flight.count());
     try testing.expectEqual(0, channel.deferred.count());
     try testing.expectEqual(4, channel.sequence);
-
-    time.now = 0;
 }
 
 test "ephemeral channel" {
@@ -1920,8 +1957,10 @@ test "ephemeral channel" {
     const topic_name = "topic";
     const channel_name = "channel#ephemeral";
 
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
+    var env: TestEnv = undefined;
+    env.init(allocator);
+    defer env.deinit();
+    var broker = &env.broker;
 
     var client = TestClient.init(allocator);
     defer client.deinit();
@@ -1942,8 +1981,10 @@ test "channel delete page references" {
     const topic_name = "topic";
     const channel_name = "channel1";
 
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
+    var env: TestEnv = undefined;
+    env.init(allocator);
+    defer env.deinit();
+    var broker = &env.broker;
 
     var client1 = TestClient.init(allocator);
     defer client1.deinit();
@@ -1981,8 +2022,10 @@ test "depth" {
     const allocator = testing.allocator;
     const topic_name = "topic";
 
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
+    var env: TestEnv = undefined;
+    env.init(allocator);
+    defer env.deinit();
+    var broker = &env.broker;
 
     var client1 = TestClient.init(allocator);
     defer client1.deinit();
@@ -2035,8 +2078,10 @@ test "check allocations" {
 fn publishFinish(allocator: mem.Allocator) !void {
     const topic_name = "topic";
 
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
+    var env: TestEnv = undefined;
+    env.init(allocator);
+    defer env.deinit();
+    var broker = &env.broker;
 
     // Create 2 channels
     const channel1_name = "channel1";
@@ -2118,8 +2163,11 @@ test "dump/restore" {
     defer dir.close();
 
     { // dump
-        var broker = TestBroker.init(allocator, 0, .{});
-        defer broker.deinit();
+        var env: TestEnv = undefined;
+        env.init(allocator);
+        defer env.deinit();
+        var broker = &env.broker;
+
         const topic = try broker.getOrCreateTopic(topic_name);
 
         var consumer1 = TestClient.init(allocator);
@@ -2133,11 +2181,11 @@ test "dump/restore" {
 
         { // add 3 messages to the topic
             topic.stream.last_sequence = 100;
-            time.now = now;
+            env.timestamp = now;
             try broker.publish(topic_name, "Iso "); // msg 1, sequence: 101
-            time.now += ns_per_s;
+            env.timestamp += ns_per_s;
             try broker.publish(topic_name, "medo u ducan "); // msg 2, sequence: 102
-            time.now += ns_per_s;
+            env.timestamp += ns_per_s;
             try broker.publish(topic_name, "nije reko dobar dan."); // msg 3, sequence: 103
         }
 
@@ -2166,8 +2214,11 @@ test "dump/restore" {
     }
 
     { // restore in another instance
-        var broker = TestBroker.init(allocator, 0, .{});
-        defer broker.deinit();
+        var env: TestEnv = undefined;
+        env.init(allocator);
+        defer env.deinit();
+        var broker = &env.broker;
+
         try broker.restore(dir);
 
         const topic = try broker.getOrCreateTopic(topic_name);
@@ -2197,13 +2248,13 @@ test "dump/restore" {
     }
 
     try std.fs.cwd().deleteTree(dir_name);
-    time.now = 0;
 }
 
 test "registrations" {
-    const allocator = testing.allocator;
-    var broker = TestBroker.init(allocator, 0, .{});
-    defer broker.deinit();
+    var env: TestEnv = undefined;
+    env.init(testing.allocator);
+    defer env.deinit();
+    var broker = &env.broker;
 
     const T = struct {
         call_count: usize = 0,

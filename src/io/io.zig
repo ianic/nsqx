@@ -12,6 +12,7 @@ const Fifo = @import("fifo.zig").Fifo;
 pub const Tcp = @import("tcp.zig").Tcp;
 pub const Udp = @import("udp.zig").Udp;
 pub const TcpListener = @import("tcp.zig").Listener;
+pub const timer = @import("timer.zig");
 
 const ns_per_ms = std.time.ns_per_ms;
 const ns_per_s = std.time.ns_per_s;
@@ -42,6 +43,7 @@ pub const Io = struct {
     cqe_buf_tail: usize = 0,
     pending: Fifo(Op) = .{},
     loop_timer: LoopTimer,
+    timer_queue: timer.Queue,
 
     // default for connect operations
     connect_timeout: linux.kernel_timespec = .{ .sec = 10, .nsec = 0 },
@@ -63,12 +65,14 @@ pub const Io = struct {
             .ring = ring,
             .timestamp = timestamp(),
             .loop_timer = .{ .io = self },
+            .timer_queue = timer.Queue.init(allocator),
         };
         if (options.recv_buffers > 0) {
             self.recv_buf_grp = try self.initBufferGroup(1, options.recv_buffers, options.recv_buffer_len);
         } else {
             self.recv_buf_grp.buffers_count = 0;
         }
+        self.setTimestamp();
     }
 
     fn initBufferGroup(self: *Io, id: u16, count: u16, size: u32) !IoUring.BufferGroup {
@@ -82,6 +86,7 @@ pub const Io = struct {
             self.allocator.free(self.recv_buf_grp.buffers);
             self.recv_buf_grp.deinit();
         }
+        self.timer_queue.deinit();
         self.ring.deinit();
     }
 
@@ -107,6 +112,9 @@ pub const Io = struct {
             _ = self.pending.pop();
         }
 
+        const next_ts = self.timer_queue.next();
+        if (next_ts != timer.infinite) self.loop_timer.set(next_ts);
+
         if (self.cqe_buf_head >= self.cqe_buf_tail) {
             // Get completions.
             self.cqe_buf_head = 0;
@@ -115,12 +123,17 @@ pub const Io = struct {
             self.cqe_buf_tail = n;
             self.metric.cqes.inc(n);
         }
-        if (self.cqe_buf_head < self.cqe_buf_tail) {
-            // Process completions.
-            const new_timestamp = timestamp();
-            self.timestamp = if (new_timestamp <= self.timestamp) self.timestamp + 1 else new_timestamp;
+        self.setTimestamp();
+        // fire timers
+        _ = self.timer_queue.tick(self.timestamp);
+        // Process completions.
+        if (self.cqe_buf_head < self.cqe_buf_tail)
             try self.flushCompletions();
-        }
+    }
+
+    fn setTimestamp(self: *Io) void {
+        const new_timestamp = timestamp();
+        self.timestamp = if (new_timestamp <= self.timestamp) self.timestamp + 1 else new_timestamp;
     }
 
     fn flushCompletions(self: *Io) Error!void {

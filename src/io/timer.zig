@@ -11,8 +11,8 @@ pub const Error = error{OutOfMemory};
 pub const Op = struct {
     const Self = @This();
 
-    ctx: *anyopaque = undefined,
-    callback: *const fn (*Op, u64) anyerror!u64 = undefined,
+    ctx: *anyopaque,
+    callback: *const fn (*Op, u64) anyerror!u64,
     ts: u64 = infinite,
     queue: *Queue,
 
@@ -20,13 +20,13 @@ pub const Op = struct {
         self: *Op,
         queue: *Queue,
         ctx: anytype,
-        comptime tick: fn (@TypeOf(ctx), u64) anyerror!u64,
+        comptime onTimer: fn (@TypeOf(ctx), u64) anyerror!u64,
     ) void {
         const Context = @TypeOf(ctx);
         const wrapper = struct {
             fn callback(op: *Op, now: u64) anyerror!u64 {
                 const ptr: Context = @ptrCast(@alignCast(op.ctx));
-                return tick(ptr, now);
+                return onTimer(ptr, now);
             }
         };
         self.* = .{
@@ -93,15 +93,21 @@ pub const Queue = struct {
     }
 
     // Fire all due operations. Return next timestamp.
-    pub fn tick(self: *Self, ts: u64) anyerror!u64 {
+    pub fn tick(self: *Self, ts: u64) u64 {
+        var next_ts = infinite;
         while (self.pq.peek()) |op| {
-            if (op.ts > ts) return op.ts;
-            op.ts = try op.callback(op, ts);
-            _ = self.pq.remove();
-            if (op.ts > ts and op.ts < infinite)
-                self.pq.add(op) catch {}; // element is just removed
+            if (op.ts > ts) {
+                next_ts = @min(next_ts, op.ts);
+                break;
+            }
+            op.ts = op.callback(op, ts) catch |err| {
+                log.err("timer callback failed {}", .{err});
+                next_ts = @min(next_ts, op.ts);
+                continue;
+            };
+            self.update(op) catch {}; // element is just removed
         }
-        return infinite;
+        return next_ts;
     }
 
     // Smallest timestamp of scheduled operations.

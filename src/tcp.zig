@@ -9,7 +9,7 @@ const protocol = @import("protocol.zig");
 const Options = @import("Options.zig");
 const Broker = @import("main.zig").Broker;
 const Channel = Broker.Channel;
-const timer = @import("timer.zig");
+const timer = @import("io/io.zig").timer;
 
 const log = std.log.scoped(.tcp);
 
@@ -85,7 +85,7 @@ pub const Conn = struct {
         };
         self.tcp.connected(socket, addr);
 
-        self.timer_op.init(&listener.broker.timer_queue, self, Conn.onTimer);
+        self.timer_op.init(&listener.io_loop.timer_queue, self, Conn.onTimer);
         try self.timer_op.update(initial_heartbeat);
 
         log.debug("{} connected {}", .{ socket, addr });

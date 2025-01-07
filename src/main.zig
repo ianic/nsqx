@@ -7,18 +7,16 @@ const mem = std.mem;
 
 const Options = @import("Options.zig");
 const fatal = @import("Options.zig").fatal;
-const Io = @import("io/io.zig").Io;
+const io = @import("io/io.zig");
 const tcp = @import("tcp.zig");
 const http = @import("http.zig");
 const lookup = @import("lookup.zig");
 const statsd = @import("statsd.zig");
-const timer = @import("timer.zig");
 pub const Broker = @import("broker.zig").BrokerType(tcp.Conn);
 
 pub const std_options = std.Options{
     .log_level = if (builtin.mode == .Debug) .debug else .warn,
 };
-
 const log = std.log.scoped(.main);
 
 pub fn main() !void {
@@ -34,31 +32,30 @@ pub fn main() !void {
         else => return err,
     };
     defer data_dir.close();
-    log.debug("using data dir {s}", .{options.data_path});
 
-    var io: Io = undefined;
-    try io.init(allocator, options.io);
-    defer io.deinit();
+    var io_loop: io.Loop = undefined;
+    try io_loop.init(allocator, options.io);
+    defer io_loop.deinit();
 
-    var broker = Broker.init(allocator, io.now(), options.broker);
+    var broker = Broker.init(allocator, &io_loop.timestamp, &io_loop.timer_queue, options.broker);
     defer broker.deinit();
 
     var lookup_connector: lookup.Connector = undefined;
-    try lookup_connector.init(allocator, &io, &broker.registrations.stream, options.lookup_tcp_addresses, options);
+    try lookup_connector.init(allocator, &io_loop, &broker.registrations.stream, options.lookup_tcp_addresses, options);
     defer lookup_connector.deinit();
     broker.setRegistrationsCallback(&lookup_connector, lookup.Connector.onRegister);
 
     var tcp_listener: tcp.Listener = undefined;
-    try tcp_listener.init(allocator, &io, &broker, options, try socket(options.tcp_address));
+    try tcp_listener.init(allocator, &io_loop, &broker, options, try socket(options.tcp_address));
     defer tcp_listener.deinit();
 
     var http_listener: http.Listener = undefined;
-    try http_listener.init(allocator, &io, &broker, options, try socket(options.http_address));
+    try http_listener.init(allocator, &io_loop, &broker, options, try socket(options.http_address));
     defer http_listener.deinit();
 
     const statsd_connector: ?*statsd.Connector = if (options.statsd.address) |_| brk: {
         var sc: statsd.Connector = undefined;
-        try sc.init(allocator, &io, &broker, options);
+        try sc.init(allocator, &io_loop, &broker, options);
         break :brk &sc;
     } else null;
     defer if (statsd_connector) |sc| sc.deinit();
@@ -68,16 +65,7 @@ pub fn main() !void {
     // Run loop
     catchSignals();
     while (true) {
-        const ts = brk: {
-            const now = io.timestamp;
-            const ts = broker.tick(now) catch broker.timer_queue.next();
-
-            const min_ts = now + std.time.ns_per_ms; // 1 ms
-            const max_ts = now + 10 * std.time.ns_per_s; // 10 s
-            break :brk @max(min_ts, @min(ts, max_ts));
-        };
-
-        io.tickTs(ts) catch |err| {
+        io_loop.tick() catch |err| {
             if (err != error.SignalInterrupt)
                 log.err("io.tick failed {}", .{err});
             switch (err) {
@@ -131,10 +119,8 @@ pub fn socket(addr: net.Address) !posix.socket_t {
 
 fn mallocTrim() void {
     const c = @cImport(@cInclude("malloc.h"));
-    //c.malloc_stats();
     const ret = c.malloc_trim(0);
     log.debug("malloc_trim retrun value: {}", .{ret});
-    //c.malloc_stats();
 }
 
 var signal = Atomic(c_int).init(0);
