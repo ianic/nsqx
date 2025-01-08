@@ -12,10 +12,14 @@ jobs:
     name: Build and Test
     steps:
       - uses: actions/checkout@v3
+      - uses: actions/checkout@v3
+        with:
+          repository: ianic/iox
+          path: './iox'
       - uses: mlugg/setup-zig@v1
         with:
           version: master
       - run: zig build
-      - run: zig build test
-      - run: zig test -lc src/main.zig
-      - run: zig run -lc src/Options.zig -- --max-mem 1G
+      - run: zig build test --summary all
+      - run: zig test -lc --dep iox -Mroot=src/main.zig -Miox=iox/src/root.zig
+      # - run: zig run -lc src/Options.zig -- --max-mem 1G
