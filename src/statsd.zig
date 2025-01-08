@@ -4,7 +4,7 @@ const posix = std.posix;
 const socket_t = posix.socket_t;
 const testing = std.testing;
 
-const io = @import("io/root.zig");
+const io = @import("iox");
 const Options = @import("Options.zig");
 const Broker = @import("main.zig").Broker;
 

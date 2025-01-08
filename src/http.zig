@@ -6,7 +6,7 @@ const posix = std.posix;
 
 const validateName = @import("protocol.zig").validateName;
 const Options = @import("Options.zig");
-const io = @import("io/root.zig");
+const io = @import("iox");
 const Broker = @import("main.zig").Broker;
 const store = @import("store.zig");
 pub const Listener = @import("tcp.zig").ListenerType(Conn);

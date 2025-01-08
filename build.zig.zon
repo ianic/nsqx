@@ -28,6 +28,10 @@
             .url = "https://github.com/sam701/zig-cli/archive/ac82640e750efb3b89c609032bdec0898739a790.tar.gz",
             .hash = "1220203f73d7a17299a5d1a2f7902bc1c8ad9d20c8f7c40b4852dfd77bdb6ff7ec5e",
         },
+        .iox = .{
+            .url = "https://github.com/ianic/iox/archive/da1020aec1b552d290bcd8e85f3872f690984a8e.tar.gz",
+            .hash = "12201c755f1a53374f78de8eca66ae4cb6df6eb6cd57008a6914e7e5d8a94994311a",
+        },
     },
 
     // Specifies the set of files and directories that are included in this package.

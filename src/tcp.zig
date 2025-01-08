@@ -4,7 +4,7 @@ const mem = std.mem;
 const net = std.net;
 const posix = std.posix;
 
-const io = @import("io/root.zig");
+const io = @import("iox");
 const protocol = @import("protocol.zig");
 const Options = @import("Options.zig");
 const Broker = @import("main.zig").Broker;

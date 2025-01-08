@@ -116,7 +116,7 @@ pub const Broker = struct {
     max_page_size: u32 = 1024 * 1024,
 };
 
-pub const Io = @import("io/root.zig").Options;
+pub const Io = @import("iox").Options;
 
 pub const Statsd = struct {
     /// statsd daemon for pushing stats
