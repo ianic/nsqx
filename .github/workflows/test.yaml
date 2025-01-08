@@ -21,5 +21,5 @@ jobs:
           version: master
       - run: zig build
       - run: zig build test --summary all
-      - run: zig test -lc --dep iox -Mroot=src/main.zig -Miox=iox/src/root.zig
-      # - run: zig run -lc src/Options.zig -- --max-mem 1G
+      - run: zig test -lc --dep iox -Mroot=src/main.zig    -Miox=iox/src/root.zig
+      - run: zig run  -lc --dep iox -Mroot=src/Options.zig -Miox=iox/src/root.zig -- --max-mem 1G
