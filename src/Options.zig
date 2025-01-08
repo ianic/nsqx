@@ -164,7 +164,7 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
         } else if (eql("version", arg)) {
-            std.debug.print("nsql {s}\n", .{version});
+            std.debug.print("nsqxd {s}\n", .{version});
             std.process.exit(0);
             // dump data path
         } else if (iter.string("data-path")) |str| {
@@ -230,19 +230,19 @@ pub fn initFromArgs(allocator: mem.Allocator) !Options {
         } else if (iter.int("io-recv-buffer-len", u32)) |i| {
             opt.io.recv_buffer_len = i;
 
-            // Allow unchanged nsqd configuration to be used with nsql. Skip
-            // nsqd arguments not used in nsql.
+            // Allow unchanged nsqd configuration to be used with nsqxd. Skip
+            // nsqd arguments not used in nsqxd.
         } else {
             for (nsqd_arguments) |nsqd_arg| {
                 if (eql(nsqd_arg, arg)) {
-                    std.debug.print("info: skipping nsqd argument '{s}' unused in nsql\n", .{nsqd_arg});
+                    std.debug.print("info: skipping nsqd argument '{s}' unused in nsqxd\n", .{nsqd_arg});
                     _ = iter.next(); // skip value also
                     continue :outer;
                 }
             }
             for (nsqd_flags) |nsqd_flag| {
                 if (eql(nsqd_flag, arg)) {
-                    std.debug.print("info: skipping nsqd argument '{s}' unused in nsql\n", .{nsqd_flag});
+                    std.debug.print("info: skipping nsqd argument '{s}' unused in nsqxd\n", .{nsqd_flag});
                     continue :outer;
                 }
             }

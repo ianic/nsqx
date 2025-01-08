@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
     const iox_mod = b.dependency("iox", dep_opts).module("iox");
 
     const exe = b.addExecutable(.{
-        .name = "nsql",
+        .name = "nsqxd",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,

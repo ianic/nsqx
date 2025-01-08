@@ -3,7 +3,7 @@
 # set -u
 set -m
 
-killall nsql  >> /dev/null 2>&1
+killall nsqxd  >> /dev/null 2>&1
 killall nsqadmin  >> /dev/null 2>&1
 killall nsqlookupd >> /dev/null 2>&1
 killall lookup >> /dev/null 2>&1
@@ -11,11 +11,11 @@ killall nsq_tail >> /dev/null 2>&1
 
 set -e
 
-cd ~/Code/nsql
+cd ~/Code/nsqx
 zig build
 
 # lookup for monitoring registrations
-cd ~/Code/nsql && zig run test/lookup.zig > tmp/registrations 2>&1 &
+cd ~/Code/nsqx && zig run test/lookup.zig > tmp/registrations 2>&1 &
 lookupd3_pid=$!
 
 # default lookupd
@@ -36,17 +36,17 @@ lookupd2_pid=$!
 admin_pid=$!
 
 # daemon
-cd ~/Code/nsql
-./zig-out/bin/nsql \
+cd ~/Code/nsqx
+./zig-out/bin/nsqxd \
   --data-path ./tmp \
   --statsd-prefix "" \
   --lookupd-tcp-address localhost:4160 \
   --lookupd-tcp-address localhost:4162 \
   --lookupd-tcp-address localhost:4164 \
-  > tmp/nsql 2>&1 &
+  > tmp/nsqxd 2>&1 &
 # --io-entries 16 \
 # --statsd-address localhost:8125 \
-nsql_pid=$!
+nsqxd_pid=$!
 
 sleep 1
 
@@ -66,16 +66,16 @@ cleanup() {
     kill $lookupd_pid >> /dev/null
     kill $lookupd2_pid >> /dev/null
     kill $lookupd3_pid >> /dev/null
-    kill $nsql_pid >> /dev/null
+    kill $nsqxd_pid >> /dev/null
 }
 trap cleanup INT TERM #EXIT
 
 echo pids:
 echo admin: $admin_pid
 echo lookupd: $lookupd_pid $lookupd2_pid $lookupd3_pid
-echo nsql: $nsql_pid
+echo nsqxd: $nsqxd_pid
 
-wait $nsql_pid
+wait $nsqxd_pid
 wait $lookupd_pid
 
 exit 0

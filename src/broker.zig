@@ -370,7 +370,7 @@ pub fn BrokerType(Client: type) type {
                     try writer.gauge(prefix, "depth", depth);
                     try writer.add(prefix, "message_count", &m.total_msgs);
                     try writer.add(prefix, "message_bytes", &m.total_bytes);
-                    // nsql specific
+                    // nsqx specific
                     try writer.add(prefix, "msgs", m.msgs);
                     try writer.add(prefix, "bytes", m.bytes);
                     try writer.add(prefix, "capacity", m.capacity);
@@ -401,7 +401,7 @@ pub fn BrokerType(Client: type) type {
             }
         }
 
-        const metadata_file_name = "nsql.dump";
+        const metadata_file_name = "nsqxd.dump";
 
         // metadata paused, topic, channel
         pub fn dump(self: *Broker, dir: std.fs.Dir) !void {

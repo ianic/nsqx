@@ -1,4 +1,4 @@
-module github.com/ianic/nsql/test
+module github.com/ianic/nsqx/test
 
 go 1.22.2
 

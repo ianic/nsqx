@@ -27,13 +27,13 @@ done
 # set -u
 set -m
 
-killall nsql  >> /dev/null 2>&1
+killall nsqxd  >> /dev/null 2>&1
 killall nsqadmin  >> /dev/null 2>&1
 killall nsqlookup >> /dev/null 2>&1
 
 set -e
 
-cd ~/Code/nsql
+cd ~/Code/nsqx
 zig build -Doptimize=ReleaseFast
 #zig build -Doptimize=ReleaseSmall
 
@@ -42,28 +42,28 @@ cd ~/Code/go/nsq/bench/bench_writer/
 go build
 cd ~/Code/go/nsq/bench/bench_reader/
 go build
-cd ~/Code/nsql
+cd ~/Code/nsqx
 
 if [ ! -z ${CLEAR+x} ]; then # if clear is set
-    rm -f ./tmp/nsql.dump ./tmp/sub_bench
+    rm -f ./tmp/nsqxd.dump ./tmp/sub_bench
 fi
 
-# sudo valgrind --tool=callgrind ./zig-out/bin/nsql \
-./zig-out/bin/nsql \
+# sudo valgrind --tool=callgrind ./zig-out/bin/nsqxd \
+./zig-out/bin/nsqxd \
     --data-path ./tmp \
     --max-mem=16G \
     --statsd-address localhost \
     --statsd-prefix "nsq" \
     --statsd-udp-packet-size 8k \
-    > tmp/nsql 2>&1 &
+    > tmp/nsqxd 2>&1 &
 nsqd_pid=$!
 
-# ./zig-out/bin/nsql --data-path ./tmp --max-mem=40G > tmp/nsql 2>&1 &
-# sudo valgrind --tool=callgrind ./zig-out/bin/nsql --data-path ./tmp > tmp/nsql 2>&1 &
-# ~/Code/go/nsq/apps/nsqd/nsqd --mem-queue-size=100000000 > tmp/nsql 2>&1 &
+# ./zig-out/bin/nsqxd --data-path ./tmp --max-mem=40G > tmp/nsqxd 2>&1 &
+# sudo valgrind --tool=callgrind ./zig-out/bin/nsqxd --data-path ./tmp > tmp/nsqxd 2>&1 &
+# ~/Code/go/nsq/apps/nsqd/nsqd --mem-queue-size=100000000 > tmp/nsqxd 2>&1 &
 
 
-#sh -c 'while pkill -usr1 nsql; do sleep 10; done' &
+#sh -c 'while pkill -usr1 nsqxd; do sleep 10; done' &
 #stat_pid=$!
 
 

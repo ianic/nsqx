@@ -3,7 +3,7 @@ set -e
 # set -u
 # set -m
 
-cd ~/Code/nsql
+cd ~/Code/nsqx
 zig build
 
 # default lookupd
@@ -24,20 +24,20 @@ lookupd2_pid=$!
 admin_pid=$!
 
 # deamon
-cd ~/Code/nsql
-./zig-out/bin/nsql &
-nsql_pid=$!
+cd ~/Code/nsqx
+./zig-out/bin/nsqx &
+nsqx_pid=$!
 
 sleep 1
-cd ~/Code/nsql/test
-go run topics_producer.go >> ~/Code/nsql/tmp/producer 2>&1
+cd ~/Code/nsqx/test
+go run topics_producer.go >> ~/Code/nsqx/tmp/producer 2>&1
 
-go run topics_consumer.go >> ~/Code/nsql/tmp/consumer 2>&1 &
+go run topics_consumer.go >> ~/Code/nsqx/tmp/consumer 2>&1 &
 consumer_pid=$!
 
 cleanup() {
     set +e
-    kill $nsql_pid >> /dev/null
+    kill $nsqx_pid >> /dev/null
     kill $admin_pid >> /dev/null
     kill $lookupd_pid >> /dev/null
     kill $lookupd2_pid >> /dev/null
@@ -45,5 +45,5 @@ cleanup() {
 }
 trap cleanup INT TERM #EXIT
 
-wait $nsql_pid
+wait $nsqx_pid
 wait $lookupd_pid
