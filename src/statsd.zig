@@ -10,7 +10,7 @@ const Broker = @import("main.zig").Broker;
 
 const log = std.log.scoped(.statsd);
 
-pub const Connector = struct {
+pub const Sender = struct {
     const Self = @This();
 
     allocator: mem.Allocator,

@@ -53,12 +53,12 @@ pub fn main() !void {
     try http_listener.init(allocator, &io_loop, &broker, options, try socket(options.http_address));
     defer http_listener.deinit();
 
-    const statsd_connector: ?*statsd.Connector = if (options.statsd.address) |_| brk: {
-        var sc: statsd.Connector = undefined;
+    const statsd_sender: ?*statsd.Sender = if (options.statsd.address) |_| brk: {
+        var sc: statsd.Sender = undefined;
         try sc.init(allocator, &io_loop, &broker, options);
         break :brk &sc;
     } else null;
-    defer if (statsd_connector) |sc| sc.deinit();
+    defer if (statsd_sender) |sc| sc.deinit();
 
     try broker.restore(data_dir);
 
@@ -66,8 +66,20 @@ pub fn main() !void {
     catchSignals();
     while (true) {
         io_loop.tick() catch |err| {
-            if (err != error.SignalInterrupt)
-                log.err("io.tick failed {}", .{err});
+            if (err == error.SignalInterrupt) {
+                const sig = signal.load(.monotonic);
+                signal.store(0, .release);
+                log.debug("interrupted by signal {}", .{sig});
+                switch (sig) {
+                    posix.SIG.USR1 => {},
+                    posix.SIG.USR2 => mallocTrim(),
+                    posix.SIG.TERM, posix.SIG.INT => break,
+                    else => {},
+                }
+                continue;
+            }
+
+            log.err("io.tick failed {}", .{err});
             switch (err) {
                 // OutOfMemory
                 // SubmissionQueueFull - when unable to prepare io operation
@@ -97,17 +109,6 @@ pub fn main() !void {
                 => break,
             }
         };
-
-        const sig = signal.load(.monotonic);
-        if (sig != 0) {
-            signal.store(0, .release);
-            switch (sig) {
-                posix.SIG.USR1 => {},
-                posix.SIG.USR2 => mallocTrim(),
-                posix.SIG.TERM, posix.SIG.INT => break,
-                else => {},
-            }
-        }
     }
 
     try broker.dump(data_dir);
