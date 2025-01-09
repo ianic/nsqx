@@ -34,7 +34,8 @@ killall nsqlookup >> /dev/null 2>&1
 set -e
 
 cd ~/Code/nsqx
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu.2.35
+# -Dtarget=x86_64-linux-musl
 #zig build -Doptimize=ReleaseSmall
 
 
