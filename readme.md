@@ -14,7 +14,7 @@ In other aspects functions like nsqd. Implements [nsq tcp](https://nsq.io/client
 
 ## Performance
 
-Using [bench](https://github.com/nsqio/nsq/tree/master/bench) from nsq project. nsqd is configured to not use diskqueue raising it's mem-queue-size above max number of messages used in test.  
+Using [bench](https://github.com/nsqio/nsq/tree/master/bench) from nsq project (to be fair; nsqd is configured to not use diskqueue raising it's mem-queue-size above max number of messages used in test).  
 
 nsqd:
 ```
