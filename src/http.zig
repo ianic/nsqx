@@ -312,16 +312,22 @@ fn metricIo(writer: anytype, io_loop: *io.Loop) !void {
 fn metricMem(writer: anytype) !void {
     const statsd = @import("statsd.zig");
     const c = @cImport(@cInclude("malloc.h"));
-    const mi = c.mallinfo2();
-
-    const m = struct {
-        malloc: c.struct_mallinfo2,
-        statm: statsd.Statm,
-    }{
-        .malloc = mi,
-        .statm = try statsd.getStatm(),
+    const m = if (!@hasDecl(c, "mallinfo2")) brk: {
+        break :brk struct {
+            statm: statsd.Statm,
+        }{
+            .statm = try statsd.getStatm(),
+        };
+    } else brk: {
+        const mi = c.mallinfo2();
+        break :brk struct {
+            malloc: c.struct_mallinfo2,
+            statm: statsd.Statm,
+        }{
+            .malloc = mi,
+            .statm = try statsd.getStatm(),
+        };
     };
-
     try std.json.stringify(m, .{}, writer);
 }
 

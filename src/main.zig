@@ -120,6 +120,8 @@ pub fn socket(addr: net.Address) !posix.socket_t {
 
 fn mallocTrim() void {
     const c = @cImport(@cInclude("malloc.h"));
+    if (!@hasDecl(c, "malloc_trim")) return;
+
     const ret = c.malloc_trim(0);
     log.debug("malloc_trim retrun value: {}", .{ret});
 }

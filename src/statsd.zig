@@ -157,8 +157,9 @@ pub const MetricWriter = struct {
 ///            restrictions, and so on) be released by malloc_trim(3).
 fn writeMalloc(writer: anytype) !void {
     const c = @cImport(@cInclude("malloc.h"));
-    const mi = c.mallinfo2();
+    if (!@hasDecl(c, "mallinfo2")) return;
 
+    const mi = c.mallinfo2();
     try writer.gauge("mem.malloc", "arena", mi.arena);
     // try writer.gauge("mem.malloc", "ordblks", mi.ordblks);
     // try writer.gauge("mem.malloc", "smblks", mi.smblks);
