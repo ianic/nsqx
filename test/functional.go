@@ -104,6 +104,8 @@ func main() {
 	}
 	consumers = append(consumers, consumer)
 
+	time.Sleep(time.Second * 1)
+
 	body := make([][]byte, len(lines))
 	for i, line := range lines {
 		body[i] = []byte(line)
@@ -122,6 +124,8 @@ func main() {
 	handler1.expect(messages)
 	handler2.expect(messages)
 	handler3.expect(messages)
+
+	time.Sleep(time.Second * 1)
 
 	stats, err := getStats(lines_topic)
 	if err != nil {
