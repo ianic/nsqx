@@ -101,7 +101,7 @@ const Conn = struct {
     const ping_msg = "PING\n";
 
     connector: *Connector,
-    tcp: io.tcp.Conn(*Conn),
+    tcp: io.tcp.Client(*Conn),
     // null if not subscribed jet
     sequence: ?u64 = null,
 
@@ -109,9 +109,9 @@ const Conn = struct {
         const allocator = connector.allocator;
         self.* = .{
             .connector = connector,
-            .tcp = io.tcp.Conn(*Conn).init(allocator, connector.io_loop, self),
+            .tcp = io.tcp.Client(*Conn).init(allocator, connector.io_loop, self, address),
         };
-        self.tcp.connect(address);
+        self.tcp.connect();
     }
 
     fn deinit(self: *Self) void {
@@ -119,22 +119,22 @@ const Conn = struct {
     }
 
     fn onTick(self: *Self) void {
-        switch (self.tcp.state) {
-            .closed => self.tcp.connect(self.tcp.address),
+        switch (self.tcp.conn.state) {
+            .closed => self.tcp.connect(),
             .connected => self.ping(),
             else => {},
         }
     }
 
     fn ping(self: *Self) void {
-        self.tcp.send(ping_msg) catch {
+        self.tcp.sendZc(ping_msg) catch {
             self.tcp.close();
         };
     }
 
     pub fn onConnect(self: *Self) io.Error!void {
         log.debug("{} connected", .{self.tcp.address});
-        try self.tcp.send(self.connector.identify);
+        try self.tcp.sendZc(self.connector.identify);
         self.sequence = self.connector.stream.subscribe(.all);
         self.pull();
     }
@@ -142,7 +142,7 @@ const Conn = struct {
     fn pull(self: *Self) void {
         const sequence = self.sequence orelse return;
         if (self.connector.stream.pull(sequence, 1024)) |res| {
-            self.tcp.send(res.data) catch return;
+            self.tcp.sendZc(res.data) catch return;
             self.sequence = res.sequence.to;
         }
     }

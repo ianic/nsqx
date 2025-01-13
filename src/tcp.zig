@@ -37,9 +37,9 @@ pub fn ListenerType(comptime ConnType: type) type {
                 .options = options,
                 .socket = socket,
                 .io_loop = io_loop,
-                .tcp_listener = undefined,
+                .tcp_listener = io.tcp.Listener(*Self, ConnType).init(allocator, io_loop, socket, self),
             };
-            self.tcp_listener.init(allocator, io_loop, socket, self);
+            self.tcp_listener.run();
         }
 
         pub fn deinit(self: *Self) void {
@@ -82,7 +82,7 @@ pub const Conn = struct {
             .listener = listener,
             .tcp = io.tcp.Conn(*Conn).init(allocator, listener.io_loop, self),
         };
-        self.tcp.connected(socket, addr);
+        self.tcp.onConnect(socket);
 
         self.timer_op.init(&listener.io_loop.timer_queue, self, Conn.onTimer);
         try self.timer_op.update(initial_heartbeat);
@@ -99,7 +99,7 @@ pub const Conn = struct {
     // Consumer api -----------------
 
     pub fn send(self: *Conn, buf: []const u8) !void {
-        return self.tcp.send(buf);
+        return self.tcp.sendZc(buf);
     }
 
     pub fn close(self: *Conn) void {
@@ -257,7 +257,7 @@ pub const Conn = struct {
     }
 
     fn respond(self: *Conn, rsp: protocol.Response) !void {
-        self.tcp.send(rsp.body()) catch |err| {
+        self.tcp.sendZc(rsp.body()) catch |err| {
             log.err("{} respond {}", .{ self.tcp.socket, err });
             self.close();
         };

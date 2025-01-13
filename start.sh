@@ -30,7 +30,7 @@ lookupd_pid=$!
 lookupd2_pid=$!
 
 # admin
-~/Code/go/nsq/build/nsqadmin \
+~/Code/go/nsq/build/nsqadmin  \
     -lookupd-http-address localhost:4161 \
     -lookupd-http-address localhost:4163 > tmp/nsqadmin 2>&1 &
 admin_pid=$!

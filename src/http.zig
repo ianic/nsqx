@@ -20,13 +20,14 @@ pub const Conn = struct {
     rsp_arena: ?std.heap.ArenaAllocator = null, // arena allocator for response
 
     pub fn init(self: *Conn, listener: *Listener, socket: posix.socket_t, addr: net.Address) !void {
+        _ = addr;
         const allocator = listener.allocator;
         self.* = .{
             .allocator = allocator,
             .listener = listener,
             .tcp = io.tcp.Conn(*Conn).init(allocator, listener.io_loop, self),
         };
-        self.tcp.connected(socket, addr);
+        self.tcp.onConnect(socket);
     }
 
     pub fn deinit(self: *Conn) void {
@@ -51,8 +52,7 @@ pub const Conn = struct {
         if (self.handle(writer, bytes)) {
             const body = try body_bytes.toOwnedSlice();
             const header = try std.fmt.allocPrint(allocator, header_template, .{ body.len, "application/json" });
-            try self.tcp.prepSend(header);
-            try self.tcp.send(body);
+            try self.tcp.sendVZc(&[_][]const u8{ header, body });
         } else |err| {
             log.warn("request failed {}", .{err});
             const header = switch (err) {
@@ -64,7 +64,7 @@ pub const Conn = struct {
                 error.InternalServerError => internal_server_error,
                 else => bad_request,
             };
-            try self.tcp.send(header);
+            try self.tcp.sendZc(header);
         }
         return bytes.len;
     }
@@ -80,7 +80,7 @@ pub const Conn = struct {
 
         log.debug(
             "{} method: {}, target: {s}, content length: {}",
-            .{ self.tcp.address, head.method, head.target, content_length },
+            .{ self.tcp.socket, head.method, head.target, content_length },
         );
 
         var target_buf: [256]u8 = undefined;
@@ -254,12 +254,11 @@ fn jsonStat(gpa: std.mem.Allocator, args: Command.Stats, writer: anytype, broker
                 var clients = try allocator.alloc(Stat.Client, client_count);
                 for (channel.consumers.list.items, 0..) |consumer, i| {
                     const client = consumer.client;
-                    const remote_address = try std.fmt.allocPrint(allocator, "{}", .{client.tcp.address});
                     clients[i] = Stat.Client{
                         .client_id = client.identify.client_id,
                         .hostname = client.identify.hostname,
                         .user_agent = client.identify.user_agent,
-                        .remote_address = remote_address,
+                        .remote_address = client.identify.hostname,
                         .ready_count = consumer.ready_count,
                         .in_flight_count = consumer.in_flight_count,
                         .message_count = consumer.metric.send,
