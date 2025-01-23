@@ -17,7 +17,7 @@ pub const Connector = struct {
 
     allocator: mem.Allocator,
     io_loop: *io.Loop,
-    connections: std.ArrayList(*Conn),
+    clients: std.ArrayList(*Client),
     identify: []const u8,
     ticker_op: io.Op = .{},
     stream: *Stream = undefined,
@@ -48,13 +48,13 @@ pub const Connector = struct {
         self.* = .{
             .allocator = allocator,
             .io_loop = io_loop,
-            .connections = std.ArrayList(*Conn).init(allocator),
+            .clients = std.ArrayList(*Client).init(allocator),
             .identify = identify,
             .state = .connected,
             .stream = stream,
         };
         errdefer self.deinit();
-        try self.connections.ensureUnusedCapacity(lookup_tcp_addresses.len);
+        try self.clients.ensureUnusedCapacity(lookup_tcp_addresses.len);
         for (lookup_tcp_addresses) |addr| try self.addLookupd(addr);
 
         // Start endless ticker
@@ -63,67 +63,111 @@ pub const Connector = struct {
     }
 
     fn addLookupd(self: *Self, address: std.net.Address) !void {
-        const conn = try self.allocator.create(Conn);
-        errdefer self.allocator.destroy(conn);
-        try self.connections.ensureUnusedCapacity(1);
-        conn.init(self, address);
-        self.connections.appendAssumeCapacity(conn);
+        const client = try self.allocator.create(Client);
+        errdefer self.allocator.destroy(client);
+        try self.clients.ensureUnusedCapacity(1);
+        client.connect(self, address);
+        self.clients.appendAssumeCapacity(client);
     }
 
     pub fn close(self: *Self) void {
         self.state = .closing;
-        for (self.connections.items) |conn| conn.shutdown();
+        for (self.clients.items) |conn| conn.shutdown();
     }
 
     pub fn deinit(self: *Self) void {
-        for (self.connections.items) |conn| {
-            conn.deinit();
-            self.allocator.destroy(conn);
+        for (self.clients.items) |client| {
+            client.deinit();
+            self.allocator.destroy(client);
         }
-        self.connections.deinit();
+        self.clients.deinit();
         self.allocator.free(self.identify);
     }
 
     fn onTick(self: *Self) void {
-        for (self.connections.items) |conn| {
-            conn.onTick();
+        for (self.clients.items) |client| {
+            client.onTick();
         }
     }
 
     pub fn onRegister(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        for (self.connections.items) |conn| conn.pull();
+        for (self.clients.items) |client| client.pull();
     }
 };
 
-const Conn = struct {
+const Client = struct {
     const Self = @This();
-    const ping_msg = "PING\n";
 
-    connector: *Connector,
-    tcp: io.tcp.Client(*Conn),
-    // null if not subscribed jet
-    sequence: ?u64 = null,
+    tcp: io.tcp.Connector(Client),
+    parent: *Connector,
+    conn: ?Conn = null,
 
-    fn init(self: *Self, connector: *Connector, address: std.net.Address) void {
-        const allocator = connector.allocator;
+    fn connect(
+        self: *Self,
+        parent: *Connector,
+        addr: net.Address,
+    ) void {
         self.* = .{
-            .connector = connector,
-            .tcp = io.tcp.Client(*Conn).init(allocator, connector.io_loop, self, address),
+            .tcp = io.tcp.Connector(Client).init(parent.allocator, parent.io_loop, self, addr),
+            .parent = parent,
+            .conn = null,
         };
         self.tcp.connect();
     }
 
     fn deinit(self: *Self) void {
-        self.tcp.deinit();
+        if (self.conn) |*conn| conn.deinit();
+    }
+
+    pub fn create(self: *Self) !struct { *Conn, *Conn.Tcp } {
+        self.conn = .{
+            .parent = self,
+            .tcp = undefined,
+            .stream = self.parent.stream,
+            .identify = self.parent.identify,
+            .sequence = null,
+        };
+        const conn = &self.conn.?;
+        return .{ conn, &conn.tcp };
     }
 
     fn onTick(self: *Self) void {
-        switch (self.tcp.conn.state) {
-            .closed => self.tcp.connect(),
-            .connected => self.ping(),
-            else => {},
+        if (self.conn) |*conn| {
+            conn.ping();
+        } else {
+            // TODO move this check to io.tcp
+            if (!self.tcp.connect_op.active() and !self.tcp.close_op.active()) {
+                self.tcp.connect();
+            }
         }
+    }
+
+    fn pull(self: *Self) void {
+        if (self.conn) |*conn| conn.pull();
+    }
+
+    pub fn onError(self: *Self, err: anyerror) void {
+        log.err("client addr: {} {}", .{ self.tcp.address, err });
+    }
+
+    pub fn onClose(_: *Self) void {}
+};
+
+const Conn = struct {
+    const Self = @This();
+    pub const Tcp = io.tcp.Conn(Conn);
+    const ping_msg = "PING\n";
+
+    parent: *Client,
+    tcp: Tcp,
+    // null if not subscribed jet
+    sequence: ?u64 = null,
+    identify: []const u8,
+    stream: *Stream,
+
+    fn deinit(self: *Self) void {
+        self.tcp.deinit();
     }
 
     fn ping(self: *Self) void {
@@ -132,16 +176,27 @@ const Conn = struct {
         };
     }
 
-    pub fn onConnect(self: *Self) io.Error!void {
-        log.debug("{} connected", .{self.tcp.address});
-        try self.tcp.sendZc(self.connector.identify);
-        self.sequence = self.connector.stream.subscribe(.all);
+    pub fn onConnect(self: *Self) void {
+        self.onConnect_() catch |err| {
+            log.err("on connect {}", .{err});
+            self.tcp.close();
+        };
+    }
+
+    pub fn onError(_: *Self, err: anyerror) void {
+        log.err("conn {}", .{err});
+    }
+
+    fn onConnect_(self: *Self) !void {
+        log.debug("{} connected", .{self.tcp.socket});
+        try self.tcp.sendZc(self.identify);
+        self.sequence = self.stream.subscribe(.all);
         self.pull();
     }
 
     fn pull(self: *Self) void {
         const sequence = self.sequence orelse return;
-        if (self.connector.stream.pull(sequence, 1024)) |res| {
+        if (self.stream.pull(sequence, 1024)) |res| {
             self.tcp.sendZc(res.data) catch return;
             self.sequence = res.sequence.to;
         }
@@ -149,11 +204,11 @@ const Conn = struct {
 
     pub fn onSend(_: *Self, _: []const u8) void {}
 
-    pub fn onRecv(self: *Self, bytes: []const u8) io.Error!usize {
+    pub fn onRecv(self: *Self, bytes: []const u8) usize {
         return self.handleResponse(bytes) catch |err| {
-            log.err("{} handle reponse failed {}", .{ self.tcp.address, err });
+            log.err("{} handle response failed {}", .{ self.tcp.socket, err });
             self.tcp.close();
-            return 0;
+            return bytes.len;
         };
     }
 
@@ -174,19 +229,21 @@ const Conn = struct {
             }
             if (msg[0] == '{' and msg[msg.len - 1] == '}') {
                 // identify response
-                log.debug("{} identify: {s}", .{ self.tcp.address, msg });
+                log.debug("{} identify: {s}", .{ self.tcp.socket, msg });
                 continue;
             }
             // error
-            log.warn("{} {s}", .{ self.tcp.address, msg });
+            log.warn("{} {s}", .{ self.tcp.socket, msg });
         }
         return pos;
     }
 
     pub fn onClose(self: *Self) void {
         if (self.sequence) |sequence|
-            self.connector.stream.unsubscribe(sequence);
+            self.stream.unsubscribe(sequence);
         self.sequence = null;
+        self.deinit();
+        self.parent.conn = null;
     }
 };
 

@@ -46,11 +46,11 @@ pub fn main() !void {
     broker.setRegistrationsCallback(&lookup_connector, lookup.Connector.onRegister);
 
     var tcp_listener: tcp.Listener = undefined;
-    try tcp_listener.init(allocator, &io_loop, &broker, options, try socket(options.tcp_address));
+    try tcp_listener.init(allocator, &io_loop, &broker, options, options.tcp_address);
     defer tcp_listener.deinit();
 
     var http_listener: http.Listener = undefined;
-    try http_listener.init(allocator, &io_loop, &broker, options, try socket(options.http_address));
+    try http_listener.init(allocator, &io_loop, &broker, options, options.http_address);
     defer http_listener.deinit();
 
     const statsd_sender: ?*statsd.Sender = if (options.statsd.address) |_| brk: {
@@ -62,36 +62,19 @@ pub fn main() !void {
 
     try broker.restore(data_dir);
 
-    // Run loop
-    catchSignals();
     while (true) {
-        io_loop.tick() catch |err| {
-            if (err == error.SignalInterrupt) {
-                const sig = signal.load(.monotonic);
-                signal.store(0, .release);
-                log.debug("interrupted by signal {}", .{sig});
-                switch (sig) {
-                    posix.SIG.USR1 => {},
-                    posix.SIG.USR2 => mallocTrim(),
-                    posix.SIG.TERM, posix.SIG.INT => break,
-                    else => {},
-                }
-                continue;
-            }
-
-            log.err("io.tick failed {}", .{err});
+        const signal = io_loop.run() catch |err| {
+            log.err("io.run failed {}", .{err});
             switch (err) {
-                // OutOfMemory
-                // SubmissionQueueFull - when unable to prepare io operation
-                // all other errors are io_uring enter specific
                 error.OutOfMemory => {
                     // Release glibc malloc memory
                     if (builtin.mode == .ReleaseFast) mallocTrim();
                 },
+                // When unable to prepare io operation
                 // Next tick will ring.submit at start
                 error.SubmissionQueueFull => {},
 
-                // io_uring enter errors
+                // All other error are from io_uring enter.
                 // ref: https://manpages.debian.org/unstable/liburing-dev/io_uring_enter.2.en.html#RETURN_VALUE
                 error.SignalInterrupt => {},
                 // hopefully transient errors
@@ -108,14 +91,18 @@ pub fn main() !void {
                 error.Unexpected,
                 => break,
             }
+            continue;
         };
+        log.debug("interrupted by signal {}", .{signal});
+        switch (signal) {
+            posix.SIG.USR1 => {},
+            posix.SIG.USR2 => mallocTrim(),
+            posix.SIG.TERM, posix.SIG.INT => break,
+            else => {},
+        }
     }
 
     try broker.dump(data_dir);
-}
-
-pub fn socket(addr: net.Address) !posix.socket_t {
-    return (try addr.listen(.{ .reuse_address = true })).stream.handle;
 }
 
 fn mallocTrim() void {
@@ -124,27 +111,6 @@ fn mallocTrim() void {
 
     const ret = c.malloc_trim(0);
     log.debug("malloc_trim retrun value: {}", .{ret});
-}
-
-var signal = Atomic(c_int).init(0);
-
-fn catchSignals() void {
-    var act = posix.Sigaction{
-        .handler = .{
-            .handler = struct {
-                fn wrapper(sig: c_int) callconv(.C) void {
-                    signal.store(sig, .release);
-                }
-            }.wrapper,
-        },
-        .mask = posix.empty_sigset,
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.TERM, &act, null);
-    posix.sigaction(posix.SIG.INT, &act, null);
-    posix.sigaction(posix.SIG.USR1, &act, null);
-    posix.sigaction(posix.SIG.USR2, &act, null);
-    posix.sigaction(posix.SIG.PIPE, &act, null);
 }
 
 test {

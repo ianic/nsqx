@@ -19,9 +19,9 @@ pub fn ListenerType(comptime ConnType: type) type {
         allocator: mem.Allocator,
         broker: *Broker,
         options: Options,
-        socket: posix.socket_t,
         io_loop: *io.Loop,
-        tcp_listener: io.tcp.Listener(*Self, ConnType),
+        tcp_listener: io.tcp.Listener(Self),
+        conns: InstanceMap(ConnType),
 
         pub fn init(
             self: *Self,
@@ -29,21 +29,31 @@ pub fn ListenerType(comptime ConnType: type) type {
             io_loop: *io.Loop,
             broker: *Broker,
             options: Options,
-            socket: posix.socket_t,
+            addr: net.Address,
         ) !void {
             self.* = .{
                 .allocator = allocator,
                 .broker = broker,
                 .options = options,
-                .socket = socket,
                 .io_loop = io_loop,
-                .tcp_listener = io.tcp.Listener(*Self, ConnType).init(allocator, io_loop, socket, self),
+                .tcp_listener = io.tcp.Listener(Self).init(allocator, io_loop, self),
+                .conns = InstanceMap(ConnType).init(allocator),
             };
-            self.tcp_listener.run();
+            try self.tcp_listener.bind(addr);
         }
 
         pub fn deinit(self: *Self) void {
-            self.tcp_listener.deinit();
+            self.conns.deinit();
+        }
+
+        pub fn create(self: *Self) !struct { *ConnType, *ConnType.Tcp } {
+            const conn = try self.conns.create();
+            conn.* = .{
+                .allocator = self.allocator,
+                .listener = self,
+                .tcp = undefined,
+            };
+            return .{ conn, &conn.tcp };
         }
 
         pub fn onAccept(self: *Self, conn: *ConnType, socket: posix.socket_t, addr: net.Address) !void {
@@ -52,8 +62,12 @@ pub fn ListenerType(comptime ConnType: type) type {
 
         pub fn onClose(_: *Self) void {}
 
+        pub fn onError(_: *Self, err: anyerror) void {
+            log.err("listener {}", .{err});
+        }
+
         pub fn destroy(self: *Self, conn: *ConnType) void {
-            self.tcp_listener.destroy(conn);
+            self.conns.destroy(conn);
         }
     };
 }
@@ -61,9 +75,12 @@ pub fn ListenerType(comptime ConnType: type) type {
 pub const Listener = ListenerType(Conn);
 
 pub const Conn = struct {
+    const Self = @This();
+    const Tcp = io.tcp.Conn(Self);
+
     allocator: mem.Allocator,
     listener: *Listener,
-    tcp: io.tcp.Conn(*Conn),
+    tcp: Tcp = undefined,
     timer_op: io.timer.Op = undefined,
 
     heartbeat_interval: u32 = initial_heartbeat,
@@ -74,21 +91,6 @@ pub const Conn = struct {
 
     // Until client set's connection heartbeat interval from identify message.
     const initial_heartbeat = 2000;
-
-    fn init(self: *Conn, listener: *Listener, socket: posix.socket_t, addr: net.Address) !void {
-        const allocator = listener.allocator;
-        self.* = .{
-            .allocator = allocator,
-            .listener = listener,
-            .tcp = io.tcp.Conn(*Conn).init(allocator, listener.io_loop, self),
-        };
-        self.tcp.onConnect(socket);
-
-        self.timer_op.init(&listener.io_loop.timer_queue, self, Conn.onTimer);
-        try self.timer_op.update(initial_heartbeat);
-
-        log.debug("{} connected {}", .{ socket, addr });
-    }
 
     pub fn deinit(self: *Conn) void {
         self.identify.deinit(self.allocator);
@@ -108,6 +110,12 @@ pub const Conn = struct {
 
     // tcp callbacks -----------------
 
+    pub fn onConnect(self: *Conn) void {
+        self.timer_op.init(&self.listener.io_loop.timer_queue, self, Conn.onTimer);
+        self.timer_op.update(initial_heartbeat) catch {};
+        log.debug("{} connected", .{self.tcp.socket});
+    }
+
     pub fn onSend(self: *Conn, buf: []const u8) void {
         _, const frame_type = protocol.parseFrame(buf) catch unreachable;
         if (frame_type != .message) return;
@@ -124,12 +132,16 @@ pub const Conn = struct {
         self.listener.destroy(self);
     }
 
-    pub fn onRecv(self: *Conn, bytes: []const u8) !usize {
+    pub fn onRecv(self: *Conn, bytes: []const u8) usize {
         // Any error is lack of resources, close connection in that case
         return self.receivedData(bytes) catch brk: {
             self.close();
             break :brk 0;
         };
+    }
+
+    pub fn onError(self: *Self, err: anyerror) void {
+        log.err("{} on error {}", .{ self.tcp.socket, err });
     }
 
     // ------------------------------
@@ -265,7 +277,7 @@ pub const Conn = struct {
 
     /// Timer callback
     pub fn onTimer(self: *Conn, _: u64) !u64 {
-        if (self.tcp.state != .connected) return io.timer.infinite;
+        if (self.tcp.state != .open) return io.timer.infinite;
         if (self.outstanding_heartbeats > 4) {
             log.debug("{} no heartbeat, closing", .{self.tcp.socket});
             self.close();
@@ -279,3 +291,42 @@ pub const Conn = struct {
         return self.listener.io_loop.tsFromDelay(self.heartbeat_interval);
     }
 };
+
+pub fn InstanceMap(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        allocator: mem.Allocator,
+        instances: std.AutoHashMap(*T, void),
+
+        pub fn init(allocator: mem.Allocator) Self {
+            return .{
+                .allocator = allocator,
+                .instances = std.AutoHashMap(*T, void).init(allocator),
+            };
+        }
+
+        pub fn create(self: *Self) !*T {
+            try self.instances.ensureUnusedCapacity(1);
+            const instance = try self.allocator.create(T);
+            errdefer self.allocator.destroy(instance);
+            self.instances.putAssumeCapacityNoClobber(instance, {});
+            return instance;
+        }
+
+        pub fn destroy(self: *Self, instance: *T) void {
+            assert(self.instances.remove(instance));
+            self.allocator.destroy(instance);
+        }
+
+        pub fn deinit(self: *Self) void {
+            var iter = self.instances.keyIterator();
+            while (iter.next()) |k| {
+                const instance = k.*;
+                instance.deinit();
+                self.allocator.destroy(instance);
+            }
+            self.instances.deinit();
+        }
+    };
+}

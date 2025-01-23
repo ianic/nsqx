@@ -14,28 +14,44 @@ pub const Listener = @import("tcp.zig").ListenerType(Conn);
 const log = std.log.scoped(.http);
 
 pub const Conn = struct {
+    pub const Tcp = io.tcp.Conn(Conn);
+
     allocator: mem.Allocator,
     listener: *Listener,
-    tcp: io.tcp.Conn(*Conn),
+    tcp: Tcp = undefined,
     rsp_arena: ?std.heap.ArenaAllocator = null, // arena allocator for response
 
-    pub fn init(self: *Conn, listener: *Listener, socket: posix.socket_t, addr: net.Address) !void {
-        _ = addr;
-        const allocator = listener.allocator;
-        self.* = .{
-            .allocator = allocator,
-            .listener = listener,
-            .tcp = io.tcp.Conn(*Conn).init(allocator, listener.io_loop, self),
-        };
-        self.tcp.onConnect(socket);
-    }
+    // pub fn init(self: *Conn, listener: *Listener, socket: posix.socket_t, addr: net.Address) !void {
+    //     _ = addr;
+    //     const allocator = listener.allocator;
+    //     self.* = .{
+    //         .allocator = allocator,
+    //         .listener = listener,
+    //         .tcp = Tcp.init(allocator, listener.io_loop, self),
+    //     };
+    //     self.tcp.onConnect(socket);
+    // }
+
+    pub fn onConnect(_: *Conn) void {}
 
     pub fn deinit(self: *Conn) void {
         self.deinitResponse();
         self.tcp.deinit();
     }
 
-    pub fn onRecv(self: *Conn, bytes: []const u8) io.Error!usize {
+    pub fn onError(self: *Conn, err: anyerror) void {
+        log.err("{} on error {}", .{ self.tcp.socket, err });
+    }
+
+    pub fn onRecv(self: *Conn, bytes: []const u8) usize {
+        return self.onRecv_(bytes) catch |err| {
+            log.err("on recv {}", .{err});
+            self.tcp.close();
+            return bytes.len;
+        };
+    }
+
+    fn onRecv_(self: *Conn, bytes: []const u8) io.Error!usize {
         if (self.rsp_arena != null) {
             self.tcp.close();
             return 0;
