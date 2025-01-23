@@ -24,8 +24,8 @@
     // internet connectivity.
     .dependencies = .{
         .iox = .{
-            .url = "https://github.com/ianic/iox/archive/cfb254ef7f684f7f142d7fde3bed13346db6f6e7.tar.gz",
-            .hash = "12207cc5af09c01690b36812c776986f2d6530404b516f212c7e348fcf21565dcda1",
+            .url = "https://github.com/ianic/iox/archive/80789e5d6dce70a2ec8b72a5a203edbe112067fe.tar.gz",
+            .hash = "1220b0f31c47c4522f6f95f8daa8cacc1c1db39e4bf6ffc95ad212ad3b8ec57177e4",
         },
     },
 

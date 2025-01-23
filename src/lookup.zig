@@ -21,11 +21,6 @@ pub const Connector = struct {
     identify: []const u8,
     ticker_op: io.Op = .{},
     stream: *Stream = undefined,
-    state: State,
-    const State = enum {
-        connected,
-        closing,
-    };
     const ping_interval = 15 * 1000; // in milliseconds
 
     pub fn init(
@@ -50,7 +45,6 @@ pub const Connector = struct {
             .io_loop = io_loop,
             .clients = std.ArrayList(*Client).init(allocator),
             .identify = identify,
-            .state = .connected,
             .stream = stream,
         };
         errdefer self.deinit();
@@ -68,11 +62,6 @@ pub const Connector = struct {
         try self.clients.ensureUnusedCapacity(1);
         client.connect(self, address);
         self.clients.appendAssumeCapacity(client);
-    }
-
-    pub fn close(self: *Self) void {
-        self.state = .closing;
-        for (self.clients.items) |conn| conn.shutdown();
     }
 
     pub fn deinit(self: *Self) void {
@@ -96,12 +85,17 @@ pub const Connector = struct {
     }
 };
 
+const ping_msg = "PING\n";
+
 const Client = struct {
     const Self = @This();
 
-    tcp: io.tcp.Connector(Client),
+    tcp_cli: io.tcp.Client(Self),
+    // If client is connected tcp_conn will be non null.
+    tcp_conn: ?io.tcp.Conn(Self) = null,
+
     parent: *Connector,
-    conn: ?Conn = null,
+    sequence: ?u64 = null,
 
     fn connect(
         self: *Self,
@@ -109,96 +103,57 @@ const Client = struct {
         addr: net.Address,
     ) void {
         self.* = .{
-            .tcp = io.tcp.Connector(Client).init(parent.allocator, parent.io_loop, self, addr),
+            .tcp_cli = undefined,
+            .tcp_conn = null,
             .parent = parent,
-            .conn = null,
+            .sequence = null,
         };
-        self.tcp.connect();
+        self.tcp_cli.connect(parent.allocator, parent.io_loop, self, &self.tcp_conn, addr);
     }
 
     fn deinit(self: *Self) void {
-        if (self.conn) |*conn| conn.deinit();
-    }
-
-    pub fn create(self: *Self) !struct { *Conn, *Conn.Tcp } {
-        self.conn = .{
-            .parent = self,
-            .tcp = undefined,
-            .stream = self.parent.stream,
-            .identify = self.parent.identify,
-            .sequence = null,
-        };
-        const conn = &self.conn.?;
-        return .{ conn, &conn.tcp };
-    }
-
-    fn onTick(self: *Self) void {
-        if (self.conn) |*conn| {
-            conn.ping();
-        } else {
-            // TODO move this check to io.tcp
-            if (!self.tcp.connect_op.active() and !self.tcp.close_op.active()) {
-                self.tcp.connect();
-            }
+        if (self.tcp_conn) |*conn| {
+            conn.deinit();
+            self.tcp_conn = null;
         }
     }
 
-    fn pull(self: *Self) void {
-        if (self.conn) |*conn| conn.pull();
+    fn onTick(self: *Self) void {
+        if (self.tcp_conn) |*conn| {
+            conn.sendZc(ping_msg) catch {};
+        } else {
+            self.tcp_cli.reconnect();
+        }
     }
 
-    pub fn onError(self: *Self, err: anyerror) void {
-        log.err("client addr: {} {}", .{ self.tcp.address, err });
-    }
-
-    pub fn onClose(_: *Self) void {}
-};
-
-const Conn = struct {
-    const Self = @This();
-    pub const Tcp = io.tcp.Conn(Conn);
-    const ping_msg = "PING\n";
-
-    parent: *Client,
-    tcp: Tcp,
-    // null if not subscribed jet
-    sequence: ?u64 = null,
-    identify: []const u8,
-    stream: *Stream,
-
-    fn deinit(self: *Self) void {
-        self.tcp.deinit();
-    }
-
-    fn ping(self: *Self) void {
-        self.tcp.sendZc(ping_msg) catch {
-            self.tcp.close();
-        };
+    pub fn onError(_: *Self, err: anyerror) void {
+        log.err("client {}", .{err});
     }
 
     pub fn onConnect(self: *Self) void {
         self.onConnect_() catch |err| {
             log.err("on connect {}", .{err});
-            self.tcp.close();
+            if (self.tcp_conn) |*conn| conn.close();
         };
     }
 
-    pub fn onError(_: *Self, err: anyerror) void {
-        log.err("conn {}", .{err});
-    }
-
     fn onConnect_(self: *Self) !void {
-        log.debug("{} connected", .{self.tcp.socket});
-        try self.tcp.sendZc(self.identify);
-        self.sequence = self.stream.subscribe(.all);
-        self.pull();
+        if (self.tcp_conn) |*conn| {
+            log.debug("{} connected", .{conn.socket});
+            try conn.sendZc(self.parent.identify);
+            self.sequence = self.parent.stream.subscribe(.all);
+            self.pull();
+        }
     }
 
     fn pull(self: *Self) void {
-        const sequence = self.sequence orelse return;
-        if (self.stream.pull(sequence, 1024)) |res| {
-            self.tcp.sendZc(res.data) catch return;
-            self.sequence = res.sequence.to;
+        if (self.tcp_conn) |*conn| {
+            const sequence = self.sequence orelse return;
+
+            if (self.parent.stream.pull(sequence, 1024)) |res| {
+                conn.sendZc(res.data) catch return;
+                self.sequence = res.sequence.to;
+            }
         }
     }
 
@@ -206,13 +161,15 @@ const Conn = struct {
 
     pub fn onRecv(self: *Self, bytes: []const u8) usize {
         return self.handleResponse(bytes) catch |err| {
-            log.err("{} handle response failed {}", .{ self.tcp.socket, err });
-            self.tcp.close();
+            if (self.tcp_conn) |*conn| {
+                log.err("{} handle response failed {}", .{ conn.socket, err });
+                conn.close();
+            }
             return bytes.len;
         };
     }
 
-    fn handleResponse(self: *Self, bytes: []const u8) io.Error!usize {
+    fn handleResponse(_: *Self, bytes: []const u8) io.Error!usize {
         var pos: usize = 0;
         while (true) {
             var buf = bytes[pos..];
@@ -229,21 +186,24 @@ const Conn = struct {
             }
             if (msg[0] == '{' and msg[msg.len - 1] == '}') {
                 // identify response
-                log.debug("{} identify: {s}", .{ self.tcp.socket, msg });
+                // log.debug("identify: {s}", .{msg});
                 continue;
             }
             // error
-            log.warn("{} {s}", .{ self.tcp.socket, msg });
+            log.warn("unknown message {s}", .{msg});
         }
         return pos;
     }
 
     pub fn onClose(self: *Self) void {
-        if (self.sequence) |sequence|
-            self.stream.unsubscribe(sequence);
-        self.sequence = null;
-        self.deinit();
-        self.parent.conn = null;
+        if (self.tcp_conn) |*conn| {
+            if (self.sequence) |sequence| {
+                self.parent.stream.unsubscribe(sequence);
+                self.sequence = null;
+            }
+            conn.deinit();
+            self.tcp_conn = null;
+        }
     }
 };
 

@@ -48,6 +48,8 @@ cd ~/Code/nsqx
 # --statsd-address localhost:8125 \
 nsqxd_pid=$!
 
+#sudo gdb zig-out/bin/nsqxd $nsqxd_pid
+
 sleep 1
 
 nsq_tail -nsqd-tcp-address localhost:4150 -channel channel1 -topic topic1  | sed "s/^/[channel1] /" &
